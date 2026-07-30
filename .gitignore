@@ -1,5 +1,6 @@
 # Yoke runtime artifacts (managed by yoke retrofit)
 /target/
+/.mesh/
 .worktrees/
 .yoke/worktrees/
 .yoke/backup/

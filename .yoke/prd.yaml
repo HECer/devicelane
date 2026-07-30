@@ -128,7 +128,7 @@
       Netzwerk, Xcode, ADB, Zertifikate und Dateirechte
     - Hardwaretests für iPhone und Android sind klar als nachgelagerte Gates
       markiert und Mocks können sie nicht als bestanden setzen
-  passes: false
+  passes: true
   needs:
     - STORY-19
   area: bootstrap

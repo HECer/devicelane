@@ -1,0 +1,10 @@
+#!/usr/bin/env sh
+set -eu
+cd "$(dirname "$0")/.."
+if command -v cargo >/dev/null 2>&1; then
+  cargo test --test bootstrap
+  cargo run --quiet --bin mesh-cli -- doctor --identity .mesh/smoke-cli >/dev/null
+else
+  powershell.exe -NoProfile -Command "cargo test --test bootstrap"
+  powershell.exe -NoProfile -Command "cargo run --quiet --bin mesh-cli -- doctor --identity .mesh/smoke-cli" >/dev/null
+fi
