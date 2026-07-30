@@ -121,7 +121,7 @@
       Chunks
     - Ein veränderter Chunk wird vor Veröffentlichung des Artefakts erkannt und
       abgelehnt
-  passes: false
+  passes: true
   needs:
     - STORY-8
   area: artifacts
