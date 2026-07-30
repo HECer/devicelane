@@ -422,6 +422,179 @@ pub mod discovery {
     }
 }
 
+pub mod authorization {
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Role {
+        Operator,
+        Observer,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Operation<'a> {
+        ReadLogs,
+        StartProcess { device_id: &'a str },
+        InstallDevice { device_id: &'a str },
+    }
+
+    impl Operation<'_> {
+        fn capability(&self) -> &str {
+            match self {
+                Self::ReadLogs => "logs.read",
+                Self::StartProcess { .. } => "process.start",
+                Self::InstallDevice { .. } => "device.install",
+            }
+        }
+
+        fn device_id(&self) -> Option<&str> {
+            match self {
+                Self::ReadLogs => None,
+                Self::StartProcess { device_id } | Self::InstallDevice { device_id } => {
+                    Some(device_id)
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AuthorizationError {
+        CapabilityDenied,
+        DeviceAlreadyLeased,
+        LeaseInactive,
+        ObserverReadOnly,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct LeaseId(u64);
+
+    struct Lease {
+        device_id: String,
+        holder: String,
+        expires_at: Instant,
+        revoked: bool,
+    }
+
+    struct Principal {
+        role: Role,
+        capabilities: HashSet<String>,
+    }
+
+    pub struct PolicyEngine {
+        principals: HashMap<String, Principal>,
+        leases: HashMap<LeaseId, Lease>,
+        next_lease_id: u64,
+    }
+
+    impl PolicyEngine {
+        pub fn new() -> Self {
+            Self {
+                principals: HashMap::new(),
+                leases: HashMap::new(),
+                next_lease_id: 1,
+            }
+        }
+
+        pub fn grant(
+            &mut self,
+            actor: impl Into<String>,
+            role: Role,
+            capability: impl Into<String>,
+        ) {
+            let principal = self.principals.entry(actor.into()).or_insert(Principal {
+                role,
+                capabilities: HashSet::new(),
+            });
+            principal.role = role;
+            principal.capabilities.insert(capability.into());
+        }
+
+        pub fn acquire_lease(
+            &mut self,
+            device_id: &str,
+            holder: &str,
+            lifetime: Duration,
+        ) -> Result<LeaseId, AuthorizationError> {
+            if self.principals.get(holder).map(|principal| principal.role) != Some(Role::Operator) {
+                return Err(AuthorizationError::ObserverReadOnly);
+            }
+            let now = Instant::now();
+            if self.leases.values().any(|lease| {
+                lease.device_id == device_id && !lease.revoked && now < lease.expires_at
+            }) {
+                return Err(AuthorizationError::DeviceAlreadyLeased);
+            }
+            let id = LeaseId(self.next_lease_id);
+            self.next_lease_id += 1;
+            self.leases.insert(
+                id,
+                Lease {
+                    device_id: device_id.to_owned(),
+                    holder: holder.to_owned(),
+                    expires_at: now + lifetime,
+                    revoked: false,
+                },
+            );
+            Ok(id)
+        }
+
+        pub fn revoke_lease(&mut self, lease_id: LeaseId) {
+            if let Some(lease) = self.leases.get_mut(&lease_id) {
+                lease.revoked = true;
+            }
+        }
+
+        pub fn lease_is_active(&self, lease_id: LeaseId) -> bool {
+            let now = Instant::now();
+            self.leases
+                .get(&lease_id)
+                .is_some_and(|lease| !lease.revoked && now < lease.expires_at)
+        }
+
+        pub fn execute<T>(
+            &mut self,
+            actor: &str,
+            operation: Operation<'_>,
+            lease_id: Option<LeaseId>,
+            adapter: impl FnOnce() -> T,
+        ) -> Result<T, AuthorizationError> {
+            let Some(principal) = self.principals.get(actor) else {
+                return Err(AuthorizationError::CapabilityDenied);
+            };
+            if !principal.capabilities.contains(operation.capability()) {
+                return Err(AuthorizationError::CapabilityDenied);
+            }
+            let device_id = operation.device_id();
+            if principal.role == Role::Observer && device_id.is_some() {
+                return Err(AuthorizationError::ObserverReadOnly);
+            }
+            if let Some(device_id) = device_id {
+                let Some(lease_id) = lease_id else {
+                    return Err(AuthorizationError::LeaseInactive);
+                };
+                let now = Instant::now();
+                let active_for_device = self.leases.get(&lease_id).is_some_and(|lease| {
+                    lease.device_id == device_id
+                        && lease.holder == actor
+                        && !lease.revoked
+                        && now < lease.expires_at
+                });
+                if !active_for_device {
+                    return Err(AuthorizationError::LeaseInactive);
+                }
+            }
+            Ok(adapter())
+        }
+    }
+
+    impl Default for PolicyEngine {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

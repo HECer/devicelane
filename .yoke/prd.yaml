@@ -63,7 +63,7 @@
     - Eine abgelaufene oder widerrufene Lease kann keine neue Operation starten
     - Observer dürfen freigegebene Logs lesen, aber keine Prozesse oder Geräte
       verändern
-  passes: false
+  passes: true
   needs:
     - STORY-4
   area: policy
