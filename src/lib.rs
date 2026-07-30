@@ -929,6 +929,128 @@ pub mod sessions {
     }
 }
 
+pub mod preflight {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum PreflightError {
+        UnsupportedHost,
+        CommandFailed,
+        InvalidOutput,
+    }
+
+    pub struct CommandOutput {
+        stdout: String,
+    }
+
+    impl CommandOutput {
+        pub fn success(stdout: impl Into<String>) -> Self {
+            Self {
+                stdout: stdout.into(),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct AppleCapabilitySnapshot {
+        pub xcode: String,
+        pub sdk: String,
+        pub devicectl: String,
+        pub simctl: String,
+    }
+
+    pub struct ApplePreflight;
+
+    impl ApplePreflight {
+        pub fn run(
+            host: &str,
+            mut command: impl FnMut(&str, &[&str]) -> Result<CommandOutput, PreflightError>,
+        ) -> Result<AppleCapabilitySnapshot, PreflightError> {
+            if host != "macos" {
+                return Err(PreflightError::UnsupportedHost);
+            }
+            let xcode = command("xcodebuild", &["-version"])?;
+            let sdk = command("xcrun", &["--sdk", "iphoneos", "--show-sdk-version"])?;
+            let devicectl = command("xcrun", &["devicectl", "--version"])?;
+            let simctl = command("xcrun", &["simctl", "--version"])?;
+            Ok(AppleCapabilitySnapshot {
+                xcode: token_after(&xcode.stdout, "Xcode")?,
+                sdk: sdk.stdout.trim().to_owned(),
+                devicectl: token_after(&devicectl.stdout, "version:")?,
+                simctl: token_after(&simctl.stdout, "SimulatorKit")?,
+            })
+        }
+    }
+
+    fn token_after(output: &str, marker: &str) -> Result<String, PreflightError> {
+        output
+            .lines()
+            .find_map(|line| line.split_once(marker).map(|(_, rest)| rest))
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_owned)
+            .ok_or(PreflightError::InvalidOutput)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AdbDeviceState {
+        Authorized,
+        Unauthorized,
+        Offline,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct AdbDevice {
+        pub id: String,
+        pub state: AdbDeviceState,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct AndroidCapabilitySnapshot {
+        pub adb_version: String,
+        pub devices: Vec<AdbDevice>,
+    }
+
+    pub struct AndroidPreflight;
+
+    impl AndroidPreflight {
+        pub fn run(
+            mut command: impl FnMut(&str, &[&str]) -> Result<CommandOutput, PreflightError>,
+        ) -> Result<AndroidCapabilitySnapshot, PreflightError> {
+            let version = command("adb", &["version"])?;
+            let devices = command("adb", &["devices", "-l"])?;
+            Self::from_outputs(&version.stdout, &devices.stdout)
+        }
+
+        pub fn from_outputs(
+            version_output: &str,
+            devices_output: &str,
+        ) -> Result<AndroidCapabilitySnapshot, PreflightError> {
+            let adb_version = token_after(version_output, "Version")?;
+            let devices = devices_output
+                .lines()
+                .skip(1)
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let id = fields.next().ok_or(PreflightError::InvalidOutput)?;
+                    let state = match fields.next() {
+                        Some("device") => AdbDeviceState::Authorized,
+                        Some("unauthorized") => AdbDeviceState::Unauthorized,
+                        Some("offline") => AdbDeviceState::Offline,
+                        _ => return Err(PreflightError::InvalidOutput),
+                    };
+                    Ok(AdbDevice {
+                        id: id.to_owned(),
+                        state,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(AndroidCapabilitySnapshot {
+                adb_version,
+                devices,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

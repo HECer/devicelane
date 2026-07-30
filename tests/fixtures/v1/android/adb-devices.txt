@@ -1,0 +1,5 @@
+List of devices attached
+emulator-5554	device product:sdk_gphone64_x86_64 model:sdk_gphone64_x86_64 device:emu64xa transport_id:1
+R58M123456A	unauthorized usb:1-1 transport_id:2
+192.0.2.10:5555	offline transport_id:3
+
