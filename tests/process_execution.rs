@@ -99,10 +99,10 @@ fn stdout_is_available_before_the_process_exits() {
         "--nocapture",
     ]);
 
-    let started_at = Instant::now();
     let mut stream = executor(&root)
         .start(request, Duration::from_secs(5), CancellationToken::new())
         .unwrap();
+    let started_at = Instant::now();
     let mut saw_first_output = false;
     while started_at.elapsed() < Duration::from_millis(500) {
         let event = stream

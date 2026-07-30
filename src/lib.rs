@@ -253,6 +253,24 @@ pub mod process_execution {
         environment: HashSet<String>,
     }
 
+    pub struct ProcessStream {
+        receiver: mpsc::Receiver<ProcessEvent>,
+    }
+
+    impl ProcessStream {
+        pub fn next_timeout(&mut self, timeout: Duration) -> Option<ProcessEvent> {
+            self.receiver.recv_timeout(timeout).ok()
+        }
+    }
+
+    impl Iterator for ProcessStream {
+        type Item = ProcessEvent;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.receiver.recv().ok()
+        }
+    }
+
     impl ProcessExecutor {
         pub fn new(
             workspace: impl AsRef<Path>,
@@ -277,6 +295,15 @@ pub mod process_execution {
             timeout: Duration,
             cancellation: CancellationToken,
         ) -> Result<Vec<ProcessEvent>, ProcessError> {
+            Ok(self.start(request, timeout, cancellation)?.collect())
+        }
+
+        pub fn start(
+            &self,
+            request: ProcessRequest,
+            timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> Result<ProcessStream, ProcessError> {
             let program =
                 fs::canonicalize(&request.program).map_err(|_| ProcessError::ProgramDenied)?;
             if !self.programs.contains(&program) {
@@ -308,81 +335,107 @@ pub mod process_execution {
             let mut child = command.group_spawn().map_err(|_| ProcessError::Io)?;
             let stdout = child.inner().stdout.take().ok_or(ProcessError::Io)?;
             let stderr = child.inner().stderr.take().ok_or(ProcessError::Io)?;
-            let (sender, receiver) = mpsc::channel();
-            let stdout_reader = read_stream(stdout, EventKind::Stdout, sender.clone());
-            let stderr_reader = read_stream(stderr, EventKind::Stderr, sender);
-            let started = Instant::now();
-            let mut output = Vec::new();
-            let mut closed_streams = 0;
-            let mut exit_code = None;
-            let terminal = loop {
-                while let Ok((kind, payload)) = receiver.try_recv() {
-                    closed_streams += 1;
-                    if !payload.is_empty() {
-                        output.push((kind, payload));
-                    }
-                }
-                if cancellation.is_cancelled() {
-                    kill_running_group(&mut child)?;
-                    child.inner().wait().map_err(|_| ProcessError::Io)?;
-                    break TerminalStatus::Cancelled;
-                }
-                if started.elapsed() >= timeout {
-                    kill_running_group(&mut child)?;
-                    child.inner().wait().map_err(|_| ProcessError::Io)?;
-                    break TerminalStatus::TimedOut;
-                }
-                if exit_code.is_none() {
-                    exit_code = child
-                        .try_wait()
-                        .map_err(|_| ProcessError::Io)?
-                        .map(|status| status.code().unwrap_or(-1));
-                }
-                if let Some(code) = exit_code.filter(|_| closed_streams == 2) {
-                    break TerminalStatus::Exited(code);
-                }
-                thread::sleep(Duration::from_millis(5));
-            };
-            stdout_reader.join().map_err(|_| ProcessError::Io)?;
-            stderr_reader.join().map_err(|_| ProcessError::Io)?;
-
-            for item in receiver {
-                if !item.1.is_empty() {
-                    output.push(item);
-                }
-            }
-
-            let mut events = vec![ProcessEvent {
-                sequence: 1,
-                kind: EventKind::Started,
-                payload: Vec::new(),
-            }];
-            for (kind, payload) in output {
-                events.push(ProcessEvent {
-                    sequence: events.len() as u64 + 1,
-                    kind,
-                    payload,
-                });
-            }
-            events.push(ProcessEvent {
-                sequence: events.len() as u64 + 1,
-                kind: EventKind::Terminal(terminal),
-                payload: Vec::new(),
+            let (stream_sender, stream_receiver) = mpsc::channel();
+            thread::spawn(move || {
+                run_process(child, stdout, stderr, timeout, cancellation, stream_sender);
             });
-            Ok(events)
+            Ok(ProcessStream {
+                receiver: stream_receiver,
+            })
         }
+    }
+
+    fn run_process(
+        mut child: command_group::GroupChild,
+        stdout: impl Read + Send + 'static,
+        stderr: impl Read + Send + 'static,
+        timeout: Duration,
+        cancellation: CancellationToken,
+        sender: mpsc::Sender<ProcessEvent>,
+    ) {
+        let (output_sender, output_receiver) = mpsc::channel();
+        let stdout_reader = read_stream(stdout, EventKind::Stdout, output_sender.clone());
+        let stderr_reader = read_stream(stderr, EventKind::Stderr, output_sender);
+        let mut sequence = 1;
+        let _ = sender.send(ProcessEvent {
+            sequence,
+            kind: EventKind::Started,
+            payload: Vec::new(),
+        });
+        let started = Instant::now();
+        let mut closed_streams = 0;
+        let mut exit_code = None;
+        let terminal = loop {
+            while let Ok(message) = output_receiver.try_recv() {
+                match message {
+                    Some((kind, payload)) => {
+                        sequence += 1;
+                        let _ = sender.send(ProcessEvent {
+                            sequence,
+                            kind,
+                            payload,
+                        });
+                    }
+                    None => closed_streams += 1,
+                }
+            }
+            if cancellation.is_cancelled() {
+                let _ = kill_running_group(&mut child);
+                let _ = child.wait();
+                break TerminalStatus::Cancelled;
+            }
+            if started.elapsed() >= timeout {
+                let _ = kill_running_group(&mut child);
+                let _ = child.wait();
+                break TerminalStatus::TimedOut;
+            }
+            if exit_code.is_none() {
+                exit_code = child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .map(|status| status.code().unwrap_or(-1));
+            }
+            if let Some(code) = exit_code.filter(|_| closed_streams == 2) {
+                break TerminalStatus::Exited(code);
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        for (kind, payload) in output_receiver.into_iter().flatten() {
+            sequence += 1;
+            let _ = sender.send(ProcessEvent {
+                sequence,
+                kind,
+                payload,
+            });
+        }
+        sequence += 1;
+        let _ = sender.send(ProcessEvent {
+            sequence,
+            kind: EventKind::Terminal(terminal),
+            payload: Vec::new(),
+        });
     }
 
     fn read_stream(
         mut stream: impl Read + Send + 'static,
         kind: EventKind,
-        sender: mpsc::Sender<(EventKind, Vec<u8>)>,
+        sender: mpsc::Sender<Option<(EventKind, Vec<u8>)>>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
-            let mut payload = Vec::new();
-            if stream.read_to_end(&mut payload).is_ok() {
-                let _ = sender.send((kind, payload));
+            let mut buffer = [0; 4096];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(length) => {
+                        let _ = sender.send(Some((kind.clone(), buffer[..length].to_vec())));
+                    }
+                    Err(_) => break,
+                }
             }
+            let _ = sender.send(None);
         })
     }
 

@@ -24,8 +24,9 @@
       Environment-Overrides außerhalb einer Allowlist werden vor Spawn abgelehnt
     - Timeout und Abbruch beenden den gesamten Kindprozessbaum auf Windows,
       macOS und Linux deterministisch
-    - ProcessExecutor::start liefert stdout und stderr bereits während der Kindprozess noch läuft; execute bleibt nur ein sammelnder Komfortwrapper
-  passes: false
+    - ProcessExecutor::start liefert stdout und stderr bereits während der
+      Kindprozess noch läuft; execute bleibt nur ein sammelnder Komfortwrapper
+  passes: true
   needs:
     - STORY-13
   area: execution
