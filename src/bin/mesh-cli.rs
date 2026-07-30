@@ -39,7 +39,10 @@ fn main() {
     let address = value(&a, "--registry");
     let stream = connect(&address);
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        // A Run RPC may legitimately wait up to two seconds for an agent.
+        // Keep the client deadline comfortably beyond the server deadline so
+        // the registry can return its structured `agent_timeout` response.
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))
