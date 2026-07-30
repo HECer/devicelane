@@ -298,6 +298,10 @@ pub mod process_execution {
             Ok(self.start(request, timeout, cancellation)?.collect())
         }
 
+        pub(crate) fn workspace(&self) -> &Path {
+            &self.workspace
+        }
+
         pub fn start(
             &self,
             request: ProcessRequest,
@@ -2357,7 +2361,9 @@ pub mod preflight {
                     "Select full Xcode with: sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer",
                 )
             });
-            checks.push(if developer_ready && xcode.success {
+            let xcode_installed =
+                xcode.success || xcode.stderr.to_ascii_lowercase().contains("license");
+            checks.push(if developer_ready && xcode_installed {
                 ready_check("full_xcode", token_after(&xcode.stdout, "Xcode").ok())
             } else {
                 failed_check(
@@ -2511,6 +2517,10 @@ pub mod preflight {
                 cancellation,
             )
         }
+
+        pub(crate) fn workspace(&self) -> &Path {
+            self.executor.workspace()
+        }
     }
 
     fn token_after(output: &str, marker: &str) -> Result<String, PreflightError> {
@@ -2581,6 +2591,328 @@ pub mod preflight {
                 devices,
             })
         }
+    }
+}
+
+pub mod apple_discovery {
+    use crate::preflight::{AppleTool, AppleToolRunner};
+    use crate::process_execution::{CancellationToken, EventKind, ProcessEvent, TerminalStatus};
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    const APP_CAPABILITIES: [&str; 2] = ["apple.app.install@1", "apple.app.launch@1"];
+    static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Connection {
+        Usb,
+        Network,
+        Simulator,
+        Disconnected,
+    }
+
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Trust {
+        Trusted,
+        Untrusted,
+        NotApplicable,
+    }
+
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum DeveloperMode {
+        Enabled,
+        Disabled,
+        NotApplicable,
+    }
+
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Availability {
+        Available,
+        Locked,
+        Unavailable,
+        RuntimeMissing,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub struct DeviceSnapshot {
+        pub id: String,
+        pub name: String,
+        pub platform: String,
+        pub os_version: String,
+        pub connection: Connection,
+        pub trust: Trust,
+        pub developer_mode: DeveloperMode,
+        pub availability: Availability,
+        pub capabilities: Vec<String>,
+        pub repair: Option<String>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AppleDiscoveryError {
+        MalformedToolOutput,
+        ToolExecutionFailed,
+    }
+
+    impl AppleDiscoveryError {
+        pub fn code(self) -> &'static str {
+            match self {
+                Self::MalformedToolOutput => "malformed_tool_output",
+                Self::ToolExecutionFailed => "tool_execution_failed",
+            }
+        }
+    }
+
+    pub struct AppleDiscovery;
+
+    impl AppleDiscovery {
+        pub fn from_outputs(
+            devicectl_output: &str,
+            simctl_output: &str,
+        ) -> Result<Vec<DeviceSnapshot>, AppleDiscoveryError> {
+            let physical = parse_devicectl(devicectl_output)?;
+            let simulators = parse_simctl(simctl_output)?;
+            Ok(physical.into_iter().chain(simulators).collect())
+        }
+
+        pub fn discover(
+            runner: &AppleToolRunner,
+            working_directory: impl AsRef<Path>,
+            timeout: Duration,
+        ) -> Result<Vec<DeviceSnapshot>, AppleDiscoveryError> {
+            let output_path = runner.workspace().join(format!(
+                ".mesh-devicectl-devices-{}-{}.json",
+                std::process::id(),
+                OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let execution = run_events(
+                runner,
+                AppleTool::Devicectl,
+                vec![
+                    "list".into(),
+                    "devices".into(),
+                    "--json-output".into(),
+                    output_path.to_string_lossy().into_owned(),
+                ],
+                working_directory.as_ref(),
+                timeout,
+            );
+            let devicectl = execution.and_then(|_| {
+                std::fs::read_to_string(&output_path)
+                    .map_err(|_| AppleDiscoveryError::ToolExecutionFailed)
+            });
+            let _ = std::fs::remove_file(output_path);
+            let devicectl = devicectl?;
+            let simctl = run(
+                runner,
+                AppleTool::Simctl,
+                vec!["list".into(), "devices".into(), "--json".into()],
+                working_directory.as_ref(),
+                timeout,
+            )?;
+            Self::from_outputs(&devicectl, &simctl)
+        }
+    }
+
+    fn run(
+        runner: &AppleToolRunner,
+        tool: AppleTool,
+        args: Vec<String>,
+        working_directory: &Path,
+        timeout: Duration,
+    ) -> Result<String, AppleDiscoveryError> {
+        let events = run_events(runner, tool, args, working_directory, timeout)?;
+        let bytes = events
+            .iter()
+            .filter(|event| event.kind == EventKind::Stdout)
+            .flat_map(|event: &ProcessEvent| event.payload.iter().copied())
+            .collect();
+        String::from_utf8(bytes).map_err(|_| AppleDiscoveryError::MalformedToolOutput)
+    }
+
+    fn run_events(
+        runner: &AppleToolRunner,
+        tool: AppleTool,
+        args: Vec<String>,
+        working_directory: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<ProcessEvent>, AppleDiscoveryError> {
+        let events = runner
+            .execute(
+                tool,
+                args,
+                working_directory,
+                HashMap::new(),
+                timeout,
+                CancellationToken::new(),
+            )
+            .map_err(|_| AppleDiscoveryError::ToolExecutionFailed)?;
+        if !matches!(
+            events.last().map(|event| &event.kind),
+            Some(EventKind::Terminal(TerminalStatus::Exited(0)))
+        ) {
+            return Err(AppleDiscoveryError::ToolExecutionFailed);
+        }
+        Ok(events)
+    }
+
+    fn parse_devicectl(output: &str) -> Result<Vec<DeviceSnapshot>, AppleDiscoveryError> {
+        let value: Value =
+            serde_json::from_str(output).map_err(|_| AppleDiscoveryError::MalformedToolOutput)?;
+        required_array(&value, &["result", "devices"])?
+            .iter()
+            .map(|device| {
+                let properties = required(device, &["deviceProperties"])?;
+                let connection = required(device, &["connectionProperties"])?;
+                let paired = required_str(connection, &["pairingState"])? == "paired";
+                let tunnel_state = required_str(connection, &["tunnelState"])?;
+                let locked = required_str(properties, &["lockState"])? == "locked";
+                let developer_mode = match required_str(properties, &["developerModeStatus"])? {
+                    "enabled" => DeveloperMode::Enabled,
+                    "disabled" => DeveloperMode::Disabled,
+                    _ => return Err(AppleDiscoveryError::MalformedToolOutput),
+                };
+                let connection = match tunnel_state {
+                    "disconnected" | "unavailable" => Connection::Disconnected,
+                    "connected" => match required_str(connection, &["transportType"])? {
+                        "usb" => Connection::Usb,
+                        "network" => Connection::Network,
+                        _ => return Err(AppleDiscoveryError::MalformedToolOutput),
+                    },
+                    _ => return Err(AppleDiscoveryError::MalformedToolOutput),
+                };
+                let trust = if paired {
+                    Trust::Trusted
+                } else {
+                    Trust::Untrusted
+                };
+                let availability = if tunnel_state == "unavailable" {
+                    Availability::Unavailable
+                } else if locked {
+                    Availability::Locked
+                } else {
+                    Availability::Available
+                };
+                let repair = physical_repair(connection, trust, developer_mode, availability);
+                Ok(DeviceSnapshot {
+                    id: required_str(device, &["identifier"])?.into(),
+                    name: required_str(properties, &["name"])?.into(),
+                    platform: required_str(device, &["hardwareProperties", "platform"])?
+                        .to_ascii_lowercase(),
+                    os_version: required_str(properties, &["osVersionNumber"])?.into(),
+                    connection,
+                    trust,
+                    developer_mode,
+                    availability,
+                    capabilities: capabilities(repair.is_none()),
+                    repair,
+                })
+            })
+            .collect()
+    }
+
+    fn parse_simctl(output: &str) -> Result<Vec<DeviceSnapshot>, AppleDiscoveryError> {
+        let value: Value =
+            serde_json::from_str(output).map_err(|_| AppleDiscoveryError::MalformedToolOutput)?;
+        let runtimes = required(&value, &["devices"])?
+            .as_object()
+            .ok_or(AppleDiscoveryError::MalformedToolOutput)?;
+        let mut snapshots = Vec::new();
+        for (runtime, devices) in runtimes {
+            let os_version = runtime
+                .strip_prefix("com.apple.CoreSimulator.SimRuntime.iOS-")
+                .ok_or(AppleDiscoveryError::MalformedToolOutput)?
+                .replace('-', ".");
+            for device in devices
+                .as_array()
+                .ok_or(AppleDiscoveryError::MalformedToolOutput)?
+            {
+                let available = device
+                    .get("isAvailable")
+                    .and_then(Value::as_bool)
+                    .ok_or(AppleDiscoveryError::MalformedToolOutput)?;
+                let availability = if available {
+                    Availability::Available
+                } else {
+                    Availability::RuntimeMissing
+                };
+                let repair = (!available).then(|| {
+                    "Install the missing iOS Simulator runtime in Xcode Settings > Platforms."
+                        .into()
+                });
+                snapshots.push(DeviceSnapshot {
+                    id: required_str(device, &["udid"])?.into(),
+                    name: required_str(device, &["name"])?.into(),
+                    platform: "ios-simulator".into(),
+                    os_version: os_version.clone(),
+                    connection: Connection::Simulator,
+                    trust: Trust::NotApplicable,
+                    developer_mode: DeveloperMode::NotApplicable,
+                    availability,
+                    capabilities: capabilities(available),
+                    repair,
+                });
+            }
+        }
+        snapshots.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(snapshots)
+    }
+
+    fn physical_repair(
+        connection: Connection,
+        trust: Trust,
+        developer_mode: DeveloperMode,
+        availability: Availability,
+    ) -> Option<String> {
+        if trust == Trust::Untrusted {
+            Some("Unlock the device and trust this Mac, then pair it again.".into())
+        } else if availability == Availability::Locked {
+            Some("Unlock the device and keep it connected to this Mac.".into())
+        } else if connection == Connection::Disconnected {
+            Some("Reconnect the device by USB or enable its paired network connection.".into())
+        } else if developer_mode == DeveloperMode::Disabled {
+            Some("Enable Developer Mode in Settings > Privacy & Security on the device.".into())
+        } else {
+            None
+        }
+    }
+
+    fn capabilities(executable: bool) -> Vec<String> {
+        if executable {
+            APP_CAPABILITIES.map(str::to_owned).to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn required<'a>(value: &'a Value, path: &[&str]) -> Result<&'a Value, AppleDiscoveryError> {
+        path.iter().try_fold(value, |value, key| {
+            value
+                .get(key)
+                .ok_or(AppleDiscoveryError::MalformedToolOutput)
+        })
+    }
+
+    fn required_str<'a>(value: &'a Value, path: &[&str]) -> Result<&'a str, AppleDiscoveryError> {
+        required(value, path)?
+            .as_str()
+            .ok_or(AppleDiscoveryError::MalformedToolOutput)
+    }
+
+    fn required_array<'a>(
+        value: &'a Value,
+        path: &[&str],
+    ) -> Result<&'a Vec<Value>, AppleDiscoveryError> {
+        required(value, path)?
+            .as_array()
+            .ok_or(AppleDiscoveryError::MalformedToolOutput)
     }
 }
 

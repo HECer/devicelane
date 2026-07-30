@@ -1,0 +1,53 @@
+{
+  "info": {"version": "397.21", "future": true},
+  "result": {
+    "devices": [
+      {
+        "identifier": "00008110-001C2D123456801E",
+        "deviceProperties": {
+          "name": "Ada's iPhone",
+          "osVersionNumber": "17.5",
+          "developerModeStatus": "enabled",
+          "lockState": "unlocked"
+        },
+        "hardwareProperties": {"platform": "iOS"},
+        "connectionProperties": {"transportType": "usb", "pairingState": "paired", "tunnelState": "connected"},
+        "futureField": {"ignored": true}
+      },
+      {
+        "identifier": "00008120-LOCKED",
+        "deviceProperties": {
+          "name": "Locked iPhone",
+          "osVersionNumber": "18.0",
+          "developerModeStatus": "enabled",
+          "lockState": "locked"
+        },
+        "hardwareProperties": {"platform": "iOS"},
+        "connectionProperties": {"transportType": "usb", "pairingState": "paired", "tunnelState": "connected"}
+      },
+      {
+        "identifier": "00008130-UNTRUSTED",
+        "deviceProperties": {
+          "name": "New iPhone",
+          "osVersionNumber": "18.0",
+          "developerModeStatus": "disabled",
+          "lockState": "unlocked"
+        },
+        "hardwareProperties": {"platform": "iOS"},
+        "connectionProperties": {"transportType": "usb", "pairingState": "unpaired", "tunnelState": "disconnected"}
+      },
+      {
+        "identifier": "00008140-DISCONNECTED",
+        "deviceProperties": {"name": "Away iPhone", "osVersionNumber": "18.0", "developerModeStatus": "enabled", "lockState": "unlocked"},
+        "hardwareProperties": {"platform": "iOS"},
+        "connectionProperties": {"transportType": "network", "pairingState": "paired", "tunnelState": "disconnected"}
+      },
+      {
+        "identifier": "00008150-UNAVAILABLE",
+        "deviceProperties": {"name": "Busy iPhone", "osVersionNumber": "18.0", "developerModeStatus": "enabled", "lockState": "unlocked"},
+        "hardwareProperties": {"platform": "iOS"},
+        "connectionProperties": {"transportType": "usb", "pairingState": "paired", "tunnelState": "unavailable"}
+      }
+    ]
+  }
+}

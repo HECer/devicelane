@@ -30,7 +30,7 @@
       enthalten einen konkreten Repair-Hinweis
     - Die Discovery ruft Tools nur über AppleToolRunner auf und kann dieselbe
       Ausgabe als JSON über die CLI liefern
-  passes: false
+  passes: true
   needs:
     - STORY-21
   area: apple-discovery

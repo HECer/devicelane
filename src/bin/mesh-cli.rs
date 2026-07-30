@@ -1,5 +1,7 @@
 use device_development_mesh::{
+    apple_discovery::AppleDiscovery,
     network_processes::{Request, Response, RunRequest},
+    preflight::{AppleTool, AppleToolRunner},
     secure_transport::SecureTransport,
 };
 use std::{
@@ -18,6 +20,25 @@ fn main() {
     }
     if a.first().map(String::as_str) == Some("doctor") {
         doctor(Path::new(&value(&a, "--identity")));
+        return;
+    }
+    if a.first().map(String::as_str) == Some("apple-discover") {
+        let workspace = value(&a, "--workspace");
+        let runner = AppleToolRunner::new(
+            &workspace,
+            [
+                (AppleTool::Devicectl, value(&a, "--devicectl").into()),
+                (AppleTool::Simctl, value(&a, "--simctl").into()),
+            ],
+        )
+        .unwrap();
+        match AppleDiscovery::discover(&runner, ".", Duration::from_secs(30)) {
+            Ok(devices) => println!("{}", serde_json::to_string(&devices).unwrap()),
+            Err(error) => {
+                eprintln!("{}", serde_json::json!({"error": error.code()}));
+                std::process::exit(1);
+            }
+        }
         return;
     }
     if a.first().map(String::as_str) == Some("pair") {
@@ -109,7 +130,7 @@ fn value(a: &[String], n: &str) -> String {
 fn metadata(a: &[String]) -> bool {
     if a == ["--help"] {
         println!(
-            "{NAME} doctor --identity DIRECTORY | pair --address ADDRESS --identity DIRECTORY | --registry ADDRESS --identity DIRECTORY list [--json] | run|events --json-request JSON"
+            "{NAME} doctor --identity DIRECTORY | apple-discover --workspace DIRECTORY --devicectl PATH --simctl PATH --json | pair --address ADDRESS --identity DIRECTORY | --registry ADDRESS --identity DIRECTORY list [--json] | run|events --json-request JSON"
         );
         true
     } else if a == ["--version"] {
