@@ -9,6 +9,7 @@ edition = "2024"
 
 [dependencies]
 cap-std = "3"
+command-group = "5"
 prost = "0.13"
 sha2 = "0.10"
 

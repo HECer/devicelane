@@ -181,6 +181,227 @@ pub mod protocol {
     }
 }
 
+pub mod process_execution {
+    use command_group::CommandGroup;
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::io::Read;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TerminalStatus {
+        Exited(i32),
+        TimedOut,
+        Cancelled,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum EventKind {
+        Started,
+        Stdout,
+        Stderr,
+        Terminal(TerminalStatus),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ProcessEvent {
+        pub sequence: u64,
+        pub kind: EventKind,
+        pub payload: Vec<u8>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ProcessError {
+        ProgramDenied,
+        WorkspaceEscape,
+        EnvironmentDenied,
+        Io,
+    }
+
+    #[derive(Clone, Default)]
+    pub struct CancellationToken(Arc<AtomicBool>);
+
+    impl CancellationToken {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn cancel(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    pub struct ProcessRequest {
+        pub program: PathBuf,
+        pub args: Vec<String>,
+        pub working_directory: PathBuf,
+        pub environment: HashMap<String, String>,
+    }
+
+    pub struct ProcessExecutor {
+        workspace: PathBuf,
+        programs: HashSet<PathBuf>,
+        environment: HashSet<String>,
+    }
+
+    impl ProcessExecutor {
+        pub fn new(
+            workspace: impl AsRef<Path>,
+            programs: impl IntoIterator<Item = PathBuf>,
+            environment: impl IntoIterator<Item = &'static str>,
+        ) -> Result<Self, ProcessError> {
+            let workspace = fs::canonicalize(workspace).map_err(|_| ProcessError::Io)?;
+            let programs = programs
+                .into_iter()
+                .map(|program| fs::canonicalize(program).map_err(|_| ProcessError::ProgramDenied))
+                .collect::<Result<_, _>>()?;
+            Ok(Self {
+                workspace,
+                programs,
+                environment: environment.into_iter().map(str::to_owned).collect(),
+            })
+        }
+
+        pub fn execute(
+            &self,
+            request: ProcessRequest,
+            timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> Result<Vec<ProcessEvent>, ProcessError> {
+            let program =
+                fs::canonicalize(&request.program).map_err(|_| ProcessError::ProgramDenied)?;
+            if !self.programs.contains(&program) {
+                return Err(ProcessError::ProgramDenied);
+            }
+            if request
+                .environment
+                .keys()
+                .any(|name| !self.environment.contains(name))
+            {
+                return Err(ProcessError::EnvironmentDenied);
+            }
+            let working_directory =
+                fs::canonicalize(self.workspace.join(request.working_directory))
+                    .map_err(|_| ProcessError::WorkspaceEscape)?;
+            if !working_directory.starts_with(&self.workspace) {
+                return Err(ProcessError::WorkspaceEscape);
+            }
+
+            let mut command = Command::new(program);
+            command
+                .args(request.args)
+                .current_dir(working_directory)
+                .env_clear()
+                .envs(request.environment)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.group_spawn().map_err(|_| ProcessError::Io)?;
+            let stdout = child.inner().stdout.take().ok_or(ProcessError::Io)?;
+            let stderr = child.inner().stderr.take().ok_or(ProcessError::Io)?;
+            let (sender, receiver) = mpsc::channel();
+            let stdout_reader = read_stream(stdout, EventKind::Stdout, sender.clone());
+            let stderr_reader = read_stream(stderr, EventKind::Stderr, sender);
+            let started = Instant::now();
+            let mut output = Vec::new();
+            let mut closed_streams = 0;
+            let mut exit_code = None;
+            let terminal = loop {
+                while let Ok((kind, payload)) = receiver.try_recv() {
+                    closed_streams += 1;
+                    if !payload.is_empty() {
+                        output.push((kind, payload));
+                    }
+                }
+                if cancellation.is_cancelled() {
+                    kill_running_group(&mut child)?;
+                    child.inner().wait().map_err(|_| ProcessError::Io)?;
+                    break TerminalStatus::Cancelled;
+                }
+                if started.elapsed() >= timeout {
+                    kill_running_group(&mut child)?;
+                    child.inner().wait().map_err(|_| ProcessError::Io)?;
+                    break TerminalStatus::TimedOut;
+                }
+                if exit_code.is_none() {
+                    exit_code = child
+                        .try_wait()
+                        .map_err(|_| ProcessError::Io)?
+                        .map(|status| status.code().unwrap_or(-1));
+                }
+                if let Some(code) = exit_code.filter(|_| closed_streams == 2) {
+                    break TerminalStatus::Exited(code);
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            stdout_reader.join().map_err(|_| ProcessError::Io)?;
+            stderr_reader.join().map_err(|_| ProcessError::Io)?;
+
+            for item in receiver {
+                if !item.1.is_empty() {
+                    output.push(item);
+                }
+            }
+
+            let mut events = vec![ProcessEvent {
+                sequence: 1,
+                kind: EventKind::Started,
+                payload: Vec::new(),
+            }];
+            for (kind, payload) in output {
+                events.push(ProcessEvent {
+                    sequence: events.len() as u64 + 1,
+                    kind,
+                    payload,
+                });
+            }
+            events.push(ProcessEvent {
+                sequence: events.len() as u64 + 1,
+                kind: EventKind::Terminal(terminal),
+                payload: Vec::new(),
+            });
+            Ok(events)
+        }
+    }
+
+    fn read_stream(
+        mut stream: impl Read + Send + 'static,
+        kind: EventKind,
+        sender: mpsc::Sender<(EventKind, Vec<u8>)>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let mut payload = Vec::new();
+            if stream.read_to_end(&mut payload).is_ok() {
+                let _ = sender.send((kind, payload));
+            }
+        })
+    }
+
+    fn kill_running_group(child: &mut command_group::GroupChild) -> Result<(), ProcessError> {
+        match child.kill() {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                Ok(())
+            }
+            Err(_) => Err(ProcessError::Io),
+        }
+    }
+}
+
 pub mod identity {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};

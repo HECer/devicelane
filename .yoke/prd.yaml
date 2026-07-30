@@ -24,7 +24,7 @@
       Environment-Overrides außerhalb einer Allowlist werden vor Spawn abgelehnt
     - Timeout und Abbruch beenden den gesamten Kindprozessbaum auf Windows,
       macOS und Linux deterministisch
-  passes: false
+  passes: true
   needs:
     - STORY-13
   area: execution
