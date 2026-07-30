@@ -93,7 +93,7 @@
       werden abgelehnt
     - Der Controller kann einen laufenden Job abbrechen und erhält einen
       terminalen Status
-  passes: false
+  passes: true
   needs:
     - STORY-6
   area: execution
