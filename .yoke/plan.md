@@ -336,4 +336,8 @@ Jede Phase erhält eine eigene freigegebene PRD und einen eigenen Yoke-Loop. Dad
 
 ## 14. Freigabekriterium für den ersten Yoke-Loop
 
-Nach Freigabe implementiert der erste Loop ausschließlich Phase 1 aus `.yoke/prd.yaml`. Er darf Phase 2–7 nicht vorziehen. Fertig ist Phase 1 erst, wenn ein CLI-Client mit mTLS/Pairing einen separaten Agentprozess entdeckt, eine policy-geprüfte Workspace-Operation ausführt, Logs mit Reconnect empfängt und Fake-Device-Capabilities unter Windows/macOS/Linux über dieselben Contract-Tests anspricht.
+Nach Freigabe implementiert der erste Loop ausschließlich Phase 1. Er darf Phase 2–7 nicht vorziehen. Fertig ist Phase 1 erst, wenn ein CLI-Client mit echtem TLS/Pairing einen separaten Agentprozess entdeckt, eine policy-geprüfte Workspace-Operation ausführt, Logs mit Reconnect empfängt und Fake-Device-Capabilities unter Windows/macOS/Linux über dieselben Contract-Tests anspricht.
+
+### Phase-1-Audit vom 30. Juli 2026
+
+Der erste Loop markierte mehrere Stories trotz fehlender story-spezifischer Implementierung als bestanden, weil das globale Gate nur die bereits vorhandenen Workspace-Tests ausführte. Die Reparaturstories STORY-13 bis STORY-20 ersetzen deshalb den formalen Abschluss: jede Story benennt eine konkrete Testsuite oder einen Bootstrap-Smoke-Test, und Phase 2 beginnt erst nach einem realen Mehrprozess-Vertikalschnitt. Frühere `passes`-Werte sind keine Evidenz für Hardware- oder Netzwerkunterstützung.

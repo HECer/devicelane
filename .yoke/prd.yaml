@@ -1,179 +1,94 @@
-- id: STORY-1
-  title: Rust-Workspace und grüne plattformübergreifende Verifikation anlegen
+- id: STORY-13
+  title: Verifikationsgate gegen leere Story-Abschlüsse härten
   priority: 1
   acceptance:
-    - cargo test --workspace beendet sich mit Exitcode 0 und führt mindestens
-      einen Test aus
-    - cargo clippy --workspace --all-targets -- -D warnings beendet sich mit
-      Exitcode 0
-    - .yoke/config.yaml enthält verify.command mit cargo test --workspace
-    - Der Workspace kompiliert auf Windows, macOS und Linux ohne
-      plattformspezifische Adapter zu aktivieren
-  passes: true
-  area: foundation
-- id: STORY-2
-  title: Versioniertes Capability- und Fehlerprotokoll definieren
+    - Das Yoke-Gate führt Workspace-Tests, Clippy mit -D warnings und rustfmt --check aus
+    - Eine plattformübergreifende CI-Matrix baut und testet Windows, macOS und Linux
+    - Ein maschinenlesbarer Acceptance-Test-Katalog ordnet jede folgende Story mindestens einer konkreten Testsuite oder einem Bootstrap-Smoke-Test zu
+    - Die Dokumentation erklärt, dass ein passes-Status ohne grüne story-spezifische Akzeptanzprüfung ungültig ist
+  passes: false
+  area: quality
+- id: STORY-14
+  title: Begrenzte reale Prozessausführung und sequenzierte Eventstreams liefern
   priority: 2
   acceptance:
-    - Contract-Tests serialisieren und deserialisieren Host, Device, Capability,
-      Job, Event und Artifact ohne Informationsverlust
-    - Eine unbekannte optionale Protokoll-Eigenschaft wird von der vorherigen
-      Minor-Version ohne Absturz ignoriert
-    - Jeder Fehler enthält stabilen Code, menschenlesbare Meldung, Retry-Klasse
-      und optionale Repair-Aktion
-  passes: true
+    - tests/process_execution.rs startet einen erlaubten Helper-Prozess in einem festen Workspace mit bereinigtem Environment
+    - stdout, stderr, Start, Exit, Timeout und Cancel besitzen lückenlose monotone Sequenznummern und genau einen terminalen Status
+    - Nicht erlaubte Programme, Pfade außerhalb des Workspace und Environment-Overrides außerhalb einer Allowlist werden vor Spawn abgelehnt
+    - Timeout und Abbruch beenden den gesamten Kindprozessbaum auf Windows, macOS und Linux deterministisch
+  passes: false
   needs:
-    - STORY-1
-  area: protocol
-- id: STORY-3
-  title: Maschinenidentität und lokales mTLS-Pairing implementieren
+    - STORY-13
+  area: execution
+- id: STORY-15
+  title: Inhaltsadressierten Artefaktspeicher mit Resume implementieren
   priority: 3
   acceptance:
-    - Zwei frische Prozesse können sich nur mit einem gültigen einmaligen
-      Pairing-Code gegenseitig vertrauen
-    - Ein abgelaufener oder wiederverwendeter Pairing-Code wird abgelehnt und im
-      Audit protokolliert
-    - Nach erfolgreichem Pairing wird jede unverschlüsselte oder fremd signierte
-      Verbindung abgelehnt
-  passes: true
+    - tests/artifacts.rs registriert Artefakte mit SHA-256, Größe, MIME-Typ, Job-ID und Ablaufzeit
+    - Chunks werden idempotent geschrieben und nach Verbindungsabbruch werden nur fehlende Chunks angefordert
+    - Ein veränderter oder falsch gehashter Chunk verhindert atomar die Veröffentlichung
+    - Pfadtraversal, abgelaufene Artefakte und Zugriffe ohne passende Session werden abgelehnt
+  passes: false
   needs:
-    - STORY-2
-  area: identity
-- id: STORY-4
-  title: Agent-Registry, Heartbeats und Capability-Snapshots bereitstellen
+    - STORY-14
+  area: artifacts
+- id: STORY-16
+  title: Device-Adapter-SDK und vollständigen Fake-Adapter liefern
   priority: 4
   acceptance:
-    - Ein gestarteter Agent erscheint innerhalb von 5 Sekunden mit OS,
-      Architektur und Capability-Snapshot in der CLI
-    - Ein beendeter Agent wird nach Ablauf des Heartbeat-Fensters als offline
-      und nicht als gelöscht angezeigt
-    - Eine Änderung des Toolchain-Snapshots erzeugt eine neue monotone Revision
-  passes: true
+    - tests/device_adapter_contract.rs prüft discover, lease, install, launch, stop, logs und artifact gegen FakeDeviceAdapter
+    - Adapteroperationen benötigen den Policy- und Lease-Kontext statt ihn umgehen zu können
+    - Nicht unterstützte Operationen liefern unsupported_capability und Detach während launch liefert waiting_for_device
+    - Dieselbe Contract-Suite kann später unverändert gegen Apple- und Android-Adapter ausgeführt werden
+  passes: false
   needs:
-    - STORY-3
-  area: discovery
-- id: STORY-5
-  title: Deny-by-default Policies und exklusive Leases erzwingen
+    - STORY-15
+  area: adapters
+- id: STORY-17
+  title: Persistente kryptografische Maschinenidentität und echtes TLS-Pairing liefern
   priority: 5
   acceptance:
-    - Eine Operation ohne passende Capability-Freigabe wird vor
-      Adapterausführung abgelehnt
-    - Nur eine Schreib- oder Debuglease kann dasselbe Device gleichzeitig
-      besitzen
-    - Eine abgelaufene oder widerrufene Lease kann keine neue Operation starten
-    - Observer dürfen freigegebene Logs lesen, aber keine Prozesse oder Geräte
-      verändern
-  passes: true
+    - tests/secure_transport.rs führt einen echten TLS-Handshake über Loopback mit getrennten Client- und Serveridentitäten aus
+    - Private Schlüssel und Truststore werden mit restriktiven Dateirechten persistent gespeichert und nie protokolliert
+    - Ein einmaliger Pairing-Code ist kryptografisch zufällig, läuft ab und kann nicht wiederverwendet werden
+    - Unverschlüsselte, fremd signierte, abgelaufene oder widerrufene Peers werden vor RPC-Verarbeitung abgelehnt und auditiert
+  passes: false
   needs:
-    - STORY-4
-  area: policy
-- id: STORY-6
-  title: Isolierte Workspaces mit Pfadgrenzen und Manifesten verwalten
+    - STORY-16
+  area: identity
+- id: STORY-18
+  title: Registry, Host-Agent und CLI als getrennte Netzwerkprozesse bereitstellen
   priority: 6
   acceptance:
-    - Ein Client kann ein Manifest in einen agent-eigenen Sitzungsworkspace
-      übertragen und identische SHA-256-Hashes zurücklesen
-    - Absolute Pfade, Parent Traversal sowie Symlink- oder Junction-Escapes aus
-      dem Workspace werden abgelehnt
-    - Ein zweiter Schreibclient erhält bei bestehender Lease einen eindeutigen
-      Konfliktfehler
-  passes: true
+    - Die Binaries mesh-registry, mesh-agent und mesh-cli besitzen stabile --help- und --version-Ausgaben
+    - tests/network_processes.rs startet alle drei Prozesse auf dynamischen Loopback-Ports und beweist Pairing sowie Agent-Heartbeat
+    - mesh-cli list zeigt Hosts, Capabilities und Devices als Text und JSON ohne Rohprotokollkenntnis
+    - Der Agent baut ausschließlich ausgehende Verbindungen auf und ein Offline-Agent bleibt mit letztem Snapshot sichtbar
+  passes: false
   needs:
-    - STORY-5
-  area: workspace
-- id: STORY-7
-  title: Begrenzte Prozessausführung und sequenzierte Eventstreams anbieten
+    - STORY-17
+  area: networking
+- id: STORY-19
+  title: Reale Client-zu-Agent-Ende-zu-Ende-Strecke beweisen
   priority: 7
   acceptance:
-    - Ein freigegebener Prozess läuft mit festem Workspace, bereinigtem
-      Environment und Zeitlimit
-    - stdout, stderr, Start, Exit und Timeout werden mit monotonen
-      Sequenznummern gestreamt
-    - Ein nicht freigegebener Befehl und ein Prozess außerhalb des Workspaces
-      werden abgelehnt
-    - Der Controller kann einen laufenden Job abbrechen und erhält einen
-      terminalen Status
-  passes: true
+    - tests/e2e_vertical_slice.rs pairt getrennte Prozesse, öffnet einen isolierten Workspace, überträgt ein Manifest und empfängt einen echten Jobexit
+    - Der Test trennt den CLI-Stream, verbindet sich mit Cursor erneut und beweist eine lückenlose Eventfolge ohne Doppelausführung
+    - Jobs und Artefakte bleiben über einen Registry-Neustart erhalten oder werden mit einem stabilen Recovery-Fehler ausgewiesen
+    - Audit-Ereignisse verbinden Principal, Host, Device, Workspace, Job und Ergebnis über stabile IDs
+  passes: false
   needs:
-    - STORY-6
-  area: execution
-- id: STORY-8
-  title: Reconnect und idempotente Jobwiederaufnahme implementieren
+    - STORY-18
+  area: e2e
+- id: STORY-20
+  title: Reproduzierbare lokale Bedienung und Bootstrap dokumentieren
   priority: 8
   acceptance:
-    - Nach erzwungenem Verbindungsabbruch setzt der Client denselben Job ab der
-      letzten bestätigten Sequenz ohne Eventlücke fort
-    - Ein wiederholter nicht-idempotenter Request mit derselben Request-ID
-      erzeugt keine zweite Ausführung
-    - Mindestens 10000 gepufferte Events können nach einem Reconnect vollständig
-      nachgeliefert werden
-  passes: true
+    - README.md enthält den vollständigen lokalen Windows-, macOS- und Linux-Workflow vom Build bis zum ersten Remote-Job
+    - scripts/setup-windows.ps1 und scripts/setup-mac.sh sind idempotent und benötigen nach Installation der Systemvoraussetzungen nur einen Aufruf
+    - mesh-cli doctor liefert maschinenlesbare Reparaturhinweise für Rust, Netzwerk, Xcode, ADB, Zertifikate und Dateirechte
+    - Hardwaretests für iPhone und Android sind klar als nachgelagerte Gates markiert und Mocks können sie nicht als bestanden setzen
+  passes: false
   needs:
-    - STORY-7
-  area: sessions
-- id: STORY-9
-  title: Inhaltsadressierte Artefakte und wiederaufnehmbare Übertragung ergänzen
-  priority: 9
-  acceptance:
-    - Ein Artefakt wird mit SHA-256, Größe, MIME-Typ, Job-ID und Ablaufzeit
-      registriert
-    - Eine unterbrochene Übertragung sendet nach Reconnect nur noch fehlende
-      Chunks
-    - Ein veränderter Chunk wird vor Veröffentlichung des Artefakts erkannt und
-      abgelehnt
-  passes: true
-  needs:
-    - STORY-8
-  area: artifacts
-- id: STORY-10
-  title: Plattformunabhängiges Device-Adapter-SDK und Fake-Adapter liefern
-  priority: 10
-  acceptance:
-    - Die Contract-Suite prüft discover, lease, install, launch, stop, logs und
-      artifact gegen einen Fake-Adapter
-    - Nicht unterstützte Operationen liefern unsupported_capability statt eines
-      generischen Prozessfehlers
-    - Ein simuliertes Device-Detach während launch erzeugt waiting_for_device
-      und endet nach dem Testtimeout deterministisch
-  passes: true
-  needs:
-    - STORY-5
-    - STORY-8
-  area: adapters
-- id: STORY-11
-  title: Apple- und Android-Preflight-Adapter ohne Hardwareabhängigkeit anlegen
-  priority: 11
-  acceptance:
-    - Der Apple-Preflight meldet auf macOS Xcode-, SDK-, devicectl- und
-      simctl-Versionen als Capability-Snapshot
-    - Der Apple-Preflight meldet auf Nicht-macOS unsupported_host ohne
-      Xcode-Kommandos aufzurufen
-    - Der Android-Preflight erkennt ADB-Version und normalisiert
-      fixture-basierte device-list-Ausgaben für authorized, unauthorized und
-      offline
-    - Alle Parser-Tests verwenden versionierte Fixtures und laufen ohne
-      angeschlossene Hardware
-  passes: true
-  needs:
-    - STORY-10
-  area: platform-adapters
-- id: STORY-12
-  title: Sicheren Client-zu-Agent-Vertikalschnitt dokumentieren und beweisen
-  priority: 12
-  acceptance:
-    - Ein Ende-zu-Ende-Test startet Registry, Agent und CLI als getrennte
-      Prozesse, pairt sie, öffnet einen Workspace und empfängt einen Jobexit
-    - Der Test unterbricht die Clientverbindung und beweist lückenlose
-      Eventwiederaufnahme
-    - Die CLI zeigt Hosts, Capabilities, Devices, Jobs und Artefakte ohne
-      Rohprotokollkenntnis an
-    - Die Dokumentation enthält reproduzierbare lokale Befehle und markiert
-      echte iOS-/Android-Hardwaretests ausdrücklich als spätere Gates
-  passes: true
-  needs:
-    - STORY-4
-    - STORY-6
-    - STORY-8
-    - STORY-9
-    - STORY-11
-  area: e2e
+    - STORY-19
+  area: bootstrap
