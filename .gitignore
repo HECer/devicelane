@@ -4,6 +4,7 @@
 .yoke/backup/
 .yoke/loop-status.json
 .yoke/loop.log
+.yoke/batch-*.log
 .yoke/loop.lock
 .yoke/loop.lock.takeover
 .yoke/loop.lock.takeover.recovery
