@@ -85,7 +85,7 @@
     - Der vollständige Fake-Tool-Ablauf erfüllt die bestehende
       DeviceAdapter-Contract-Suite, markiert aber kein physisches Hardware-Gate
       als bestanden
-  passes: false
+  passes: true
   needs:
     - STORY-24
   area: apple-simulator

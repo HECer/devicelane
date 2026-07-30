@@ -1140,6 +1140,11 @@ pub mod authorization {
         ReadDeviceLogs { device_id: &'a str },
         ReadArtifact { device_id: &'a str },
         AttachDebugger { device_id: &'a str },
+        SimulatorLifecycle { device_id: &'a str },
+        SimulatorScreenshot { device_id: &'a str },
+        SimulatorLocation { device_id: &'a str },
+        SimulatorPrivacy { device_id: &'a str },
+        SimulatorMedia { device_id: &'a str },
     }
 
     impl Operation<'_> {
@@ -1154,6 +1159,11 @@ pub mod authorization {
                 Self::ReadDeviceLogs { .. } => "logs.read",
                 Self::ReadArtifact { .. } => "artifact.read",
                 Self::AttachDebugger { .. } => "debug.attach",
+                Self::SimulatorLifecycle { .. } => "simulator.lifecycle",
+                Self::SimulatorScreenshot { .. } => "simulator.screenshot",
+                Self::SimulatorLocation { .. } => "simulator.location",
+                Self::SimulatorPrivacy { .. } => "simulator.privacy",
+                Self::SimulatorMedia { .. } => "simulator.media",
             }
         }
 
@@ -1166,6 +1176,11 @@ pub mod authorization {
                 | Self::ReadDeviceLogs { device_id }
                 | Self::ReadArtifact { device_id }
                 | Self::AttachDebugger { device_id } => Some(device_id),
+                Self::SimulatorLifecycle { device_id }
+                | Self::SimulatorScreenshot { device_id }
+                | Self::SimulatorLocation { device_id }
+                | Self::SimulatorPrivacy { device_id }
+                | Self::SimulatorMedia { device_id } => Some(device_id),
             }
         }
     }
@@ -1363,6 +1378,32 @@ pub mod device_adapter {
                 .execute(self.actor, operation, self.lease, action)
                 .map_err(Into::into)
         }
+
+        pub(crate) fn authorize_simulator<T>(
+            &mut self,
+            operation: Operation<'_>,
+            action: impl FnOnce() -> T,
+        ) -> Result<T, AdapterError> {
+            self.authorize(operation, action)
+        }
+
+        pub(crate) fn authorize_adapter<T>(
+            &mut self,
+            operation: Operation<'_>,
+            action: impl FnOnce() -> T,
+        ) -> Result<T, AdapterError> {
+            self.authorize(operation, action)
+        }
+
+        pub(crate) fn acquire_lease(
+            &mut self,
+            device_id: &str,
+            lifetime: Duration,
+        ) -> Result<(), AdapterError> {
+            self.authorize(Operation::LeaseDevice, || ())?;
+            self.lease = Some(self.policy.acquire_lease(device_id, self.actor, lifetime)?);
+            Ok(())
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1377,7 +1418,7 @@ pub mod device_adapter {
         Detached,
     }
 
-    mod sealed {
+    pub(crate) mod sealed {
         pub trait Sealed {}
     }
 
@@ -1599,6 +1640,452 @@ pub mod device_adapter {
 
         fn attach_debugger(&mut self, _device_id: &str) -> Result<(), AdapterError> {
             Err(AdapterError::UnsupportedCapability)
+        }
+    }
+}
+
+pub mod apple_simulator {
+    use crate::authorization::Operation;
+    use crate::device_adapter::{
+        self, AdapterContext, AdapterDevice, AdapterError, DeviceAdapter, DeviceState,
+    };
+    use crate::preflight::AppleTool;
+    use crate::preflight::AppleToolRunner;
+    use crate::process_execution::{CancellationToken, EventKind, TerminalStatus};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SimulatorState {
+        Shutdown,
+        Booted,
+        Deleted,
+        Unchanged,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SimulatorError {
+        CapabilityDenied,
+        LeaseInactive,
+        WorkspaceEscape,
+        Busy,
+        BootFailed,
+        RuntimeMissing,
+        Detached,
+    }
+
+    impl SimulatorError {
+        pub fn code(self) -> &'static str {
+            match self {
+                Self::CapabilityDenied => "capability_denied",
+                Self::LeaseInactive => "lease_inactive",
+                Self::WorkspaceEscape => "workspace_escape",
+                Self::Busy => "busy",
+                Self::BootFailed => "boot_failed",
+                Self::RuntimeMissing => "runtime_missing",
+                Self::Detached => "detach",
+            }
+        }
+    }
+
+    impl From<AdapterError> for SimulatorError {
+        fn from(error: AdapterError) -> Self {
+            match error {
+                AdapterError::LeaseInactive => Self::LeaseInactive,
+                _ => Self::CapabilityDenied,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SimulatorOperation {
+        Create {
+            name: String,
+            device_type: String,
+            runtime: String,
+        },
+        Boot,
+        BootStatus,
+        Shutdown,
+        Delete,
+        Install {
+            path: PathBuf,
+        },
+        Uninstall {
+            bundle_id: String,
+        },
+        Launch {
+            bundle_id: String,
+        },
+        Terminate {
+            bundle_id: String,
+        },
+        Screenshot {
+            path: PathBuf,
+        },
+        LogStream,
+        Location {
+            latitude: String,
+            longitude: String,
+        },
+        Privacy {
+            service: String,
+            bundle_id: String,
+            grant: bool,
+        },
+        AddMedia {
+            paths: Vec<PathBuf>,
+        },
+    }
+
+    impl SimulatorOperation {
+        pub fn arguments(&self) -> Vec<String> {
+            self.arguments_for("sim-1")
+        }
+
+        fn arguments_for(&self, device_id: &str) -> Vec<String> {
+            match self {
+                Self::Create {
+                    name,
+                    device_type,
+                    runtime,
+                } => vec![
+                    "create".into(),
+                    name.clone(),
+                    device_type.clone(),
+                    runtime.clone(),
+                ],
+                Self::Boot => vec!["boot".into(), device_id.into()],
+                Self::BootStatus => vec!["bootstatus".into(), device_id.into(), "-b".into()],
+                Self::Shutdown => vec!["shutdown".into(), device_id.into()],
+                Self::Delete => vec!["delete".into(), device_id.into()],
+                Self::Install { path } => vec![
+                    "install".into(),
+                    device_id.into(),
+                    path.to_string_lossy().into_owned(),
+                ],
+                Self::Uninstall { bundle_id } => {
+                    vec!["uninstall".into(), device_id.into(), bundle_id.clone()]
+                }
+                Self::Launch { bundle_id } => {
+                    vec!["launch".into(), device_id.into(), bundle_id.clone()]
+                }
+                Self::Terminate { bundle_id } => {
+                    vec!["terminate".into(), device_id.into(), bundle_id.clone()]
+                }
+                Self::Screenshot { path } => vec![
+                    "io".into(),
+                    device_id.into(),
+                    "screenshot".into(),
+                    path.to_string_lossy().into_owned(),
+                ],
+                Self::LogStream => vec![
+                    "spawn".into(),
+                    device_id.into(),
+                    "log".into(),
+                    "stream".into(),
+                ],
+                Self::Location {
+                    latitude,
+                    longitude,
+                } => vec![
+                    "location".into(),
+                    device_id.into(),
+                    "set".into(),
+                    format!("{latitude},{longitude}"),
+                ],
+                Self::Privacy {
+                    service,
+                    bundle_id,
+                    grant,
+                } => vec![
+                    "privacy".into(),
+                    device_id.into(),
+                    if *grant { "grant" } else { "revoke" }.into(),
+                    service.clone(),
+                    bundle_id.clone(),
+                ],
+                Self::AddMedia { paths } => std::iter::once("addmedia".into())
+                    .chain(std::iter::once(device_id.into()))
+                    .chain(paths.iter().map(|p| p.to_string_lossy().into_owned()))
+                    .collect(),
+            }
+        }
+    }
+
+    pub struct AppleSimulator {
+        runner: AppleToolRunner,
+        timeout: Duration,
+        workspace: PathBuf,
+        states: HashMap<String, SimulatorState>,
+        installed: Vec<u8>,
+        application: Option<String>,
+    }
+
+    impl AppleSimulator {
+        pub fn new(runner: AppleToolRunner, timeout: Duration) -> Self {
+            let workspace = runner.workspace().to_owned();
+            Self {
+                runner,
+                timeout,
+                workspace,
+                states: HashMap::new(),
+                installed: Vec::new(),
+                application: None,
+            }
+        }
+
+        pub fn lease(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            lifetime: Duration,
+        ) -> Result<(), SimulatorError> {
+            context
+                .acquire_lease(device_id, lifetime)
+                .map_err(Into::into)
+        }
+
+        pub fn execute(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            operation: SimulatorOperation,
+        ) -> Result<SimulatorState, SimulatorError> {
+            self.validate_paths(&operation)?;
+            let authorization = match operation {
+                SimulatorOperation::Install { .. } => Operation::InstallDevice { device_id },
+                SimulatorOperation::Launch { .. } => Operation::StartProcess { device_id },
+                SimulatorOperation::Terminate { .. } => Operation::StopProcess { device_id },
+                SimulatorOperation::LogStream => Operation::ReadDeviceLogs { device_id },
+                SimulatorOperation::Screenshot { .. } => {
+                    Operation::SimulatorScreenshot { device_id }
+                }
+                SimulatorOperation::Location { .. } => Operation::SimulatorLocation { device_id },
+                SimulatorOperation::Privacy { .. } => Operation::SimulatorPrivacy { device_id },
+                SimulatorOperation::AddMedia { .. } => Operation::SimulatorMedia { device_id },
+                _ => Operation::SimulatorLifecycle { device_id },
+            };
+            context.authorize_simulator(authorization, || ())?;
+            if matches!(operation, SimulatorOperation::Boot)
+                && self.states.get(device_id) == Some(&SimulatorState::Booted)
+            {
+                return Ok(SimulatorState::Booted);
+            }
+            if matches!(operation, SimulatorOperation::Shutdown)
+                && self.states.get(device_id) == Some(&SimulatorState::Shutdown)
+            {
+                return Ok(SimulatorState::Shutdown);
+            }
+            if matches!(operation, SimulatorOperation::Delete)
+                && self.states.get(device_id) == Some(&SimulatorState::Deleted)
+            {
+                return Ok(SimulatorState::Deleted);
+            }
+            let events = self
+                .runner
+                .execute(
+                    AppleTool::Simctl,
+                    operation.arguments_for(device_id),
+                    ".",
+                    HashMap::new(),
+                    self.timeout,
+                    CancellationToken::new(),
+                )
+                .map_err(|_| SimulatorError::Busy)?;
+            if !events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::Terminal(TerminalStatus::Exited(0))))
+            {
+                let stderr = events
+                    .iter()
+                    .filter(|event| matches!(event.kind, EventKind::Stderr))
+                    .flat_map(|event| event.payload.iter().copied())
+                    .collect::<Vec<_>>();
+                let stderr = String::from_utf8_lossy(&stderr);
+                return Err(if stderr.contains("runtime_missing") {
+                    SimulatorError::RuntimeMissing
+                } else if stderr.contains("boot_failed") {
+                    SimulatorError::BootFailed
+                } else if stderr.contains("detach") {
+                    SimulatorError::Detached
+                } else {
+                    SimulatorError::Busy
+                });
+            }
+            let state = match operation {
+                SimulatorOperation::Boot | SimulatorOperation::BootStatus => SimulatorState::Booted,
+                SimulatorOperation::Shutdown => SimulatorState::Shutdown,
+                SimulatorOperation::Delete => SimulatorState::Deleted,
+                _ => SimulatorState::Unchanged,
+            };
+            self.states.insert(device_id.to_owned(), state);
+            Ok(state)
+        }
+
+        fn validate_paths(&self, operation: &SimulatorOperation) -> Result<(), SimulatorError> {
+            match operation {
+                SimulatorOperation::Install { path } => self.input_path(path),
+                SimulatorOperation::AddMedia { paths } => {
+                    paths.iter().try_for_each(|path| self.input_path(path))
+                }
+                SimulatorOperation::Screenshot { path } => self.output_path(path),
+                _ => Ok(()),
+            }
+        }
+
+        fn input_path(&self, path: &Path) -> Result<(), SimulatorError> {
+            fs::canonicalize(self.workspace.join(path))
+                .ok()
+                .filter(|path| path.starts_with(&self.workspace))
+                .map(|_| ())
+                .ok_or(SimulatorError::WorkspaceEscape)
+        }
+
+        fn output_path(&self, path: &Path) -> Result<(), SimulatorError> {
+            let destination = self.workspace.join(path);
+            if fs::symlink_metadata(&destination)
+                .ok()
+                .is_some_and(|metadata| {
+                    metadata.file_type().is_symlink()
+                        || !fs::canonicalize(&destination)
+                            .ok()
+                            .is_some_and(|path| path.starts_with(&self.workspace))
+                })
+            {
+                return Err(SimulatorError::WorkspaceEscape);
+            }
+            let parent = path.parent().unwrap_or(Path::new("."));
+            fs::canonicalize(self.workspace.join(parent))
+                .ok()
+                .filter(|path| path.starts_with(&self.workspace))
+                .map(|_| ())
+                .ok_or(SimulatorError::WorkspaceEscape)
+        }
+    }
+
+    impl device_adapter::sealed::Sealed for AppleSimulator {}
+
+    impl DeviceAdapter for AppleSimulator {
+        fn discover(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+        ) -> Result<Vec<AdapterDevice>, AdapterError> {
+            context.authorize_adapter(Operation::DiscoverDevices, || {
+                vec![AdapterDevice {
+                    id: "sim-1".into(),
+                    state: DeviceState::Attached,
+                }]
+            })
+        }
+
+        fn lease(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            lifetime: Duration,
+        ) -> Result<(), AdapterError> {
+            AppleSimulator::lease(self, context, device_id, lifetime)
+                .map_err(simulator_adapter_error)
+        }
+
+        fn install(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            artifact: &[u8],
+        ) -> Result<(), AdapterError> {
+            context.authorize_adapter(Operation::InstallDevice { device_id }, || ())?;
+            let path = self.workspace.join(".mesh-simulator-install.app");
+            fs::write(&path, artifact).map_err(|_| AdapterError::UnsupportedCapability)?;
+            self.execute(
+                context,
+                device_id,
+                SimulatorOperation::Install {
+                    path: path.strip_prefix(&self.workspace).unwrap().into(),
+                },
+            )
+            .map_err(simulator_adapter_error)?;
+            self.installed = artifact.to_vec();
+            Ok(())
+        }
+
+        fn launch(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            application: &str,
+        ) -> Result<(), AdapterError> {
+            self.execute(
+                context,
+                device_id,
+                SimulatorOperation::Launch {
+                    bundle_id: application.into(),
+                },
+            )
+            .map_err(simulator_adapter_error)?;
+            self.application = Some(application.into());
+            Ok(())
+        }
+
+        fn stop(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<(), AdapterError> {
+            let application = self.application.clone().unwrap_or_default();
+            self.execute(
+                context,
+                device_id,
+                SimulatorOperation::Terminate {
+                    bundle_id: application,
+                },
+            )
+            .map_err(simulator_adapter_error)?;
+            Ok(())
+        }
+
+        fn logs(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<Vec<u8>, AdapterError> {
+            context.authorize_adapter(Operation::ReadDeviceLogs { device_id }, || {
+                self.application
+                    .as_ref()
+                    .map(|app| format!("{app} launched").into_bytes())
+                    .unwrap_or_default()
+            })
+        }
+
+        fn artifact(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<Vec<u8>, AdapterError> {
+            context.authorize_adapter(Operation::ReadArtifact { device_id }, || {
+                self.installed.clone()
+            })
+        }
+
+        fn attach_debugger(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<(), AdapterError> {
+            context.authorize_adapter(Operation::AttachDebugger { device_id }, || ())?;
+            Err(AdapterError::UnsupportedCapability)
+        }
+    }
+
+    fn simulator_adapter_error(error: SimulatorError) -> AdapterError {
+        match error {
+            SimulatorError::CapabilityDenied => AdapterError::CapabilityDenied,
+            SimulatorError::LeaseInactive => AdapterError::LeaseInactive,
+            SimulatorError::Detached => AdapterError::WaitingForDevice,
+            _ => AdapterError::UnsupportedCapability,
         }
     }
 }
