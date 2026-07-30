@@ -1,0 +1,59 @@
+---
+name: authoring-prd
+description: Use when turning a product idea into a loop-ready .yoke/prd.yaml — slice the idea into small, independently shippable stories with testable behavioral acceptance criteria; greenfield STORY-1 scaffolds the project and wires verify.command.
+---
+
+# Authoring a PRD
+
+The Yoke loop is only as good as its stories. Bad stories ("build the app") stall it;
+good stories (small, testable, ordered) let it run overnight.
+
+## Story rules
+
+1. **One iteration per story.** If you can't imagine an agent finishing it in one sitting,
+   split it. Prefer 5-12 stories over 3 epics.
+2. **Independently shippable.** After any story, the project builds and tests pass.
+3. **Acceptance = observable behavior**, never implementation:
+   - Good: "GET /health returns 200", "the CLI prints the sum of its arguments"
+   - Bad: "create a HealthController class", "use express"
+   2-5 criteria per story. Each must be checkable by a test or a command.
+4. **Dense priorities from 1**; lower runs first. Order by dependency, then by risk.
+5. **Greenfield: STORY-1 scaffolds.** Project skeleton + runnable test suite + a criterion
+   that the verify command (`verify.command` in `.yoke/config.yaml`) exits 0. Every later
+   story stands on a green pipeline.
+6. **Performance requirements are acceptance criteria — with numbers.** "Should be fast" is
+   a vibe the loop cannot gate; "imports 1M rows in < 2s (asserted by the bench test)" is a
+   criterion. If the whole project has a budget, wire `perf.command` in `.yoke/config.yaml`
+   (see the `performance` skill) instead of repeating it per story.
+7. **Ask everything now.** Clarifying questions belong in this planning round — a loop run
+   is unattended. A criterion that still contains `TBD` or another placeholder is not
+   loop-ready, and `yoke prd check` rejects it. During implementation,
+   `loop.decisionPolicy: auto` resolves routine ambiguity; `critical` pauses only for
+   high-impact choices and resumes after `yoke loop answer` records the answer.
+8. **Model real dependencies.** Add `needs` only for hard prerequisites, `area` for files or
+   subsystems that must not be edited concurrently, and `agent` only as an affinity hint.
+   Dependency IDs must exist; self-dependencies and cycles are invalid.
+
+## Format (`.yoke/prd.yaml`)
+
+```yaml
+- id: STORY-1
+  title: scaffold a TypeScript CLI with vitest
+  priority: 1
+  acceptance:
+    - "npm test exits 0 with at least one passing test"
+    - "verify.command is set in .yoke/config.yaml"
+  passes: false
+- id: STORY-2
+  title: add the sum command
+  priority: 2
+  needs: [STORY-1]
+  area: cli
+  agent: codex
+  acceptance:
+    - "cli sum 1 2 prints 3"
+    - "non-numeric input exits 1 with an error message"
+  passes: false
+```
+
+`passes` is owned by the loop — always start `false`. Validate with `yoke prd check`.

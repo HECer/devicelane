@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Device Development Mesh – Architektur</title>
+  <style>
+    :root{color-scheme:dark;--bg:#08111f;--panel:#101c2e;--line:#31435e;--text:#edf4ff;--muted:#9eb0c9;--cyan:#5de4ff;--green:#69e6a6;--amber:#ffca6b;--red:#ff7d8c}
+    *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at 20% 0,#142c48 0,transparent 38%),var(--bg);font:15px/1.5 Inter,Segoe UI,sans-serif;color:var(--text)}
+    main{max-width:1280px;margin:auto;padding:36px 28px 60px} h1{font-size:38px;letter-spacing:-.04em;margin:0 0 8px} h2{margin:38px 0 14px;font-size:22px} p{color:var(--muted);max-width:900px}.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:.16em;font-weight:700;font-size:12px}.grid{display:grid;gap:16px}.topology{grid-template-columns:1fr 1.2fr 1fr;align-items:stretch}.card{background:linear-gradient(145deg,#13243a,#0d1727);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 16px 40px #0005}.card h3{margin:0 0 10px;font-size:16px}.pill{display:inline-block;padding:4px 9px;border:1px solid #46607f;border-radius:999px;margin:3px 3px 3px 0;color:#cfe0f5;font-size:12px}.arrow{text-align:center;color:var(--cyan);font-size:13px;padding:8px}.hosts{display:grid;grid-template-columns:1fr 1fr;gap:12px}.host{border:1px solid #3b5270;border-radius:10px;padding:13px}.host.mac{border-top:3px solid var(--cyan)}.host.win{border-top:3px solid var(--green)}.device{margin-top:10px;padding:10px;border-radius:8px;background:#08111f;color:#dfeaff}.matrix{width:100%;border-collapse:collapse;background:#0d1727;border:1px solid var(--line);border-radius:14px;overflow:hidden}.matrix th,.matrix td{padding:12px 14px;border-bottom:1px solid #25364d;text-align:left}.matrix th{color:#8edff0;font-size:12px;text-transform:uppercase;letter-spacing:.08em}.primary{color:var(--green);font-weight:700}.later{color:var(--amber)}.no{color:var(--red)}.roadmap{grid-template-columns:repeat(4,1fr)}.phase{position:relative;min-height:150px}.phase b{color:var(--cyan)}.phase ul{padding-left:18px;color:var(--muted)}.warning{border-left:4px solid var(--amber);padding:14px 18px;background:#2c2314;border-radius:8px;color:#ffe2a7}.legend{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);margin:8px 0 20px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}@media(max-width:900px){.topology,.roadmap{grid-template-columns:1fr}.hosts{grid-template-columns:1fr}}
+  </style>
+</head>
+<body><main>
+  <div class="eyebrow">Plan zur Freigabe · 30. Juli 2026</div>
+  <h1>Device Development Mesh</h1>
+  <p>Eine sichere Schnittstelle, die Builds, Debugging, Logs, Dateien und angeschlossene Geräte über Windows, macOS und Linux hinweg als versionierte Capabilities verfügbar macht.</p>
+
+  <h2>Topologie</h2>
+  <div class="grid topology">
+    <section class="card"><h3>Controller</h3><span class="pill">CLI</span><span class="pill">Desktop</span><span class="pill">IDE</span><span class="pill">CI</span><div class="arrow">mTLS Control · Events · Artifacts →</div><p>Ein Client sieht nur freigegebene Hosts, Geräte und Operationen. Jobs bleiben am Host bestehen, wenn der Client kurz offline ist.</p></section>
+    <section class="card"><h3>Self-hosted Control Plane</h3><span class="pill">Identity</span><span class="pill">Discovery</span><span class="pill">Signaling</span><span class="pill">Audit</span><span class="pill">Relay fallback</span><p>Host-Agenten verbinden sich ausschließlich ausgehend. Im LAN ist direkter Betrieb möglich; im WAN vermittelt die Control Plane direkte oder Relay-Verbindungen.</p></section>
+    <section class="card"><h3>Host Agents</h3><div class="hosts"><div class="host mac"><b>macOS</b><div class="device">Xcode · iPhone · Simulator · LLDB · XCTest</div></div><div class="host win"><b>Windows</b><div class="device">ADB · Android · MSBuild · PowerShell · DAP</div></div></div><p>Adapter melden nur Werkzeuge und Geräte, die auf dem jeweiligen Host tatsächlich verfügbar sind.</p></section>
+  </div>
+
+  <h2>Capability-Matrix</h2>
+  <div class="legend"><span><i class="dot" style="background:var(--green)"></i>garantierter Zielpfad</span><span><i class="dot" style="background:var(--amber)"></i>spätere Erweiterung</span><span><i class="dot" style="background:var(--red)"></i>bewusste Plattformgrenze</span></div>
+  <table class="matrix"><thead><tr><th>Client → Host → Ziel</th><th>Build & Sign</th><th>Install & Start</th><th>Logs / Debug / Tests</th><th>UI-Steuerung</th></tr></thead><tbody>
+    <tr><td>Windows → Mac → iPhone</td><td class="primary">Xcode</td><td class="primary">devicectl</td><td class="primary">LLDB · XCTest · xctrace</td><td class="primary">eigene App via XCUIAutomation</td></tr>
+    <tr><td>Windows → Mac → Simulator</td><td class="primary">Xcode</td><td class="primary">simctl</td><td class="primary">voller Dev-Workflow</td><td class="primary">XCUIAutomation</td></tr>
+    <tr><td>Mac → Windows → Android</td><td class="primary">Gradle</td><td class="primary">ADB</td><td class="primary">logcat · JDWP · Perfetto</td><td class="primary">ADB / UI Automator</td></tr>
+    <tr><td>Mac → Windows → Windows-App</td><td class="primary">MSBuild / dotnet</td><td class="primary">Prozessadapter</td><td class="primary">DAP · ETW · Dumps</td><td class="later">UI Automation Adapter</td></tr>
+    <tr><td>Beliebig → iOS-System / fremde Apps</td><td class="no">nicht anwendbar</td><td class="no">nicht freigegeben</td><td class="no">durch iOS begrenzt</td><td class="no">kein öffentliches iOS-ADB</td></tr>
+  </tbody></table>
+
+  <h2>Lieferfolge</h2>
+  <div class="grid roadmap">
+    <section class="card phase"><b>0 · Beweise</b><ul><li>Mac + iPhone</li><li>Windows + Android</li><li>PTY, Relay, Resume</li></ul></section>
+    <section class="card phase"><b>1 · Sicherer Kern</b><ul><li>Protokoll & Pairing</li><li>Policy & Leases</li><li>Workspace & Events</li><li>Fake Adapter E2E</li></ul></section>
+    <section class="card phase"><b>2–4 · Native Adapter</b><ul><li>Mac/iOS</li><li>Android</li><li>Windows/macOS Apps</li></ul></section>
+    <section class="card phase"><b>5–7 · Produkt</b><ul><li>Tauri UX</li><li>WAN & Teams</li><li>IDE & CI</li><li>Installer & Updates</li></ul></section>
+  </div>
+  <p class="warning"><strong>Freigabepunkt:</strong> Der erste Yoke-Loop implementiert nur Phase 1 mit 12 geprüften Stories. Apple- und Android-Hardware gelten erst nach separaten Hardware-Gates als unterstützt.</p>
+</main></body></html>

@@ -1,0 +1,9 @@
+canonVersion: 1.1.0
+agents:
+  - codex
+loop:
+  enabled: true
+  decisionPolicy: auto
+runner:
+  agent: codex
+codeGraph: graphify

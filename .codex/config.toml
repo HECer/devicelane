@@ -1,0 +1,12 @@
+# Yoke project configuration. Codex loads this in trusted repositories.
+
+[features]
+hooks = true
+
+[mcp_servers.graphify]
+command = "graphify"
+args = ["serve"]
+
+[mcp_servers.playwright]
+command = "npx"
+args = ["@playwright/mcp@latest"]

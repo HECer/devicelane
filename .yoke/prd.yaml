@@ -1,0 +1,136 @@
+- id: STORY-1
+  title: Rust-Workspace und grüne plattformübergreifende Verifikation anlegen
+  priority: 1
+  area: foundation
+  acceptance:
+    - "cargo test --workspace beendet sich mit Exitcode 0 und führt mindestens einen Test aus"
+    - "cargo clippy --workspace --all-targets -- -D warnings beendet sich mit Exitcode 0"
+    - ".yoke/config.yaml enthält verify.command mit cargo test --workspace"
+    - "Der Workspace kompiliert auf Windows, macOS und Linux ohne plattformspezifische Adapter zu aktivieren"
+  passes: false
+
+- id: STORY-2
+  title: Versioniertes Capability- und Fehlerprotokoll definieren
+  priority: 2
+  needs: [STORY-1]
+  area: protocol
+  acceptance:
+    - "Contract-Tests serialisieren und deserialisieren Host, Device, Capability, Job, Event und Artifact ohne Informationsverlust"
+    - "Eine unbekannte optionale Protokoll-Eigenschaft wird von der vorherigen Minor-Version ohne Absturz ignoriert"
+    - "Jeder Fehler enthält stabilen Code, menschenlesbare Meldung, Retry-Klasse und optionale Repair-Aktion"
+  passes: false
+
+- id: STORY-3
+  title: Maschinenidentität und lokales mTLS-Pairing implementieren
+  priority: 3
+  needs: [STORY-2]
+  area: identity
+  acceptance:
+    - "Zwei frische Prozesse können sich nur mit einem gültigen einmaligen Pairing-Code gegenseitig vertrauen"
+    - "Ein abgelaufener oder wiederverwendeter Pairing-Code wird abgelehnt und im Audit protokolliert"
+    - "Nach erfolgreichem Pairing wird jede unverschlüsselte oder fremd signierte Verbindung abgelehnt"
+  passes: false
+
+- id: STORY-4
+  title: Agent-Registry, Heartbeats und Capability-Snapshots bereitstellen
+  priority: 4
+  needs: [STORY-3]
+  area: discovery
+  acceptance:
+    - "Ein gestarteter Agent erscheint innerhalb von 5 Sekunden mit OS, Architektur und Capability-Snapshot in der CLI"
+    - "Ein beendeter Agent wird nach Ablauf des Heartbeat-Fensters als offline und nicht als gelöscht angezeigt"
+    - "Eine Änderung des Toolchain-Snapshots erzeugt eine neue monotone Revision"
+  passes: false
+
+- id: STORY-5
+  title: Deny-by-default Policies und exklusive Leases erzwingen
+  priority: 5
+  needs: [STORY-4]
+  area: policy
+  acceptance:
+    - "Eine Operation ohne passende Capability-Freigabe wird vor Adapterausführung abgelehnt"
+    - "Nur eine Schreib- oder Debuglease kann dasselbe Device gleichzeitig besitzen"
+    - "Eine abgelaufene oder widerrufene Lease kann keine neue Operation starten"
+    - "Observer dürfen freigegebene Logs lesen, aber keine Prozesse oder Geräte verändern"
+  passes: false
+
+- id: STORY-6
+  title: Isolierte Workspaces mit Pfadgrenzen und Manifesten verwalten
+  priority: 6
+  needs: [STORY-5]
+  area: workspace
+  acceptance:
+    - "Ein Client kann ein Manifest in einen agent-eigenen Sitzungsworkspace übertragen und identische SHA-256-Hashes zurücklesen"
+    - "Absolute Pfade, Parent Traversal sowie Symlink- oder Junction-Escapes aus dem Workspace werden abgelehnt"
+    - "Ein zweiter Schreibclient erhält bei bestehender Lease einen eindeutigen Konfliktfehler"
+  passes: false
+
+- id: STORY-7
+  title: Begrenzte Prozessausführung und sequenzierte Eventstreams anbieten
+  priority: 7
+  needs: [STORY-6]
+  area: execution
+  acceptance:
+    - "Ein freigegebener Prozess läuft mit festem Workspace, bereinigtem Environment und Zeitlimit"
+    - "stdout, stderr, Start, Exit und Timeout werden mit monotonen Sequenznummern gestreamt"
+    - "Ein nicht freigegebener Befehl und ein Prozess außerhalb des Workspaces werden abgelehnt"
+    - "Der Controller kann einen laufenden Job abbrechen und erhält einen terminalen Status"
+  passes: false
+
+- id: STORY-8
+  title: Reconnect und idempotente Jobwiederaufnahme implementieren
+  priority: 8
+  needs: [STORY-7]
+  area: sessions
+  acceptance:
+    - "Nach erzwungenem Verbindungsabbruch setzt der Client denselben Job ab der letzten bestätigten Sequenz ohne Eventlücke fort"
+    - "Ein wiederholter nicht-idempotenter Request mit derselben Request-ID erzeugt keine zweite Ausführung"
+    - "Mindestens 10000 gepufferte Events können nach einem Reconnect vollständig nachgeliefert werden"
+  passes: false
+
+- id: STORY-9
+  title: Inhaltsadressierte Artefakte und wiederaufnehmbare Übertragung ergänzen
+  priority: 9
+  needs: [STORY-8]
+  area: artifacts
+  acceptance:
+    - "Ein Artefakt wird mit SHA-256, Größe, MIME-Typ, Job-ID und Ablaufzeit registriert"
+    - "Eine unterbrochene Übertragung sendet nach Reconnect nur noch fehlende Chunks"
+    - "Ein veränderter Chunk wird vor Veröffentlichung des Artefakts erkannt und abgelehnt"
+  passes: false
+
+- id: STORY-10
+  title: Plattformunabhängiges Device-Adapter-SDK und Fake-Adapter liefern
+  priority: 10
+  needs: [STORY-5, STORY-8]
+  area: adapters
+  acceptance:
+    - "Die Contract-Suite prüft discover, lease, install, launch, stop, logs und artifact gegen einen Fake-Adapter"
+    - "Nicht unterstützte Operationen liefern unsupported_capability statt eines generischen Prozessfehlers"
+    - "Ein simuliertes Device-Detach während launch erzeugt waiting_for_device und endet nach dem Testtimeout deterministisch"
+  passes: false
+
+- id: STORY-11
+  title: Apple- und Android-Preflight-Adapter ohne Hardwareabhängigkeit anlegen
+  priority: 11
+  needs: [STORY-10]
+  area: platform-adapters
+  acceptance:
+    - "Der Apple-Preflight meldet auf macOS Xcode-, SDK-, devicectl- und simctl-Versionen als Capability-Snapshot"
+    - "Der Apple-Preflight meldet auf Nicht-macOS unsupported_host ohne Xcode-Kommandos aufzurufen"
+    - "Der Android-Preflight erkennt ADB-Version und normalisiert fixture-basierte device-list-Ausgaben für authorized, unauthorized und offline"
+    - "Alle Parser-Tests verwenden versionierte Fixtures und laufen ohne angeschlossene Hardware"
+  passes: false
+
+- id: STORY-12
+  title: Sicheren Client-zu-Agent-Vertikalschnitt dokumentieren und beweisen
+  priority: 12
+  needs: [STORY-4, STORY-6, STORY-8, STORY-9, STORY-11]
+  area: e2e
+  acceptance:
+    - "Ein Ende-zu-Ende-Test startet Registry, Agent und CLI als getrennte Prozesse, pairt sie, öffnet einen Workspace und empfängt einen Jobexit"
+    - "Der Test unterbricht die Clientverbindung und beweist lückenlose Eventwiederaufnahme"
+    - "Die CLI zeigt Hosts, Capabilities, Devices, Jobs und Artefakte ohne Rohprotokollkenntnis an"
+    - "Die Dokumentation enthält reproduzierbare lokale Befehle und markiert echte iOS-/Android-Hardwaretests ausdrücklich als spätere Gates"
+  passes: false
+
