@@ -1,0 +1,7 @@
+{
+  "project": {
+    "name": "Mesh App",
+    "configurations": ["Debug", "Release"],
+    "schemes": ["Mesh App", "Mesh App Tests"]
+  }
+}

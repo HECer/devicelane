@@ -47,7 +47,7 @@
       Leerzeichen oder Metazeichen werden ohne Shell korrekt übergeben
     - Nicht verfügbare oder inkompatible Destinations liefern einen
       normalisierten Repair-Hinweis
-  passes: false
+  passes: true
   needs:
     - STORY-22
   area: apple-projects

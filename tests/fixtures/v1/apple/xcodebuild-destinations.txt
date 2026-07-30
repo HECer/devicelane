@@ -1,0 +1,3 @@
+		{ platform:iOS, arch:arm64, id:00008110-001234567890801E, name:Developer iPhone }
+		{ platform:iOS Simulator, id:8E1D2C4B-1111-2222-3333-444455556666, OS:18.0, name:iPhone 16 }
+		{ platform:iOS, id:dvtdevice-DVTiPhonePlaceholder-iphoneos:placeholder, name:Any iOS Device, error:iOS 18.0 is not installed. }

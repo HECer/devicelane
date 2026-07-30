@@ -1,0 +1,7 @@
+{
+  "workspace": {
+    "name": "Mesh Workspace",
+    "configurations": ["Debug", "Release"],
+    "schemes": ["Mesh App", "Mesh App Tests"]
+  }
+}

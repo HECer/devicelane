@@ -2594,6 +2594,338 @@ pub mod preflight {
     }
 }
 
+pub mod apple_project_discovery {
+    use crate::preflight::{AppleTool, AppleToolRunner};
+    use crate::process_execution::{CancellationToken, EventKind, TerminalStatus};
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ContainerKind {
+        Project,
+        Workspace,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ProjectContainer {
+        pub id: String,
+        pub path: String,
+        pub kind: ContainerKind,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct NamedItem {
+        pub id: String,
+        pub name: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Destination {
+        pub id: String,
+        pub name: String,
+        pub platform: String,
+        pub os: Option<String>,
+        pub available: bool,
+        pub repair: Option<String>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ProjectSnapshot {
+        pub container: ProjectContainer,
+        pub schemes: Vec<NamedItem>,
+        pub configurations: Vec<NamedItem>,
+        pub destinations: Vec<Destination>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SelectionResponse {
+        pub kind: &'static str,
+        pub options: Vec<NamedItem>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum DiscoveryOutcome {
+        Ready(ProjectSnapshot),
+        Selection(SelectionResponse),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ProjectDiscoveryError {
+        OutsideWorkspace,
+        MalformedToolOutput,
+        ToolExecutionFailed,
+        ContainerNotFound,
+        InvalidSelection,
+    }
+
+    pub struct AppleProjectDiscovery;
+
+    impl AppleProjectDiscovery {
+        pub fn from_outputs(
+            path: &str,
+            kind: ContainerKind,
+            list_output: &str,
+            destinations_output: &str,
+        ) -> Result<ProjectSnapshot, ProjectDiscoveryError> {
+            let value: Value = serde_json::from_str(list_output)
+                .map_err(|_| ProjectDiscoveryError::MalformedToolOutput)?;
+            let container_value = match kind {
+                ContainerKind::Project => value.get("project"),
+                ContainerKind::Workspace => value.get("workspace"),
+            }
+            .ok_or(ProjectDiscoveryError::MalformedToolOutput)?;
+            let schemes = named_items(container_value, "schemes", "scheme")?;
+            let configurations = named_items(container_value, "configurations", "configuration")?;
+            Ok(ProjectSnapshot {
+                container: container(path, kind),
+                schemes,
+                configurations,
+                destinations: parse_destinations(destinations_output)?,
+            })
+        }
+
+        pub fn discover(
+            runner: &AppleToolRunner,
+            working_directory: impl AsRef<Path>,
+            container_id: Option<&str>,
+            scheme_id: Option<&str>,
+            timeout: Duration,
+        ) -> Result<DiscoveryOutcome, ProjectDiscoveryError> {
+            let directory = fs::canonicalize(runner.workspace().join(working_directory.as_ref()))
+                .map_err(|_| ProjectDiscoveryError::OutsideWorkspace)?;
+            if !directory.starts_with(runner.workspace()) {
+                return Err(ProjectDiscoveryError::OutsideWorkspace);
+            }
+            let mut containers = find_containers(runner.workspace(), &directory)?;
+            containers.sort_by(|a, b| a.id.cmp(&b.id));
+            let selected = match (container_id, containers.as_slice()) {
+                (None, []) => return Err(ProjectDiscoveryError::ContainerNotFound),
+                (None, [only]) => only.clone(),
+                (None, _) => {
+                    return Ok(DiscoveryOutcome::Selection(SelectionResponse {
+                        kind: "container",
+                        options: containers
+                            .into_iter()
+                            .map(|item| NamedItem {
+                                id: item.id,
+                                name: item.path,
+                            })
+                            .collect(),
+                    }));
+                }
+                (Some(id), _) => containers
+                    .into_iter()
+                    .find(|item| item.id == id)
+                    .ok_or(ProjectDiscoveryError::InvalidSelection)?,
+            };
+            let flag = container_flag(selected.kind);
+            let list = run(
+                runner,
+                vec![
+                    flag.into(),
+                    selected.path.clone(),
+                    "-list".into(),
+                    "-json".into(),
+                ],
+                runner.workspace(),
+                timeout,
+            )?;
+            let mut snapshot = Self::from_outputs(&selected.path, selected.kind, &list, "")?;
+            let scheme = match snapshot.select_scheme(scheme_id) {
+                Ok(scheme) => scheme.name.clone(),
+                Err(selection) => return Ok(DiscoveryOutcome::Selection(selection)),
+            };
+            let destinations = run(
+                runner,
+                vec![
+                    flag.into(),
+                    selected.path,
+                    "-scheme".into(),
+                    scheme,
+                    "-showdestinations".into(),
+                ],
+                runner.workspace(),
+                timeout,
+            )?;
+            snapshot.destinations = parse_destinations(&destinations)?;
+            Ok(DiscoveryOutcome::Ready(snapshot))
+        }
+
+        pub fn resolve_outputs(
+            path: &str,
+            kind: ContainerKind,
+            list_output: &str,
+            destinations_output: &str,
+            scheme_id: Option<&str>,
+        ) -> Result<DiscoveryOutcome, ProjectDiscoveryError> {
+            let snapshot = Self::from_outputs(path, kind, list_output, destinations_output)?;
+            match snapshot.select_scheme(scheme_id) {
+                Ok(_) => Ok(DiscoveryOutcome::Ready(snapshot)),
+                Err(selection) => Ok(DiscoveryOutcome::Selection(selection)),
+            }
+        }
+    }
+
+    impl ProjectSnapshot {
+        pub fn select_scheme(&self, id: Option<&str>) -> Result<&NamedItem, SelectionResponse> {
+            if let Some(id) = id {
+                return self
+                    .schemes
+                    .iter()
+                    .find(|scheme| scheme.id == id)
+                    .ok_or_else(|| SelectionResponse {
+                        kind: "scheme",
+                        options: self.schemes.clone(),
+                    });
+            }
+            match self.schemes.as_slice() {
+                [scheme] => Ok(scheme),
+                _ => Err(SelectionResponse {
+                    kind: "scheme",
+                    options: self.schemes.clone(),
+                }),
+            }
+        }
+
+        pub fn xcodebuild_arguments(&self, scheme: &str) -> Vec<String> {
+            vec![
+                container_flag(self.container.kind).into(),
+                self.container.path.clone(),
+                "-scheme".into(),
+                scheme.into(),
+            ]
+        }
+    }
+
+    fn find_containers(
+        root: &Path,
+        directory: &Path,
+    ) -> Result<Vec<ProjectContainer>, ProjectDiscoveryError> {
+        Ok(fs::read_dir(directory)
+            .map_err(|_| ProjectDiscoveryError::OutsideWorkspace)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let extension = path.extension()?.to_str()?;
+                let kind = match extension {
+                    "xcodeproj" => ContainerKind::Project,
+                    "xcworkspace" => ContainerKind::Workspace,
+                    _ => return None,
+                };
+                let canonical = fs::canonicalize(&path).ok()?;
+                if !canonical.starts_with(root) {
+                    return None;
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                Some(container(&relative, kind))
+            })
+            .collect())
+    }
+
+    fn container(path: &str, kind: ContainerKind) -> ProjectContainer {
+        let prefix = match kind {
+            ContainerKind::Project => "project",
+            ContainerKind::Workspace => "workspace",
+        };
+        ProjectContainer {
+            id: format!("{prefix}:{}", encode_id(path)),
+            path: path.into(),
+            kind,
+        }
+    }
+
+    fn named_items(
+        value: &Value,
+        key: &str,
+        prefix: &str,
+    ) -> Result<Vec<NamedItem>, ProjectDiscoveryError> {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .ok_or(ProjectDiscoveryError::MalformedToolOutput)?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(|name| NamedItem {
+                        id: format!("{prefix}:{}", encode_id(name)),
+                        name: name.into(),
+                    })
+                    .ok_or(ProjectDiscoveryError::MalformedToolOutput)
+            })
+            .collect()
+    }
+
+    fn parse_destinations(output: &str) -> Result<Vec<Destination>, ProjectDiscoveryError> {
+        output.lines().filter(|line| line.trim().starts_with('{')).map(|line| {
+            let fields: HashMap<_, _> = line.trim().trim_matches(['{', '}']).split(',')
+                .filter_map(|field| field.trim().split_once(':'))
+                .map(|(key, value)| (key.trim(), value.trim())).collect();
+            let id = fields.get("id").ok_or(ProjectDiscoveryError::MalformedToolOutput)?.to_string();
+            let name = fields.get("name").ok_or(ProjectDiscoveryError::MalformedToolOutput)?.to_string();
+            let platform = fields.get("platform").ok_or(ProjectDiscoveryError::MalformedToolOutput)?.to_string();
+            let error = fields.get("error");
+            Ok(Destination {
+                id, name, platform, os: fields.get("OS").map(|value| value.to_string()),
+                available: error.is_none(),
+                repair: error.map(|_| "Install the required platform or runtime in Xcode Settings > Platforms, then choose a compatible destination.".into()),
+            })
+        }).collect()
+    }
+
+    fn run(
+        runner: &AppleToolRunner,
+        args: Vec<String>,
+        directory: &Path,
+        timeout: Duration,
+    ) -> Result<String, ProjectDiscoveryError> {
+        let relative: PathBuf = directory
+            .strip_prefix(runner.workspace())
+            .map_err(|_| ProjectDiscoveryError::OutsideWorkspace)?
+            .into();
+        let events = runner
+            .execute(
+                AppleTool::Xcodebuild,
+                args,
+                relative,
+                HashMap::new(),
+                timeout,
+                CancellationToken::new(),
+            )
+            .map_err(|_| ProjectDiscoveryError::ToolExecutionFailed)?;
+        if !matches!(
+            events.last().map(|event| &event.kind),
+            Some(EventKind::Terminal(TerminalStatus::Exited(0)))
+        ) {
+            return Err(ProjectDiscoveryError::ToolExecutionFailed);
+        }
+        let bytes = events
+            .iter()
+            .filter(|event| event.kind == EventKind::Stdout)
+            .flat_map(|event| event.payload.iter().copied())
+            .collect();
+        String::from_utf8(bytes).map_err(|_| ProjectDiscoveryError::MalformedToolOutput)
+    }
+
+    fn container_flag(kind: ContainerKind) -> &'static str {
+        match kind {
+            ContainerKind::Project => "-project",
+            ContainerKind::Workspace => "-workspace",
+        }
+    }
+
+    fn encode_id(value: &str) -> String {
+        value.replace('%', "%25").replace(' ', "%20")
+    }
+}
+
 pub mod apple_discovery {
     use crate::preflight::{AppleTool, AppleToolRunner};
     use crate::process_execution::{CancellationToken, EventKind, ProcessEvent, TerminalStatus};
