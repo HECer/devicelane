@@ -107,7 +107,7 @@
       erzeugt keine zweite Ausführung
     - Mindestens 10000 gepufferte Events können nach einem Reconnect vollständig
       nachgeliefert werden
-  passes: false
+  passes: true
   needs:
     - STORY-7
   area: sessions

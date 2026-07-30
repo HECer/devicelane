@@ -795,6 +795,140 @@ pub mod workspace {
     }
 }
 
+pub mod sessions {
+    use crate::protocol::Event;
+    use std::collections::HashMap;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ResumeError {
+        CursorAhead,
+    }
+
+    pub struct Client {
+        job_id: String,
+        last_acknowledged_sequence: u64,
+    }
+
+    impl Client {
+        pub fn new(job_id: impl Into<String>) -> Self {
+            Self {
+                job_id: job_id.into(),
+                last_acknowledged_sequence: 0,
+            }
+        }
+
+        pub fn acknowledge(&mut self, sequence: u64) {
+            self.last_acknowledged_sequence = sequence;
+        }
+
+        pub fn connect(&self, journal: &JobJournal) -> Result<Connection, ResumeError> {
+            Ok(Connection {
+                events: journal
+                    .resume(&self.job_id, self.last_acknowledged_sequence)?
+                    .into_iter(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct Connection {
+        events: std::vec::IntoIter<Event>,
+    }
+
+    impl Connection {
+        pub fn disconnect(self) {}
+    }
+
+    impl Iterator for Connection {
+        type Item = Event;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.events.next()
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct RequestResult {
+        job_id: String,
+    }
+
+    impl RequestResult {
+        pub fn new(job_id: impl Into<String>) -> Self {
+            Self {
+                job_id: job_id.into(),
+            }
+        }
+
+        pub fn job_id(&self) -> &str {
+            &self.job_id
+        }
+    }
+
+    pub struct JobJournal {
+        events: HashMap<String, Vec<Event>>,
+        requests: HashMap<String, RequestResult>,
+    }
+
+    impl JobJournal {
+        pub fn new() -> Self {
+            Self {
+                events: HashMap::new(),
+                requests: HashMap::new(),
+            }
+        }
+
+        pub fn append(&mut self, job_id: &str, kind: &str, payload: Vec<u8>) {
+            let events = self.events.entry(job_id.to_owned()).or_default();
+            events.push(Event {
+                version: None,
+                job_id: job_id.to_owned(),
+                sequence: events.len() as u64 + 1,
+                kind: kind.to_owned(),
+                payload,
+            });
+        }
+
+        pub fn resume(
+            &self,
+            job_id: &str,
+            last_seen_sequence: u64,
+        ) -> Result<Vec<Event>, ResumeError> {
+            let events = self
+                .events
+                .get(job_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if last_seen_sequence > events.len() as u64 {
+                return Err(ResumeError::CursorAhead);
+            }
+            Ok(events
+                .iter()
+                .filter(|event| event.sequence > last_seen_sequence)
+                .cloned()
+                .collect())
+        }
+
+        pub fn execute_once(
+            &mut self,
+            request_id: &str,
+            operation: impl FnOnce() -> RequestResult,
+        ) -> RequestResult {
+            if let Some(result) = self.requests.get(request_id) {
+                return result.clone();
+            }
+            let result = operation();
+            self.requests.insert(request_id.to_owned(), result.clone());
+            result
+        }
+    }
+
+    impl Default for JobJournal {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
