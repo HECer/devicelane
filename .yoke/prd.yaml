@@ -169,7 +169,7 @@
       Rohprotokollkenntnis an
     - Die Dokumentation enthält reproduzierbare lokale Befehle und markiert
       echte iOS-/Android-Hardwaretests ausdrücklich als spätere Gates
-  passes: false
+  passes: true
   needs:
     - STORY-4
     - STORY-6
