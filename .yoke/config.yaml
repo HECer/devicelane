@@ -7,3 +7,5 @@ loop:
 runner:
   agent: codex
 codeGraph: graphify
+verify:
+  command: cargo test --workspace
