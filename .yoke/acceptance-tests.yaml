@@ -1,0 +1,14 @@
+STORY-14:
+  suite: tests/process_execution.rs
+STORY-15:
+  suite: tests/artifacts.rs
+STORY-16:
+  suite: tests/device_adapter_contract.rs
+STORY-17:
+  suite: tests/secure_transport.rs
+STORY-18:
+  suite: tests/network_processes.rs
+STORY-19:
+  suite: tests/e2e_vertical_slice.rs
+STORY-20:
+  bootstrap: scripts/bootstrap-smoke

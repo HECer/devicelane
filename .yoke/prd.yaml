@@ -2,20 +2,28 @@
   title: Verifikationsgate gegen leere Story-Abschlüsse härten
   priority: 1
   acceptance:
-    - Das Yoke-Gate führt Workspace-Tests, Clippy mit -D warnings und rustfmt --check aus
-    - Eine plattformübergreifende CI-Matrix baut und testet Windows, macOS und Linux
-    - Ein maschinenlesbarer Acceptance-Test-Katalog ordnet jede folgende Story mindestens einer konkreten Testsuite oder einem Bootstrap-Smoke-Test zu
-    - Die Dokumentation erklärt, dass ein passes-Status ohne grüne story-spezifische Akzeptanzprüfung ungültig ist
-  passes: false
+    - Das Yoke-Gate führt Workspace-Tests, Clippy mit -D warnings und rustfmt
+      --check aus
+    - Eine plattformübergreifende CI-Matrix baut und testet Windows, macOS und
+      Linux
+    - Ein maschinenlesbarer Acceptance-Test-Katalog ordnet jede folgende Story
+      mindestens einer konkreten Testsuite oder einem Bootstrap-Smoke-Test zu
+    - Die Dokumentation erklärt, dass ein passes-Status ohne grüne
+      story-spezifische Akzeptanzprüfung ungültig ist
+  passes: true
   area: quality
 - id: STORY-14
   title: Begrenzte reale Prozessausführung und sequenzierte Eventstreams liefern
   priority: 2
   acceptance:
-    - tests/process_execution.rs startet einen erlaubten Helper-Prozess in einem festen Workspace mit bereinigtem Environment
-    - stdout, stderr, Start, Exit, Timeout und Cancel besitzen lückenlose monotone Sequenznummern und genau einen terminalen Status
-    - Nicht erlaubte Programme, Pfade außerhalb des Workspace und Environment-Overrides außerhalb einer Allowlist werden vor Spawn abgelehnt
-    - Timeout und Abbruch beenden den gesamten Kindprozessbaum auf Windows, macOS und Linux deterministisch
+    - tests/process_execution.rs startet einen erlaubten Helper-Prozess in einem
+      festen Workspace mit bereinigtem Environment
+    - stdout, stderr, Start, Exit, Timeout und Cancel besitzen lückenlose
+      monotone Sequenznummern und genau einen terminalen Status
+    - Nicht erlaubte Programme, Pfade außerhalb des Workspace und
+      Environment-Overrides außerhalb einer Allowlist werden vor Spawn abgelehnt
+    - Timeout und Abbruch beenden den gesamten Kindprozessbaum auf Windows,
+      macOS und Linux deterministisch
   passes: false
   needs:
     - STORY-13
@@ -24,10 +32,14 @@
   title: Inhaltsadressierten Artefaktspeicher mit Resume implementieren
   priority: 3
   acceptance:
-    - tests/artifacts.rs registriert Artefakte mit SHA-256, Größe, MIME-Typ, Job-ID und Ablaufzeit
-    - Chunks werden idempotent geschrieben und nach Verbindungsabbruch werden nur fehlende Chunks angefordert
-    - Ein veränderter oder falsch gehashter Chunk verhindert atomar die Veröffentlichung
-    - Pfadtraversal, abgelaufene Artefakte und Zugriffe ohne passende Session werden abgelehnt
+    - tests/artifacts.rs registriert Artefakte mit SHA-256, Größe, MIME-Typ,
+      Job-ID und Ablaufzeit
+    - Chunks werden idempotent geschrieben und nach Verbindungsabbruch werden
+      nur fehlende Chunks angefordert
+    - Ein veränderter oder falsch gehashter Chunk verhindert atomar die
+      Veröffentlichung
+    - Pfadtraversal, abgelaufene Artefakte und Zugriffe ohne passende Session
+      werden abgelehnt
   passes: false
   needs:
     - STORY-14
@@ -36,10 +48,14 @@
   title: Device-Adapter-SDK und vollständigen Fake-Adapter liefern
   priority: 4
   acceptance:
-    - tests/device_adapter_contract.rs prüft discover, lease, install, launch, stop, logs und artifact gegen FakeDeviceAdapter
-    - Adapteroperationen benötigen den Policy- und Lease-Kontext statt ihn umgehen zu können
-    - Nicht unterstützte Operationen liefern unsupported_capability und Detach während launch liefert waiting_for_device
-    - Dieselbe Contract-Suite kann später unverändert gegen Apple- und Android-Adapter ausgeführt werden
+    - tests/device_adapter_contract.rs prüft discover, lease, install, launch,
+      stop, logs und artifact gegen FakeDeviceAdapter
+    - Adapteroperationen benötigen den Policy- und Lease-Kontext statt ihn
+      umgehen zu können
+    - Nicht unterstützte Operationen liefern unsupported_capability und Detach
+      während launch liefert waiting_for_device
+    - Dieselbe Contract-Suite kann später unverändert gegen Apple- und
+      Android-Adapter ausgeführt werden
   passes: false
   needs:
     - STORY-15
@@ -48,10 +64,14 @@
   title: Persistente kryptografische Maschinenidentität und echtes TLS-Pairing liefern
   priority: 5
   acceptance:
-    - tests/secure_transport.rs führt einen echten TLS-Handshake über Loopback mit getrennten Client- und Serveridentitäten aus
-    - Private Schlüssel und Truststore werden mit restriktiven Dateirechten persistent gespeichert und nie protokolliert
-    - Ein einmaliger Pairing-Code ist kryptografisch zufällig, läuft ab und kann nicht wiederverwendet werden
-    - Unverschlüsselte, fremd signierte, abgelaufene oder widerrufene Peers werden vor RPC-Verarbeitung abgelehnt und auditiert
+    - tests/secure_transport.rs führt einen echten TLS-Handshake über Loopback
+      mit getrennten Client- und Serveridentitäten aus
+    - Private Schlüssel und Truststore werden mit restriktiven Dateirechten
+      persistent gespeichert und nie protokolliert
+    - Ein einmaliger Pairing-Code ist kryptografisch zufällig, läuft ab und kann
+      nicht wiederverwendet werden
+    - Unverschlüsselte, fremd signierte, abgelaufene oder widerrufene Peers
+      werden vor RPC-Verarbeitung abgelehnt und auditiert
   passes: false
   needs:
     - STORY-16
@@ -60,10 +80,14 @@
   title: Registry, Host-Agent und CLI als getrennte Netzwerkprozesse bereitstellen
   priority: 6
   acceptance:
-    - Die Binaries mesh-registry, mesh-agent und mesh-cli besitzen stabile --help- und --version-Ausgaben
-    - tests/network_processes.rs startet alle drei Prozesse auf dynamischen Loopback-Ports und beweist Pairing sowie Agent-Heartbeat
-    - mesh-cli list zeigt Hosts, Capabilities und Devices als Text und JSON ohne Rohprotokollkenntnis
-    - Der Agent baut ausschließlich ausgehende Verbindungen auf und ein Offline-Agent bleibt mit letztem Snapshot sichtbar
+    - Die Binaries mesh-registry, mesh-agent und mesh-cli besitzen stabile
+      --help- und --version-Ausgaben
+    - tests/network_processes.rs startet alle drei Prozesse auf dynamischen
+      Loopback-Ports und beweist Pairing sowie Agent-Heartbeat
+    - mesh-cli list zeigt Hosts, Capabilities und Devices als Text und JSON ohne
+      Rohprotokollkenntnis
+    - Der Agent baut ausschließlich ausgehende Verbindungen auf und ein
+      Offline-Agent bleibt mit letztem Snapshot sichtbar
   passes: false
   needs:
     - STORY-17
@@ -72,10 +96,15 @@
   title: Reale Client-zu-Agent-Ende-zu-Ende-Strecke beweisen
   priority: 7
   acceptance:
-    - tests/e2e_vertical_slice.rs pairt getrennte Prozesse, öffnet einen isolierten Workspace, überträgt ein Manifest und empfängt einen echten Jobexit
-    - Der Test trennt den CLI-Stream, verbindet sich mit Cursor erneut und beweist eine lückenlose Eventfolge ohne Doppelausführung
-    - Jobs und Artefakte bleiben über einen Registry-Neustart erhalten oder werden mit einem stabilen Recovery-Fehler ausgewiesen
-    - Audit-Ereignisse verbinden Principal, Host, Device, Workspace, Job und Ergebnis über stabile IDs
+    - tests/e2e_vertical_slice.rs pairt getrennte Prozesse, öffnet einen
+      isolierten Workspace, überträgt ein Manifest und empfängt einen echten
+      Jobexit
+    - Der Test trennt den CLI-Stream, verbindet sich mit Cursor erneut und
+      beweist eine lückenlose Eventfolge ohne Doppelausführung
+    - Jobs und Artefakte bleiben über einen Registry-Neustart erhalten oder
+      werden mit einem stabilen Recovery-Fehler ausgewiesen
+    - Audit-Ereignisse verbinden Principal, Host, Device, Workspace, Job und
+      Ergebnis über stabile IDs
   passes: false
   needs:
     - STORY-18
@@ -84,10 +113,14 @@
   title: Reproduzierbare lokale Bedienung und Bootstrap dokumentieren
   priority: 8
   acceptance:
-    - README.md enthält den vollständigen lokalen Windows-, macOS- und Linux-Workflow vom Build bis zum ersten Remote-Job
-    - scripts/setup-windows.ps1 und scripts/setup-mac.sh sind idempotent und benötigen nach Installation der Systemvoraussetzungen nur einen Aufruf
-    - mesh-cli doctor liefert maschinenlesbare Reparaturhinweise für Rust, Netzwerk, Xcode, ADB, Zertifikate und Dateirechte
-    - Hardwaretests für iPhone und Android sind klar als nachgelagerte Gates markiert und Mocks können sie nicht als bestanden setzen
+    - README.md enthält den vollständigen lokalen Windows-, macOS- und
+      Linux-Workflow vom Build bis zum ersten Remote-Job
+    - scripts/setup-windows.ps1 und scripts/setup-mac.sh sind idempotent und
+      benötigen nach Installation der Systemvoraussetzungen nur einen Aufruf
+    - mesh-cli doctor liefert maschinenlesbare Reparaturhinweise für Rust,
+      Netzwerk, Xcode, ADB, Zertifikate und Dateirechte
+    - Hardwaretests für iPhone und Android sind klar als nachgelagerte Gates
+      markiert und Mocks können sie nicht als bestanden setzen
   passes: false
   needs:
     - STORY-19

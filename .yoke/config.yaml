@@ -8,4 +8,4 @@ runner:
   agent: codex
 codeGraph: graphify
 verify:
-  command: cargo test --workspace
+  command: cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check
