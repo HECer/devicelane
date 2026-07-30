@@ -135,7 +135,7 @@
       generischen Prozessfehlers
     - Ein simuliertes Device-Detach während launch erzeugt waiting_for_device
       und endet nach dem Testtimeout deterministisch
-  passes: false
+  passes: true
   needs:
     - STORY-5
     - STORY-8
