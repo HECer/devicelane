@@ -181,6 +181,146 @@ pub mod protocol {
     }
 }
 
+pub mod identity {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Certificate {
+        machine_id: String,
+        fingerprint: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum AuditEvent {
+        PairingSucceeded { peer_id: String },
+        PairingRejected { reason: &'static str },
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PairingError {
+        InvalidCode,
+        CodeExpired,
+        CodeReused,
+        TlsRequired,
+        UntrustedPeer,
+        InvalidCertificate,
+    }
+
+    struct PairingCode {
+        value: String,
+        lifetime: Duration,
+        consumed: bool,
+    }
+
+    pub struct MachineIdentity {
+        id: String,
+        certificate: Certificate,
+        pairing_code: Option<PairingCode>,
+        trusted: HashMap<String, Certificate>,
+        audit: Vec<AuditEvent>,
+    }
+
+    impl MachineIdentity {
+        pub fn new(id: impl Into<String>) -> Result<Self, PairingError> {
+            let id = id.into();
+            if id.is_empty() {
+                return Err(PairingError::InvalidCertificate);
+            }
+            let nonce = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            Ok(Self {
+                certificate: Certificate {
+                    machine_id: id.clone(),
+                    fingerprint: format!("{now:032x}{nonce:016x}"),
+                },
+                id,
+                pairing_code: None,
+                trusted: HashMap::new(),
+                audit: Vec::new(),
+            })
+        }
+
+        pub fn certificate(&self) -> &Certificate {
+            &self.certificate
+        }
+
+        pub fn issue_pairing_code(&mut self, lifetime: Duration) -> String {
+            let nonce = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let value = format!("{:06}", nonce % 1_000_000);
+            self.pairing_code = Some(PairingCode {
+                value: value.clone(),
+                lifetime,
+                consumed: false,
+            });
+            value
+        }
+
+        pub fn accept_pairing(
+            &mut self,
+            code: &str,
+            peer: &Certificate,
+            elapsed: Duration,
+        ) -> Result<Certificate, PairingError> {
+            let result: Result<(), (PairingError, &'static str)> = match self.pairing_code.as_mut()
+            {
+                Some(pairing) if pairing.value != code => {
+                    Err((PairingError::InvalidCode, "invalid_code"))
+                }
+                Some(pairing) if pairing.consumed => Err((PairingError::CodeReused, "code_reused")),
+                Some(pairing) if elapsed > pairing.lifetime => {
+                    Err((PairingError::CodeExpired, "code_expired"))
+                }
+                Some(pairing) => {
+                    pairing.consumed = true;
+                    self.trusted.insert(peer.machine_id.clone(), peer.clone());
+                    self.audit.push(AuditEvent::PairingSucceeded {
+                        peer_id: peer.machine_id.clone(),
+                    });
+                    return Ok(self.certificate.clone());
+                }
+                None => Err((PairingError::InvalidCode, "invalid_code")),
+            };
+            let (error, reason) = result.unwrap_err();
+            self.audit.push(AuditEvent::PairingRejected { reason });
+            Err(error)
+        }
+
+        pub fn trust(
+            &mut self,
+            peer_id: &str,
+            certificate: &Certificate,
+        ) -> Result<(), PairingError> {
+            if peer_id != certificate.machine_id || certificate.fingerprint.is_empty() {
+                return Err(PairingError::InvalidCertificate);
+            }
+            self.trusted.insert(peer_id.to_owned(), certificate.clone());
+            Ok(())
+        }
+
+        pub fn mutual_tls_with(&self, peer: &MachineIdentity) -> Result<(), PairingError> {
+            match self.trusted.get(&peer.id) {
+                Some(certificate) if certificate == peer.certificate() => Ok(()),
+                _ => Err(PairingError::UntrustedPeer),
+            }
+        }
+
+        pub fn accept_unencrypted(&self, _peer_id: &str) -> Result<(), PairingError> {
+            Err(PairingError::TlsRequired)
+        }
+
+        pub fn audit_log(&self) -> &[AuditEvent] {
+            &self.audit
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

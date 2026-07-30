@@ -35,7 +35,7 @@
       Audit protokolliert
     - Nach erfolgreichem Pairing wird jede unverschlüsselte oder fremd signierte
       Verbindung abgelehnt
-  passes: false
+  passes: true
   needs:
     - STORY-2
   area: identity
