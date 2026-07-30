@@ -1,134 +1,109 @@
-- id: STORY-13
-  title: Verifikationsgate gegen leere Story-Abschlüsse härten
+- id: STORY-21
+  title: Apple-Preflight und typisierte Toolausführung liefern
   priority: 1
   acceptance:
-    - Das Yoke-Gate führt Workspace-Tests, Clippy mit -D warnings und rustfmt
-      --check aus
-    - Eine plattformübergreifende CI-Matrix baut und testet Windows, macOS und
-      Linux
-    - Ein maschinenlesbarer Acceptance-Test-Katalog ordnet jede folgende Story
-      mindestens einer konkreten Testsuite oder einem Bootstrap-Smoke-Test zu
-    - Die Dokumentation erklärt, dass ein passes-Status ohne grüne
-      story-spezifische Akzeptanzprüfung ungültig ist
-  passes: true
-  area: quality
-- id: STORY-14
-  title: Begrenzte reale Prozessausführung und sequenzierte Eventstreams liefern
+    - tests/apple_preflight.rs prüft maschinenlesbare Zustände und konkrete Reparaturhinweise für macOS, vollständiges Xcode, aktives Developer-Verzeichnis, xcodebuild, devicectl, simctl, xcresulttool, xctrace und lldb-dap
+    - Auf Nicht-macOS-Systemen liefert der Apple-Preflight unsupported_host statt einen Prozess zu starten oder zu panicen
+    - AppleToolRunner startet ausschließlich fest erlaubte Apple-Programme mit getrennten Argumenten, bereinigtem Environment, Workspace-Grenze, Timeout und Abbruch
+    - Versionierte Fixtures beweisen Erfolgs-, fehlende-Tool-, Lizenz- und Developer-Directory-Fehler ohne ein Hardware-Gate zu bestehen
+  passes: false
+  area: apple-core
+- id: STORY-22
+  title: Physische Apple-Geräte und Simulatoren normalisiert erkennen
   priority: 2
   acceptance:
-    - tests/process_execution.rs startet einen erlaubten Helper-Prozess in einem
-      festen Workspace mit bereinigtem Environment
-    - stdout, stderr, Start, Exit, Timeout und Cancel besitzen lückenlose
-      monotone Sequenznummern und genau einen terminalen Status
-    - Nicht erlaubte Programme, Pfade außerhalb des Workspace und
-      Environment-Overrides außerhalb einer Allowlist werden vor Spawn abgelehnt
-    - Timeout und Abbruch beenden den gesamten Kindprozessbaum auf Windows,
-      macOS und Linux deterministisch
-    - ProcessExecutor::start liefert stdout und stderr bereits während der
-      Kindprozess noch läuft; execute bleibt nur ein sammelnder Komfortwrapper
-  passes: true
-  needs:
-    - STORY-13
-  area: execution
-- id: STORY-15
-  title: Inhaltsadressierten Artefaktspeicher mit Resume implementieren
+    - tests/apple_discovery.rs normalisiert versionierte devicectl- und simctl-JSON-Fixtures in stabile DeviceSnapshot-Werte mit ID, Name, Plattform, OS-Version, Verbindung, Trust, Developer Mode und Verfügbarkeit
+    - Parser tolerieren unbekannte Zusatzfelder und liefern bei fehlenden Pflichtfeldern einen stabilen malformed_tool_output-Fehler ohne Teilinventar
+    - Geräte mit disconnected, locked, untrusted, unavailable oder runtime_missing veröffentlichen keine ausführbaren App-Capabilities und enthalten einen konkreten Repair-Hinweis
+    - Die Discovery ruft Tools nur über AppleToolRunner auf und kann dieselbe Ausgabe als JSON über die CLI liefern
+  passes: false
+  needs: [STORY-21]
+  area: apple-discovery
+- id: STORY-23
+  title: Xcode-Projekte Schemes und Destinations entdecken
   priority: 3
   acceptance:
-    - tests/artifacts.rs registriert Artefakte mit SHA-256, Größe, MIME-Typ,
-      Job-ID und Ablaufzeit
-    - Chunks werden idempotent geschrieben und nach Verbindungsabbruch werden
-      nur fehlende Chunks angefordert
-    - Ein veränderter oder falsch gehashter Chunk verhindert atomar die
-      Veröffentlichung
-    - Pfadtraversal, abgelaufene Artefakte und Zugriffe ohne passende Session
-      werden abgelehnt
-  passes: true
-  needs:
-    - STORY-14
-  area: artifacts
-- id: STORY-16
-  title: Device-Adapter-SDK und vollständigen Fake-Adapter liefern
+    - tests/apple_project_discovery.rs prüft Project-, Workspace-, Scheme-, Configuration- und Destination-Erkennung aus versionierten xcodebuild-Fixtures
+    - Mehrdeutige Container oder Schemes führen zu einer Auswahlantwort mit stabilen IDs statt zu einer stillen Standardwahl
+    - Projektpfade werden auf den geleasten Workspace begrenzt und Argumente mit Leerzeichen oder Metazeichen werden ohne Shell korrekt übergeben
+    - Nicht verfügbare oder inkompatible Destinations liefern einen normalisierten Repair-Hinweis
+  passes: false
+  needs: [STORY-22]
+  area: apple-projects
+- id: STORY-24
+  title: Xcode Build und Test als resumierbaren Agent-Job ausführen
   priority: 4
   acceptance:
-    - tests/device_adapter_contract.rs prüft discover, lease, install, launch,
-      stop, logs und artifact gegen FakeDeviceAdapter
-    - Adapteroperationen benötigen den Policy- und Lease-Kontext statt ihn
-      umgehen zu können
-    - Nicht unterstützte Operationen liefern unsupported_capability und Detach
-      während launch liefert waiting_for_device
-    - Dieselbe Contract-Suite kann später unverändert gegen Apple- und
-      Android-Adapter ausgeführt werden
-  passes: true
-  needs:
-    - STORY-15
-  area: adapters
-- id: STORY-17
-  title: Persistente kryptografische Maschinenidentität und echtes TLS-Pairing liefern
+    - tests/apple_build.rs beweist einen typisierten xcodebuild-Plan für build und test mit explizitem Container, Scheme, Configuration, Destination, DerivedData und ResultBundle im geleasten Workspace
+    - stdout und stderr werden als lückenlos sequenzierte Events gestreamt; Timeout und Cancel beenden den vollständigen xcodebuild-Prozessbaum genau einmal
+    - Erfolgreiche .app-, .dSYM- und .xcresult-Ausgaben werden gehasht im ArtifactStore registriert und können nach Verbindungsabbruch fortgesetzt geladen werden
+    - Signing wird ausschließlich über lokal vorhandene Identitäts- oder Profilreferenzen gewählt; Schlüsselmaterial und geschützte Buildvariablen erscheinen weder in Events noch Auditdaten
+  passes: false
+  needs: [STORY-23]
+  area: apple-build
+- id: STORY-25
+  title: iOS-Simulator Lifecycle und Entwicklungsautomation bereitstellen
   priority: 5
   acceptance:
-    - tests/secure_transport.rs führt einen echten TLS-Handshake über Loopback
-      mit getrennten Client- und Serveridentitäten aus
-    - Private Schlüssel und Truststore werden mit restriktiven Dateirechten
-      persistent gespeichert und nie protokolliert
-    - Ein einmaliger Pairing-Code ist kryptografisch zufällig, läuft ab und kann
-      nicht wiederverwendet werden
-    - Unverschlüsselte, fremd signierte, abgelaufene oder widerrufene Peers
-      werden vor RPC-Verarbeitung abgelehnt und auditiert
-  passes: true
-  needs:
-    - STORY-16
-  area: identity
-- id: STORY-18
-  title: Registry, Host-Agent und CLI als getrennte Netzwerkprozesse bereitstellen
+    - tests/apple_simulator.rs prüft create, boot, bootstatus, shutdown, delete, install, uninstall, launch und terminate als typisierte simctl-Operationen
+    - Screenshot, Logstream, Location, Privacy-Permissions sowie Media-Import sind capability- und lease-geschützt und auf erlaubte Dateien im Workspace begrenzt
+    - Wiederholte idempotente Operationen liefern den vorhandenen Zustand; busy, boot_failed, runtime_missing und detach besitzen stabile Fehlercodes
+    - Der vollständige Fake-Tool-Ablauf erfüllt die bestehende DeviceAdapter-Contract-Suite, markiert aber kein physisches Hardware-Gate als bestanden
+  passes: false
+  needs: [STORY-24]
+  area: apple-simulator
+- id: STORY-26
+  title: Physisches iPhone installieren starten stoppen und protokollieren
   priority: 6
   acceptance:
-    - Die Binaries mesh-registry, mesh-agent und mesh-cli besitzen stabile
-      --help- und --version-Ausgaben
-    - tests/network_processes.rs startet alle drei Prozesse auf dynamischen
-      Loopback-Ports und beweist Pairing sowie Agent-Heartbeat
-    - mesh-cli list zeigt Hosts, Capabilities und Devices als Text und JSON ohne
-      Rohprotokollkenntnis
-    - Der Agent baut ausschließlich ausgehende Verbindungen auf und ein
-      Offline-Agent bleibt mit letztem Snapshot sichtbar
-  passes: true
-  needs:
-    - STORY-17
-  area: networking
-- id: STORY-19
-  title: Reale Client-zu-Agent-Ende-zu-Ende-Strecke beweisen
+    - tests/apple_physical_device.rs prüft devicectl-Pläne für install, launch, terminate, uninstall, device info und App-Logstream anhand versionierter Tool-Fixtures
+    - Jede mutierende Operation benötigt eine gültige exklusive Geräte-Lease und passende Apple-Capability; Beobachter dürfen ausschließlich freigegebene Logs lesen
+    - locked, untrusted, developer_mode_disabled, signing_failed, device_busy und detached werden normalisiert und enthalten konkrete Reparaturhinweise
+    - Bundle-ID, App-Pfad und Geräte-ID werden validiert und ausschließlich als getrennte Argumente an devicectl übergeben
+  passes: false
+  needs: [STORY-25]
+  area: apple-physical
+- id: STORY-27
+  title: XCTest XCUI und xcresult Artefakte integrieren
   priority: 7
   acceptance:
-    - tests/e2e_vertical_slice.rs pairt getrennte Prozesse, öffnet einen
-      isolierten Workspace, überträgt ein Manifest und empfängt einen echten
-      Jobexit
-    - Der Test trennt den CLI-Stream, verbindet sich mit Cursor erneut und
-      beweist eine lückenlose Eventfolge ohne Doppelausführung
-    - Jobs und Artefakte bleiben über einen Registry-Neustart erhalten oder
-      werden mit einem stabilen Recovery-Fehler ausgewiesen
-    - Audit-Ereignisse verbinden Principal, Host, Device, Workspace, Job und
-      Ergebnis über stabile IDs
-    - Der E2E-Test startet einen bereits gepairten Host-Agenten, der den Job
-      über seine ausgehende Registry-Verbindung abholt und ausschließlich unter
-      seinem eigenen Workspace-Root ausführt
-    - Die Registry darf weder den Agentprozess pro Job starten noch einen
-      Projektworkspace auf dem Control-Plane-Host anlegen
-  passes: true
-  needs:
-    - STORY-18
-  area: e2e
-- id: STORY-20
-  title: Reproduzierbare lokale Bedienung und Bootstrap dokumentieren
+    - tests/apple_xctest.rs prüft build-for-testing, test-without-building, Testplan-, Only-Testing- und UI-Test-Auswahl als typisierte xcodebuild-Operationen
+    - xcresulttool-Fixtures werden in stabile Suite-, Testfall-, Fehler-, Attachment- und Coverage-Ergebnisse mit Quellreferenzen normalisiert
+    - Screenshots, Videos, Diagnosen und das rohe .xcresult werden als gehashte Artefakte registriert und sensible Umgebungswerte redigiert
+    - Abbruch, Testfehler, Runner-Crash, Geräteverlust und inkompatibles Result-Schema erzeugen genau einen terminalen Status und behalten auswertbare Teilresultate
+  passes: false
+  needs: [STORY-26]
+  area: apple-testing
+- id: STORY-28
+  title: Kontrollierte LLDB- und xctrace-Sessions liefern
   priority: 8
   acceptance:
-    - README.md enthält den vollständigen lokalen Windows-, macOS- und
-      Linux-Workflow vom Build bis zum ersten Remote-Job
-    - scripts/setup-windows.ps1 und scripts/setup-mac.sh sind idempotent und
-      benötigen nach Installation der Systemvoraussetzungen nur einen Aufruf
-    - mesh-cli doctor liefert maschinenlesbare Reparaturhinweise für Rust,
-      Netzwerk, Xcode, ADB, Zertifikate und Dateirechte
-    - Hardwaretests für iPhone und Android sind klar als nachgelagerte Gates
-      markiert und Mocks können sie nicht als bestanden setzen
-  passes: true
-  needs:
-    - STORY-19
-  area: bootstrap
+    - tests/apple_diagnostics.rs prüft Launch, Attach, Breakpoint, Continue, Pause, Stack, Variables und Disconnect über einen sitzungsgebundenen LLDB-DAP-Endpunkt
+    - Debugendpunkte binden ausschließlich Loopback oder den verschlüsselten Sessionkanal, benötigen Lease und Capability und werden bei Revoke oder Timeout beendet
+    - xctrace-Pläne für CPU, Memory, Energy und Network erzwingen Ziel, Dauer, Workspace-Ausgabe und Ressourcenlimit
+    - Trace-, Symbol-, Crash- und Diagnoseausgaben werden als Artefakte registriert; fehlende Templates oder Symbole liefern stabile Repair-Hinweise
+  passes: false
+  needs: [STORY-27]
+  area: apple-diagnostics
+- id: STORY-29
+  title: Mac-Agent mit einem Befehl installieren und betreiben
+  priority: 9
+  acceptance:
+    - tests/mac_bootstrap.rs und scripts/mac-bootstrap-smoke prüfen einen idempotenten setup-mac.sh-Aufruf für Release-Build, Doctor, Pairing, Benutzer-LaunchAgent, Start, Status und Upgrade
+    - Der LaunchAgent verwendet absolute Pfade, KeepAlive mit Backoff, restriktive Dateirechte und keine Pairing-Codes, privaten Schlüssel oder Signing-Secrets in Plist oder Logs
+    - setup-mac.sh besitzt einen nebenwirkungsfreien --dry-run und gibt bei Erfolg genau den nächsten Controller-Befehl sowie den Pfad eines redigierten Diagnosebundles aus
+    - Deinstallation entfernt nur die explizit installierte LaunchAgent-Datei und Programmdateien; Identität und Auditdaten bleiben standardmäßig erhalten
+  passes: false
+  needs: [STORY-28]
+  area: mac-bootstrap
+- id: STORY-30
+  title: Reales Mac-und-iPhone-Hardware-Gate bestehen
+  priority: 10
+  acceptance:
+    - scripts/mac-hardware-gate.sh läuft auf einem echten Mac ohne Mock-Toolpfade und erfasst Xcode-, SDK-, Tool- und Geräteversionen in einem redigierten signierten Ergebnisbundle
+    - Eine gebündelte minimale Development-App wird mit lokalem Signing gebaut, auf einem physisch angeschlossenen entsperrten iPhone installiert, gestartet, protokolliert und wieder beendet
+    - Ein XCTest- oder XCUI-Smoke-Test läuft auf demselben physischen Gerät und .xcresult, App-Log, Screenshot und Audit-IDs werden über den Mesh-Artifactpfad zum Client zurückgegeben
+    - Das Gate bleibt bei Simulator, fehlendem Developer Mode, fehlendem Trust, ungültigem Signing oder Mock-Ausgabe rot und nennt genau den nächsten Reparaturschritt
+  passes: false
+  needs: [STORY-29]
+  area: apple-hardware-gate

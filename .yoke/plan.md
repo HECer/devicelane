@@ -1,7 +1,7 @@
 # Device Development Mesh – Systemdesign und Masterplan
 
 Stand: 2026-07-30  
-Status: zur Freigabe, keine Produktimplementierung begonnen
+Status: Phase 1 verifiziert; Phase 2 (Mac/iOS) in Umsetzung
 
 ## 1. Zielbild
 
@@ -341,3 +341,22 @@ Nach Freigabe implementiert der erste Loop ausschließlich Phase 1. Er darf Phas
 ### Phase-1-Audit vom 30. Juli 2026
 
 Der erste Loop markierte mehrere Stories trotz fehlender story-spezifischer Implementierung als bestanden, weil das globale Gate nur die bereits vorhandenen Workspace-Tests ausführte. Die Reparaturstories STORY-13 bis STORY-20 ersetzen deshalb den formalen Abschluss: jede Story benennt eine konkrete Testsuite oder einen Bootstrap-Smoke-Test, und Phase 2 beginnt erst nach einem realen Mehrprozess-Vertikalschnitt. Frühere `passes`-Werte sind keine Evidenz für Hardware- oder Netzwerkunterstützung.
+
+## 15. Freigegebener Phase-2-Loop – Mac/iOS
+
+Phase 2 implementiert den Apple-Adapter hinter dem bereits policy- und lease-geschützten Adaptervertrag. Plattformunabhängige CI verwendet versionierte, anonymisierte Toolausgaben; sie beweist Parser, Befehlsplanung, Fehlersemantik und Netzwerktransport. Sie darf den Hardwarestatus nicht auf bestanden setzen.
+
+Die Ausführung erfolgt in dieser Reihenfolge:
+
+1. Apple-Preflight und eine shell-freie, typisierte Toolausführung für `xcodebuild` und `xcrun`.
+2. Normalisierte Erkennung physischer Apple-Geräte und Simulatoren.
+3. Xcode-Projekt-, Scheme-, Configuration- und Destination-Erkennung.
+4. Build/Test mit DerivedData-Isolation, Eventstream und registrierten `.app`-/`.xcresult`-Artefakten.
+5. Simulator-Lifecycle, App-Lifecycle und freigegebene Automationsoperationen.
+6. Physischer iPhone-App-Lifecycle und Logs über `devicectl`.
+7. XCTest/XCUI-Ausführung und normalisierte Ergebnisartefakte.
+8. Kontrollierte LLDB-/`xctrace`-Sessions ohne öffentlich exponierten Debugport.
+9. Idempotenter Ein-Befehl-Mac-Bootstrap als Benutzer-LaunchAgent einschließlich Diagnosebundle.
+10. Reales Hardware-Gate mit einem angeschlossenen iPhone. Erst dieses Gate darf Phase 2 als Hardware-unterstützt ausweisen.
+
+Nicht-Ziele dieses Loops bleiben allgemeine iOS-Systemfernsteuerung, Steuerung fremder Apps, Umgehung von Signing/Trust/Developer Mode sowie eine Desktop-GUI. Private Signing-Schlüssel verlassen niemals den macOS-Keychain. Der Nutzer wird erst eingebunden, wenn Bootstrap und Hardware-Gate als ein konkreter Mac-Befehl bereitstehen.

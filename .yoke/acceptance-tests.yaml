@@ -1,14 +1,22 @@
-STORY-14:
-  suite: tests/process_execution.rs
-STORY-15:
-  suite: tests/artifacts.rs
-STORY-16:
-  suite: tests/device_adapter_contract.rs
-STORY-17:
-  suite: tests/secure_transport.rs
-STORY-18:
-  suite: tests/network_processes.rs
-STORY-19:
-  suite: tests/e2e_vertical_slice.rs
-STORY-20:
-  bootstrap: scripts/bootstrap-smoke
+STORY-21:
+  suite: tests/apple_preflight.rs
+STORY-22:
+  suite: tests/apple_discovery.rs
+STORY-23:
+  suite: tests/apple_project_discovery.rs
+STORY-24:
+  suite: tests/apple_build.rs
+STORY-25:
+  suite: tests/apple_simulator.rs
+STORY-26:
+  suite: tests/apple_physical_device.rs
+STORY-27:
+  suite: tests/apple_xctest.rs
+STORY-28:
+  suite: tests/apple_diagnostics.rs
+STORY-29:
+  suite: tests/mac_bootstrap.rs
+  bootstrap: scripts/mac-bootstrap-smoke
+STORY-30:
+  hardware_gate: scripts/mac-hardware-gate.sh
+  requires: macos-and-physical-iphone
