@@ -3024,7 +3024,7 @@ pub mod apple_build {
 
     pub struct AppleBuildStream {
         inner: ProcessStream,
-        redact_output: bool,
+        secrets: Vec<String>,
         journal: Vec<ProcessEvent>,
     }
 
@@ -3042,8 +3042,14 @@ pub mod apple_build {
         type Item = ProcessEvent;
         fn next(&mut self) -> Option<Self::Item> {
             let mut event = self.inner.next()?;
-            if self.redact_output && matches!(event.kind, EventKind::Stdout | EventKind::Stderr) {
-                event.payload = b"[REDACTED OUTPUT]".to_vec();
+            if matches!(event.kind, EventKind::Stdout | EventKind::Stderr) {
+                let mut output = String::from_utf8_lossy(&event.payload).into_owned();
+                for secret in &self.secrets {
+                    if !secret.is_empty() {
+                        output = output.replace(secret, "[REDACTED]");
+                    }
+                }
+                event.payload = output.into_bytes();
             }
             self.journal.push(event.clone());
             Some(event)
@@ -3124,7 +3130,7 @@ pub mod apple_build {
                 .map_err(AppleBuildError::Process)?;
             Ok(AppleBuildStream {
                 inner,
-                redact_output: !plan.protected_build_settings.is_empty(),
+                secrets: plan.protected_build_settings.values().cloned().collect(),
                 journal: Vec::new(),
             })
         }

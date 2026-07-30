@@ -7,8 +7,10 @@ use device_development_mesh::process_execution::{CancellationToken, EventKind, T
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 
 fn workspace() -> PathBuf {
     let root = env::temp_dir().join(format!("mesh-apple-build-{}", std::process::id()));
@@ -146,6 +148,111 @@ fn rejects_signing_reference_that_is_not_locally_available() {
 }
 
 #[test]
+fn build_stream_preserves_live_output_while_redacting_only_secret_values() {
+    let root = workspace();
+    let job = AppleBuildJob::with_prefix(
+        &root,
+        env::current_exe().unwrap(),
+        ["API_TOKEN"],
+        [
+            "--ignored",
+            "--exact",
+            "apple_build_stream_helper",
+            "--nocapture",
+            "--",
+        ],
+    )
+    .unwrap()
+    .with_local_signing_references([SigningReference::Identity(
+        "Apple Development: Local".into(),
+    )]);
+    let build = plan(BuildAction::Build);
+    let began = Instant::now();
+    let mut stream = job
+        .start(&build, Duration::from_secs(5), CancellationToken::new())
+        .unwrap();
+
+    let mut events = Vec::new();
+    for event in stream.by_ref() {
+        let is_visible_output = matches!(event.kind, EventKind::Stdout)
+            && String::from_utf8_lossy(&event.payload).contains("build-phase-visible");
+        events.push(event);
+        if is_visible_output {
+            break;
+        }
+    }
+    assert!(
+        began.elapsed() < Duration::from_millis(700),
+        "stdout was buffered until the helper exited"
+    );
+    let output = events
+        .iter()
+        .flat_map(|event| event.payload.clone())
+        .collect::<Vec<_>>();
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("build-phase-visible"));
+    assert!(output.contains("[REDACTED]"));
+    assert!(!output.contains("very-secret"));
+
+    events.extend(stream);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Terminal(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn build_stream_timeout_and_cancel_each_emit_one_terminal_status() {
+    let root = workspace();
+    let job = AppleBuildJob::with_prefix(
+        &root,
+        env::current_exe().unwrap(),
+        ["API_TOKEN"],
+        [
+            "--ignored",
+            "--exact",
+            "apple_build_slow_helper",
+            "--nocapture",
+            "--",
+        ],
+    )
+    .unwrap()
+    .with_local_signing_references([SigningReference::Identity(
+        "Apple Development: Local".into(),
+    )]);
+    let build = plan(BuildAction::Build);
+
+    let timed_out = job
+        .start(&build, Duration::from_millis(50), CancellationToken::new())
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        timed_out
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Terminal(TerminalStatus::TimedOut)))
+            .count(),
+        1
+    );
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let cancelled = job
+        .start(&build, Duration::from_secs(5), cancellation)
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cancelled
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Terminal(TerminalStatus::Cancelled)))
+            .count(),
+        1
+    );
+}
+
+#[test]
 #[ignore]
 fn apple_build_helper() {
     fs::create_dir_all("DerivedData/Build/Products/Debug/Mesh.app").unwrap();
@@ -160,4 +267,18 @@ fn apple_build_helper() {
     fs::write("Results/Test.xcresult/data", b"result").unwrap();
     println!("stdout {}", env::var("API_TOKEN").unwrap());
     eprintln!("stderr {}", env::var("API_TOKEN").unwrap());
+}
+
+#[test]
+#[ignore]
+fn apple_build_stream_helper() {
+    println!("build-phase-visible {}", env::var("API_TOKEN").unwrap());
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(Duration::from_millis(900));
+}
+
+#[test]
+#[ignore]
+fn apple_build_slow_helper() {
+    std::thread::sleep(Duration::from_secs(30));
 }
