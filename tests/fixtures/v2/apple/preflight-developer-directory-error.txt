@@ -1,0 +1,7 @@
+xcode-select -p|error||xcode-select: error: unable to get active developer directory
+xcodebuild -version|error||xcrun: error: invalid active developer path
+xcrun --find devicectl|error||xcrun: error: invalid active developer path
+xcrun --find simctl|error||xcrun: error: invalid active developer path
+xcrun --find xcresulttool|error||xcrun: error: invalid active developer path
+xcrun --find xctrace|error||xcrun: error: invalid active developer path
+xcrun --find lldb-dap|error||xcrun: error: invalid active developer path

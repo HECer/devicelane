@@ -2237,6 +2237,13 @@ pub mod network_processes {
 }
 
 pub mod preflight {
+    use crate::process_execution::{
+        CancellationToken, ProcessError, ProcessEvent, ProcessExecutor, ProcessRequest,
+    };
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum PreflightError {
         UnsupportedHost,
@@ -2246,13 +2253,61 @@ pub mod preflight {
 
     pub struct CommandOutput {
         stdout: String,
+        stderr: String,
+        success: bool,
     }
 
     impl CommandOutput {
         pub fn success(stdout: impl Into<String>) -> Self {
             Self {
                 stdout: stdout.into(),
+                stderr: String::new(),
+                success: true,
             }
+        }
+
+        pub fn new(success: bool, stdout: impl Into<String>, stderr: impl Into<String>) -> Self {
+            Self {
+                stdout: stdout.into(),
+                stderr: stderr.into(),
+                success,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ApplePreflightState {
+        Ready,
+        NeedsRepair,
+        UnsupportedHost,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AppleCheckState {
+        Ready,
+        MissingTool,
+        LicenseNotAccepted,
+        InvalidDeveloperDirectory,
+        UnsupportedHost,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct AppleCheck {
+        pub name: &'static str,
+        pub state: AppleCheckState,
+        pub value: Option<String>,
+        pub repair: Option<&'static str>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct ApplePreflightReport {
+        pub state: ApplePreflightState,
+        pub checks: Vec<AppleCheck>,
+    }
+
+    impl ApplePreflightReport {
+        pub fn check(&self, name: &str) -> Option<&AppleCheck> {
+            self.checks.iter().find(|check| check.name == name)
         }
     }
 
@@ -2267,6 +2322,89 @@ pub mod preflight {
     pub struct ApplePreflight;
 
     impl ApplePreflight {
+        pub fn inspect(
+            host: &str,
+            mut command: impl FnMut(&str, &[&str]) -> Result<CommandOutput, PreflightError>,
+        ) -> ApplePreflightReport {
+            if host != "macos" {
+                return ApplePreflightReport {
+                    state: ApplePreflightState::UnsupportedHost,
+                    checks: vec![AppleCheck {
+                        name: "macos",
+                        state: AppleCheckState::UnsupportedHost,
+                        value: None,
+                        repair: Some("Run Apple tooling on a macOS host."),
+                    }],
+                };
+            }
+
+            let developer = command("xcode-select", &["-p"])
+                .unwrap_or_else(|_| CommandOutput::new(false, "", "command failed"));
+            let xcode = command("xcodebuild", &["-version"])
+                .unwrap_or_else(|_| CommandOutput::new(false, "", "command failed"));
+            let mut checks = vec![ready_check("macos", None)];
+            let developer_ready = developer.success
+                && developer
+                    .stdout
+                    .trim()
+                    .ends_with("Xcode.app/Contents/Developer");
+            checks.push(if developer_ready {
+                ready_check("developer_directory", Some(developer.stdout.trim().to_owned()))
+            } else {
+                failed_check(
+                    "developer_directory",
+                    AppleCheckState::InvalidDeveloperDirectory,
+                    "Select full Xcode with: sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer",
+                )
+            });
+            checks.push(if developer_ready && xcode.success {
+                ready_check("full_xcode", token_after(&xcode.stdout, "Xcode").ok())
+            } else {
+                failed_check(
+                    "full_xcode",
+                    AppleCheckState::InvalidDeveloperDirectory,
+                    "Install full Xcode and select it with xcode-select --switch.",
+                )
+            });
+            checks.push(if xcode.success {
+                ready_check("xcodebuild", token_after(&xcode.stdout, "Xcode").ok())
+            } else if xcode.stderr.to_ascii_lowercase().contains("license") {
+                failed_check(
+                    "xcodebuild",
+                    AppleCheckState::LicenseNotAccepted,
+                    "Accept the license with: sudo xcodebuild -license accept",
+                )
+            } else {
+                failed_check(
+                    "xcodebuild",
+                    AppleCheckState::MissingTool,
+                    "Install full Xcode from Apple and select its developer directory.",
+                )
+            });
+            for tool in ["devicectl", "simctl", "xcresulttool", "xctrace", "lldb-dap"] {
+                let output = command("xcrun", &["--find", tool])
+                    .unwrap_or_else(|_| CommandOutput::new(false, "", "command failed"));
+                checks.push(if output.success {
+                    ready_check(tool, Some(output.stdout.trim().to_owned()))
+                } else {
+                    failed_check(
+                        tool,
+                        AppleCheckState::MissingTool,
+                        "Install or update full Xcode, then select its developer directory.",
+                    )
+                });
+            }
+            let state = if checks
+                .iter()
+                .all(|check| check.state == AppleCheckState::Ready)
+            {
+                ApplePreflightState::Ready
+            } else {
+                ApplePreflightState::NeedsRepair
+            };
+            ApplePreflightReport { state, checks }
+        }
+
         pub fn run(
             host: &str,
             mut command: impl FnMut(&str, &[&str]) -> Result<CommandOutput, PreflightError>,
@@ -2284,6 +2422,94 @@ pub mod preflight {
                 devicectl: token_after(&devicectl.stdout, "version:")?,
                 simctl: token_after(&simctl.stdout, "SimulatorKit")?,
             })
+        }
+    }
+
+    fn ready_check(name: &'static str, value: Option<String>) -> AppleCheck {
+        AppleCheck {
+            name,
+            state: AppleCheckState::Ready,
+            value,
+            repair: None,
+        }
+    }
+
+    fn failed_check(
+        name: &'static str,
+        state: AppleCheckState,
+        repair: &'static str,
+    ) -> AppleCheck {
+        AppleCheck {
+            name,
+            state,
+            value: None,
+            repair: Some(repair),
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum AppleTool {
+        Xcodebuild,
+        Devicectl,
+        Simctl,
+        Xcresulttool,
+        Xctrace,
+        LldbDap,
+    }
+
+    impl AppleTool {
+        pub const ALL: [Self; 6] = [
+            Self::Xcodebuild,
+            Self::Devicectl,
+            Self::Simctl,
+            Self::Xcresulttool,
+            Self::Xctrace,
+            Self::LldbDap,
+        ];
+    }
+
+    pub struct AppleToolRunner {
+        executor: ProcessExecutor,
+        programs: HashMap<AppleTool, PathBuf>,
+    }
+
+    impl AppleToolRunner {
+        pub fn new(
+            workspace: impl AsRef<Path>,
+            programs: impl IntoIterator<Item = (AppleTool, PathBuf)>,
+        ) -> Result<Self, ProcessError> {
+            let programs: HashMap<_, _> = programs.into_iter().collect();
+            let executor = ProcessExecutor::new(
+                workspace,
+                programs.values().cloned(),
+                ["DEVELOPER_DIR", "SDKROOT", "TMPDIR"],
+            )?;
+            Ok(Self { executor, programs })
+        }
+
+        pub fn execute(
+            &self,
+            tool: AppleTool,
+            args: Vec<String>,
+            working_directory: impl Into<PathBuf>,
+            environment: HashMap<String, String>,
+            timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> Result<Vec<ProcessEvent>, ProcessError> {
+            let program = self
+                .programs
+                .get(&tool)
+                .ok_or(ProcessError::ProgramDenied)?;
+            self.executor.execute(
+                ProcessRequest {
+                    program: program.clone(),
+                    args,
+                    working_directory: working_directory.into(),
+                    environment,
+                },
+                timeout,
+                cancellation,
+            )
         }
     }
 

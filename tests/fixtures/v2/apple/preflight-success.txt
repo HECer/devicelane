@@ -1,0 +1,7 @@
+xcode-select -p|ok|/Applications/Xcode.app/Contents/Developer|
+xcodebuild -version|ok|Xcode 16.4\nBuild version 16F6|
+xcrun --find devicectl|ok|/Applications/Xcode.app/Contents/Developer/usr/bin/devicectl|
+xcrun --find simctl|ok|/Applications/Xcode.app/Contents/Developer/usr/bin/simctl|
+xcrun --find xcresulttool|ok|/Applications/Xcode.app/Contents/Developer/usr/bin/xcresulttool|
+xcrun --find xctrace|ok|/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace|
+xcrun --find lldb-dap|ok|/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap|
