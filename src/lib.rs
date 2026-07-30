@@ -321,6 +321,107 @@ pub mod identity {
     }
 }
 
+pub mod discovery {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct CapabilitySnapshot {
+        pub capabilities: Vec<String>,
+        pub toolchains: Vec<String>,
+    }
+
+    pub struct AgentHeartbeat {
+        pub agent_id: String,
+        pub operating_system: String,
+        pub architecture: String,
+        pub snapshot: CapabilitySnapshot,
+    }
+
+    pub struct Agent {
+        heartbeat: AgentHeartbeat,
+    }
+
+    impl Agent {
+        pub fn new(heartbeat: AgentHeartbeat) -> Self {
+            Self { heartbeat }
+        }
+
+        pub fn start(self, registry: &mut Registry, now: Duration) {
+            registry.record_heartbeat(self.heartbeat, now);
+        }
+    }
+
+    struct AgentRecord {
+        heartbeat: AgentHeartbeat,
+        last_seen: Duration,
+        snapshot_revision: u64,
+    }
+
+    pub struct Registry {
+        heartbeat_window: Duration,
+        agents: HashMap<String, AgentRecord>,
+    }
+
+    impl Registry {
+        pub fn new(heartbeat_window: Duration) -> Self {
+            Self {
+                heartbeat_window,
+                agents: HashMap::new(),
+            }
+        }
+
+        pub fn record_heartbeat(&mut self, heartbeat: AgentHeartbeat, now: Duration) {
+            let revision = self
+                .agents
+                .get(&heartbeat.agent_id)
+                .map(|record| {
+                    record.snapshot_revision
+                        + u64::from(record.heartbeat.snapshot != heartbeat.snapshot)
+                })
+                .unwrap_or(1);
+            self.agents.insert(
+                heartbeat.agent_id.clone(),
+                AgentRecord {
+                    heartbeat,
+                    last_seen: now,
+                    snapshot_revision: revision,
+                },
+            );
+        }
+
+        pub fn snapshot_revision(&self, agent_id: &str) -> Option<u64> {
+            self.agents
+                .get(agent_id)
+                .map(|record| record.snapshot_revision)
+        }
+
+        pub fn cli_agents(&self, now: Duration) -> String {
+            self.agents
+                .values()
+                .map(|record| {
+                    let agent = &record.heartbeat;
+                    let status = if now.saturating_sub(record.last_seen) >= self.heartbeat_window {
+                        "offline"
+                    } else {
+                        "online"
+                    };
+                    format!(
+                        "{} {} {} {} {} revision={} {status}",
+                        agent.agent_id,
+                        agent.operating_system,
+                        agent.architecture,
+                        agent.snapshot.capabilities.join(","),
+                        agent.snapshot.toolchains.join(","),
+                        record.snapshot_revision
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

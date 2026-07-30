@@ -48,7 +48,7 @@
     - Ein beendeter Agent wird nach Ablauf des Heartbeat-Fensters als offline
       und nicht als gelöscht angezeigt
     - Eine Änderung des Toolchain-Snapshots erzeugt eine neue monotone Revision
-  passes: false
+  passes: true
   needs:
     - STORY-3
   area: discovery
