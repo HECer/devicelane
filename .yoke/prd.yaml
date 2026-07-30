@@ -77,7 +77,7 @@
       dem Workspace werden abgelehnt
     - Ein zweiter Schreibclient erhält bei bestehender Lease einen eindeutigen
       Konfliktfehler
-  passes: false
+  passes: true
   needs:
     - STORY-5
   area: workspace

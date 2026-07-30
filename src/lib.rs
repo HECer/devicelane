@@ -595,6 +595,206 @@ pub mod authorization {
     }
 }
 
+pub mod workspace {
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::fs::OpenOptions;
+    use std::io::{ErrorKind, Write};
+    use std::path::{Component, Path, PathBuf};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WorkspaceError {
+        PathEscape,
+        WriteLeaseConflict,
+        WriteLeaseRequired,
+        Io,
+    }
+
+    pub struct ManifestEntry {
+        path: PathBuf,
+        contents: Vec<u8>,
+    }
+
+    impl ManifestEntry {
+        pub fn new(path: impl Into<PathBuf>, contents: Vec<u8>) -> Self {
+            Self {
+                path: path.into(),
+                contents,
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct ManifestHash {
+        path: String,
+        sha256: String,
+    }
+
+    impl ManifestHash {
+        pub fn path(&self) -> &str {
+            &self.path
+        }
+
+        pub fn sha256(&self) -> &str {
+            &self.sha256
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct Manifest {
+        entries: Vec<ManifestHash>,
+    }
+
+    impl Manifest {
+        pub fn entries(&self) -> &[ManifestHash] {
+            &self.entries
+        }
+    }
+
+    pub struct WorkspaceManager {
+        root: PathBuf,
+        root_dir: Dir,
+        write_leases: HashMap<(String, String), String>,
+    }
+
+    impl WorkspaceManager {
+        pub fn new(root: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
+            fs::create_dir_all(root.as_ref()).map_err(|_| WorkspaceError::Io)?;
+            let root = fs::canonicalize(root.as_ref()).map_err(|_| WorkspaceError::Io)?;
+            let root_dir = Dir::open_ambient_dir(&root, ambient_authority())
+                .map_err(|_| WorkspaceError::Io)?;
+            Ok(Self {
+                root,
+                root_dir,
+                write_leases: HashMap::new(),
+            })
+        }
+
+        pub fn acquire_write_lease(
+            &mut self,
+            agent_id: &str,
+            session_id: &str,
+            client_id: &str,
+        ) -> Result<(), WorkspaceError> {
+            validate_agent_name(agent_id)?;
+            validate_name(session_id)?;
+            let key = (agent_id.to_owned(), session_id.to_owned());
+            if self
+                .write_leases
+                .get(&key)
+                .is_some_and(|holder| holder != client_id)
+            {
+                return Err(WorkspaceError::WriteLeaseConflict);
+            }
+            let session = self.root.join(agent_id).join(session_id);
+            fs::create_dir_all(&session).map_err(|_| WorkspaceError::Io)?;
+            if !fs::canonicalize(&session)
+                .map_err(|_| WorkspaceError::Io)?
+                .starts_with(&self.root)
+            {
+                return Err(WorkspaceError::PathEscape);
+            }
+            let lease = self.root.join(".leases").join(agent_id).join(session_id);
+            fs::create_dir_all(lease.parent().unwrap()).map_err(|_| WorkspaceError::Io)?;
+            match OpenOptions::new().write(true).create_new(true).open(&lease) {
+                Ok(mut file) => file
+                    .write_all(client_id.as_bytes())
+                    .map_err(|_| WorkspaceError::Io)?,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if fs::read_to_string(&lease).map_err(|_| WorkspaceError::Io)? != client_id {
+                        return Err(WorkspaceError::WriteLeaseConflict);
+                    }
+                }
+                Err(_) => return Err(WorkspaceError::Io),
+            }
+            self.write_leases.insert(key, client_id.to_owned());
+            Ok(())
+        }
+
+        pub fn upload_manifest(
+            &self,
+            agent_id: &str,
+            session_id: &str,
+            client_id: &str,
+            entries: Vec<ManifestEntry>,
+        ) -> Result<Manifest, WorkspaceError> {
+            validate_agent_name(agent_id)?;
+            validate_name(session_id)?;
+            if self
+                .write_leases
+                .get(&(agent_id.to_owned(), session_id.to_owned()))
+                .map(String::as_str)
+                != Some(client_id)
+            {
+                return Err(WorkspaceError::WriteLeaseRequired);
+            }
+            let session = fs::canonicalize(self.root.join(agent_id).join(session_id))
+                .map_err(|_| WorkspaceError::Io)?;
+            let session_dir = self
+                .root_dir
+                .open_dir(Path::new(agent_id).join(session_id))
+                .map_err(|_| WorkspaceError::PathEscape)?;
+            let mut hashes = Vec::with_capacity(entries.len());
+            for entry in entries {
+                validate_relative_path(&entry.path)?;
+                let destination = session.join(&entry.path);
+                let mut ancestor = destination.parent().ok_or(WorkspaceError::PathEscape)?;
+                while !ancestor.exists() {
+                    ancestor = ancestor.parent().ok_or(WorkspaceError::PathEscape)?;
+                }
+                if !fs::canonicalize(ancestor)
+                    .map_err(|_| WorkspaceError::Io)?
+                    .starts_with(&session)
+                {
+                    return Err(WorkspaceError::PathEscape);
+                }
+                if fs::symlink_metadata(&destination)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(WorkspaceError::PathEscape);
+                }
+                session_dir
+                    .create_dir_all(entry.path.parent().unwrap())
+                    .map_err(|_| WorkspaceError::PathEscape)?;
+                session_dir
+                    .write(&entry.path, &entry.contents)
+                    .map_err(|_| WorkspaceError::PathEscape)?;
+                hashes.push(ManifestHash {
+                    path: entry.path.to_string_lossy().replace('\\', "/"),
+                    sha256: format!("{:x}", Sha256::digest(&entry.contents)),
+                });
+            }
+            Ok(Manifest { entries: hashes })
+        }
+    }
+
+    fn validate_name(name: &str) -> Result<(), WorkspaceError> {
+        validate_relative_path(Path::new(name))
+    }
+
+    fn validate_agent_name(name: &str) -> Result<(), WorkspaceError> {
+        if name.eq_ignore_ascii_case(".leases") {
+            return Err(WorkspaceError::PathEscape);
+        }
+        validate_name(name)
+    }
+
+    fn validate_relative_path(path: &Path) -> Result<(), WorkspaceError> {
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(WorkspaceError::PathEscape);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
