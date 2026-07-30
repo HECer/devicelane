@@ -456,6 +456,7 @@ pub mod process_execution {
 }
 
 pub mod identity {
+    use rand::{RngCore, rngs::OsRng};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -526,8 +527,9 @@ pub mod identity {
         }
 
         pub fn issue_pairing_code(&mut self, lifetime: Duration) -> String {
-            let nonce = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let value = format!("{:06}", nonce % 1_000_000);
+            let mut random = [0_u8; 4];
+            OsRng.fill_bytes(&mut random);
+            let value = format!("{:06}", u32::from_le_bytes(random) % 1_000_000);
             self.pairing_code = Some(PairingCode {
                 value: value.clone(),
                 lifetime,
@@ -591,6 +593,423 @@ pub mod identity {
 
         pub fn audit_log(&self) -> &[AuditEvent] {
             &self.audit
+        }
+    }
+}
+
+pub mod secure_transport {
+    use rand::{RngCore, rngs::OsRng};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use rustls::{
+        ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::fmt;
+    use std::fs;
+    use std::io;
+    use std::net::TcpStream;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum AuditEvent {
+        Paired(String),
+        Rejected(&'static str),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TransportError {
+        InvalidCode,
+        CodeExpired,
+        CodeReused,
+        TlsRequired,
+        UntrustedPeer,
+        RevokedPeer,
+        InvalidCertificate,
+        Io,
+        Tls,
+    }
+
+    struct PairingCode {
+        value: String,
+        lifetime: Duration,
+        issued_at: Instant,
+        consumed: bool,
+    }
+
+    pub struct SecureTransport {
+        root: PathBuf,
+        id: String,
+        certificate: Vec<u8>,
+        private_key: Vec<u8>,
+        trusted: HashMap<String, Vec<u8>>,
+        revoked: HashSet<String>,
+        pairing_code: Option<PairingCode>,
+        audit: Mutex<Vec<AuditEvent>>,
+        rpc_count: usize,
+    }
+
+    impl fmt::Debug for SecureTransport {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("SecureTransport")
+                .field("id", &self.id)
+                .field("trusted_peers", &self.trusted.keys().collect::<Vec<_>>())
+                .finish()
+        }
+    }
+
+    impl SecureTransport {
+        pub fn load_or_create(
+            root: impl AsRef<Path>,
+            id: impl Into<String>,
+        ) -> Result<Self, TransportError> {
+            let root = root.as_ref().to_owned();
+            let id = id.into();
+            if !valid_machine_id(&id) {
+                return Err(TransportError::InvalidCertificate);
+            }
+            fs::create_dir_all(root.join("trust")).map_err(|_| TransportError::Io)?;
+            secure_directory(&root)?;
+            secure_directory(&root.join("trust"))?;
+            let certificate_path = root.join("certificate.der");
+            let key_path = root.join("private-key.der");
+            let (certificate, private_key) = if certificate_path.exists() && key_path.exists() {
+                (
+                    fs::read(&certificate_path).map_err(|_| TransportError::Io)?,
+                    fs::read(&key_path).map_err(|_| TransportError::Io)?,
+                )
+            } else {
+                let generated = rcgen::generate_simple_self_signed(vec![id.clone()])
+                    .map_err(|_| TransportError::InvalidCertificate)?;
+                let certificate = generated.cert.der().to_vec();
+                let private_key = generated.key_pair.serialize_der();
+                write_secret(&certificate_path, &certificate)?;
+                write_secret(&key_path, &private_key)?;
+                (certificate, private_key)
+            };
+            let mut trusted = HashMap::new();
+            for entry in fs::read_dir(root.join("trust")).map_err(|_| TransportError::Io)? {
+                let entry = entry.map_err(|_| TransportError::Io)?;
+                if entry.path().extension().and_then(|value| value.to_str()) == Some("der") {
+                    let peer_id = entry
+                        .path()
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    trusted.insert(
+                        peer_id,
+                        fs::read(entry.path()).map_err(|_| TransportError::Io)?,
+                    );
+                }
+            }
+            let revoked = fs::read_to_string(root.join("revoked"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            Ok(Self {
+                root,
+                id,
+                certificate,
+                private_key,
+                trusted,
+                revoked,
+                pairing_code: None,
+                audit: Mutex::new(Vec::new()),
+                rpc_count: 0,
+            })
+        }
+
+        pub fn certificate_der(&self) -> &[u8] {
+            &self.certificate
+        }
+
+        pub fn machine_id(&self) -> &str {
+            &self.id
+        }
+
+        pub fn issue_pairing_code(&mut self, lifetime: Duration) -> String {
+            let mut random = [0_u8; 16];
+            OsRng.fill_bytes(&mut random);
+            let value: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+            self.pairing_code = Some(PairingCode {
+                value: value.clone(),
+                lifetime,
+                issued_at: Instant::now(),
+                consumed: false,
+            });
+            value
+        }
+
+        pub fn accept_pairing(
+            &mut self,
+            code: &str,
+            certificate: &[u8],
+            elapsed: Duration,
+        ) -> Result<(), TransportError> {
+            let Some(pairing) = self.pairing_code.as_ref() else {
+                self.reject("invalid_code");
+                return Err(TransportError::InvalidCode);
+            };
+            if pairing.value != code {
+                self.reject("invalid_code");
+                return Err(TransportError::InvalidCode);
+            }
+            if pairing.consumed {
+                self.reject("code_reused");
+                return Err(TransportError::CodeReused);
+            }
+            if pairing.issued_at.elapsed().saturating_add(elapsed) > pairing.lifetime {
+                self.reject("code_expired");
+                return Err(TransportError::CodeExpired);
+            }
+            self.pairing_code.as_mut().unwrap().consumed = true;
+            let peer_id = certificate_dns_name(certificate)?;
+            self.trust(&peer_id, certificate)?;
+            self.audit
+                .get_mut()
+                .unwrap()
+                .push(AuditEvent::Paired(peer_id));
+            Ok(())
+        }
+
+        pub fn trust(&mut self, peer_id: &str, certificate: &[u8]) -> Result<(), TransportError> {
+            if !valid_machine_id(peer_id) || certificate_dns_name(certificate)? != peer_id {
+                return Err(TransportError::InvalidCertificate);
+            }
+            write_secret(
+                &self.root.join("trust").join(format!("{peer_id}.der")),
+                certificate,
+            )?;
+            self.trusted
+                .insert(peer_id.to_owned(), certificate.to_vec());
+            Ok(())
+        }
+
+        pub fn revoke(&mut self, peer_id: &str) -> Result<(), TransportError> {
+            self.revoked.insert(peer_id.to_owned());
+            let contents = self.revoked.iter().cloned().collect::<Vec<_>>().join("\n");
+            write_secret(&self.root.join("revoked"), contents.as_bytes())
+        }
+
+        pub fn reject_cleartext(&self) -> Result<(), TransportError> {
+            self.reject("tls_required");
+            Err(TransportError::TlsRequired)
+        }
+
+        pub fn process_cleartext_rpc(&mut self) -> Result<(), TransportError> {
+            self.reject_cleartext()
+        }
+
+        pub fn process_rpc(&mut self, certificate: &[u8]) -> Result<(), TransportError> {
+            self.authorize_peer(certificate)?;
+            self.rpc_count += 1;
+            Ok(())
+        }
+
+        pub fn authorize_peer(&self, certificate: &[u8]) -> Result<(), TransportError> {
+            let peer_id = self
+                .trusted
+                .iter()
+                .find_map(|(id, trusted)| (trusted.as_slice() == certificate).then_some(id));
+            let Some(peer_id) = peer_id else {
+                self.reject("untrusted_peer");
+                return Err(TransportError::UntrustedPeer);
+            };
+            if self.revoked.contains(peer_id) {
+                self.reject("revoked_peer");
+                return Err(TransportError::RevokedPeer);
+            }
+            Ok(())
+        }
+
+        pub fn connect_tls(
+            &self,
+            mut stream: TcpStream,
+            server_name: &str,
+        ) -> Result<StreamOwned<ClientConnection, TcpStream>, TransportError> {
+            let config = ClientConfig::builder()
+                .with_root_certificates(self.roots()?)
+                .with_client_auth_cert(self.cert_chain(), self.key()?)
+                .map_err(|_| TransportError::InvalidCertificate)?;
+            let name = ServerName::try_from(server_name.to_owned())
+                .map_err(|_| TransportError::InvalidCertificate)?;
+            let mut connection =
+                ClientConnection::new(Arc::new(config), name).map_err(|_| TransportError::Tls)?;
+            connection.complete_io(&mut stream).map_err(|_| {
+                self.reject("tls_handshake_failed");
+                TransportError::Tls
+            })?;
+            let peer = connection
+                .peer_certificates()
+                .and_then(|certificates| certificates.first())
+                .ok_or(TransportError::UntrustedPeer)?;
+            self.authorize_peer(peer.as_ref())?;
+            Ok(StreamOwned::new(connection, stream))
+        }
+
+        pub fn accept_tls(
+            &self,
+            mut stream: TcpStream,
+        ) -> Result<StreamOwned<ServerConnection, TcpStream>, TransportError> {
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(self.roots()?))
+                .build()
+                .map_err(|_| TransportError::InvalidCertificate)?;
+            let config = ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(self.cert_chain(), self.key()?)
+                .map_err(|_| TransportError::InvalidCertificate)?;
+            let mut connection =
+                ServerConnection::new(Arc::new(config)).map_err(|_| TransportError::Tls)?;
+            connection.complete_io(&mut stream).map_err(|_| {
+                self.reject("tls_handshake_failed");
+                TransportError::Tls
+            })?;
+            let peer = connection
+                .peer_certificates()
+                .and_then(|certificates| certificates.first())
+                .ok_or(TransportError::UntrustedPeer)?;
+            self.authorize_peer(peer.as_ref())?;
+            Ok(StreamOwned::new(connection, stream))
+        }
+
+        pub fn audit_log(&self) -> Vec<AuditEvent> {
+            self.audit.lock().unwrap().clone()
+        }
+
+        pub fn rpc_count(&self) -> usize {
+            self.rpc_count
+        }
+
+        fn roots(&self) -> Result<RootCertStore, TransportError> {
+            let mut roots = RootCertStore::empty();
+            for certificate in self.trusted.values() {
+                roots
+                    .add(CertificateDer::from(certificate.clone()))
+                    .map_err(|_| TransportError::InvalidCertificate)?;
+            }
+            Ok(roots)
+        }
+
+        fn cert_chain(&self) -> Vec<CertificateDer<'static>> {
+            vec![CertificateDer::from(self.certificate.clone())]
+        }
+
+        fn key(&self) -> Result<PrivateKeyDer<'static>, TransportError> {
+            Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                self.private_key.clone(),
+            )))
+        }
+
+        fn reject(&self, reason: &'static str) {
+            self.audit
+                .lock()
+                .unwrap()
+                .push(AuditEvent::Rejected(reason));
+        }
+    }
+
+    fn certificate_dns_name(certificate: &[u8]) -> Result<String, TransportError> {
+        use x509_parser::extensions::GeneralName;
+        use x509_parser::prelude::FromDer;
+        let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate)
+            .map_err(|_| TransportError::InvalidCertificate)?;
+        parsed
+            .subject_alternative_name()
+            .map_err(|_| TransportError::InvalidCertificate)?
+            .and_then(|extension| {
+                extension
+                    .value
+                    .general_names
+                    .iter()
+                    .find_map(|name| match name {
+                        GeneralName::DNSName(name) => Some((*name).to_owned()),
+                        _ => None,
+                    })
+            })
+            .ok_or(TransportError::InvalidCertificate)
+    }
+
+    fn write_secret(path: &Path, contents: &[u8]) -> Result<(), TransportError> {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::PermissionsExt;
+            if path.exists() {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                    .map_err(|_| TransportError::Io)?;
+            }
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|_| TransportError::Io)?;
+            file.write_all(contents).map_err(|_| TransportError::Io)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .map_err(|_| TransportError::Io)?;
+        }
+        #[cfg(windows)]
+        {
+            if path.exists() {
+                restrict_windows_path(path)?;
+            }
+            fs::write(path, contents).map_err(|_| TransportError::Io)?;
+            restrict_windows_path(path)?;
+        }
+        Ok(())
+    }
+
+    fn secure_directory(path: &Path) -> Result<(), TransportError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|_| TransportError::Io)?;
+        }
+        #[cfg(windows)]
+        restrict_windows_path(path)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn restrict_windows_path(path: &Path) -> Result<(), TransportError> {
+        use std::process::Command;
+        let account = Command::new("whoami")
+            .output()
+            .map_err(|_| TransportError::Io)?;
+        let account = String::from_utf8(account.stdout).map_err(|_| TransportError::Io)?;
+        let status = Command::new("icacls")
+            .arg(path)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                &format!("{}:F", account.trim()),
+            ])
+            .output()
+            .map_err(|_| TransportError::Io)?;
+        if status.status.success() {
+            Ok(())
+        } else {
+            Err(TransportError::Io)
+        }
+    }
+
+    fn valid_machine_id(id: &str) -> bool {
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    }
+
+    impl From<io::Error> for TransportError {
+        fn from(_: io::Error) -> Self {
+            Self::Io
         }
     }
 }

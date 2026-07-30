@@ -74,7 +74,7 @@
       nicht wiederverwendet werden
     - Unverschlüsselte, fremd signierte, abgelaufene oder widerrufene Peers
       werden vor RPC-Verarbeitung abgelehnt und auditiert
-  passes: false
+  passes: true
   needs:
     - STORY-16
   area: identity

@@ -12,4 +12,11 @@ cap-std = "3"
 command-group = "5"
 prost = "0.13"
 sha2 = "0.10"
+rand = "0.8"
+rcgen = "0.13"
+rustls = "0.23"
+x509-parser = "0.17"
+
+[dev-dependencies]
+tempfile = "3"
 
