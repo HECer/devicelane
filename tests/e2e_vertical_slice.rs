@@ -10,32 +10,14 @@ fn real_vertical_slice_resumes_without_reexecution_and_survives_registry_restart
     let root = tempfile::tempdir().unwrap();
     let registry_id = root.path().join("registry");
     let cli_id = root.path().join("cli");
-    let pairing_address = free_address();
-    let mut pairing_server = Command::new(env!("CARGO_BIN_EXE_mesh-registry"))
-        .args([
-            "pair",
-            "--listen",
-            &pairing_address,
-            "--identity",
-            registry_id.to_str().unwrap(),
-        ])
-        .spawn()
-        .unwrap();
-    let pairing = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
-        .args([
-            "pair",
-            "--address",
-            &pairing_address,
-            "--identity",
-            cli_id.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(pairing.status.success());
-    assert!(pairing_server.wait().unwrap().success());
+    let agent_id = root.path().join("agent");
+    let agent_workspaces = root.path().join("agent-workspaces");
+    pair_process(env!("CARGO_BIN_EXE_mesh-cli"), &registry_id, &cli_id);
+    pair_process(env!("CARGO_BIN_EXE_mesh-agent"), &registry_id, &agent_id);
+
     let address = free_address();
     let mut registry_process = registry(&address, &registry_id);
-
+    let _agent_process = agent(&address, &agent_id, &agent_workspaces);
     let request = serde_json::json!({
         "principal_id": "principal-1", "host_id": "mac-1", "device_id": "iphone-1",
         "workspace_id": "workspace-1", "request_id": "request-1",
@@ -54,6 +36,14 @@ fn real_vertical_slice_resumes_without_reexecution_and_survives_registry_restart
     assert_eq!(first_events.last().unwrap()["kind"], "exit");
     assert_eq!(first_events.last().unwrap()["payload"], "0");
     assert_eq!(first["artifact"], "manifest_files=1");
+    assert_eq!(
+        std::fs::read_to_string(agent_workspaces.join("mac-1/workspace-1/src/main.rs")).unwrap(),
+        "fn main() {}"
+    );
+    assert!(
+        !registry_id.join("workspaces").exists(),
+        "the control plane executed a host job locally"
+    );
 
     let cursor = first_events[0]["sequence"].as_u64().unwrap();
     let resumed = cli(
@@ -94,6 +84,38 @@ fn real_vertical_slice_resumes_without_reexecution_and_survives_registry_restart
     assert_eq!(audit[0]["result"], "succeeded");
 }
 
+fn pair_process(binary: &str, registry_identity: &std::path::Path, peer_identity: &std::path::Path) {
+    let pairing_address = free_address();
+    let mut pairing_server = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_mesh-registry"))
+            .args([
+                "pair",
+                "--listen",
+                &pairing_address,
+                "--identity",
+                registry_identity.to_str().unwrap(),
+            ])
+            .spawn()
+            .unwrap(),
+    );
+    let pairing = Command::new(binary)
+        .args([
+            "pair",
+            "--address",
+            &pairing_address,
+            "--identity",
+            peer_identity.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        pairing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pairing.stderr)
+    );
+    assert!(pairing_server.wait().unwrap().success());
+}
+
 fn cli(
     address: &str,
     identity: &std::path::Path,
@@ -124,6 +146,40 @@ fn registry(address: &str, identity: &std::path::Path) -> ChildGuard {
                 identity.to_str().unwrap(),
                 "--offline-after-ms",
                 "300",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn agent(
+    address: &str,
+    identity: &std::path::Path,
+    workspaces: &std::path::Path,
+) -> ChildGuard {
+    ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_mesh-agent"))
+            .args([
+                "--registry",
+                address,
+                "--identity",
+                identity.to_str().unwrap(),
+                "--id",
+                "mac-1",
+                "--os",
+                "macos",
+                "--arch",
+                "aarch64",
+                "--capability",
+                "process.start@1",
+                "--device",
+                "iphone-1:ios:connected",
+                "--heartbeat-ms",
+                "25",
+                "--workspace-root",
+                workspaces.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())

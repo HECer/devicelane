@@ -107,7 +107,9 @@
       werden mit einem stabilen Recovery-Fehler ausgewiesen
     - Audit-Ereignisse verbinden Principal, Host, Device, Workspace, Job und
       Ergebnis über stabile IDs
-  passes: true
+    - Der E2E-Test startet einen bereits gepairten Host-Agenten, der den Job über seine ausgehende Registry-Verbindung abholt und ausschließlich unter seinem eigenen Workspace-Root ausführt
+    - Die Registry darf weder den Agentprozess pro Job starten noch einen Projektworkspace auf dem Control-Plane-Host anlegen
+  passes: false
   needs:
     - STORY-18
   area: e2e
