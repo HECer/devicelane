@@ -21,7 +21,7 @@
       Minor-Version ohne Absturz ignoriert
     - Jeder Fehler enthält stabilen Code, menschenlesbare Meldung, Retry-Klasse
       und optionale Repair-Aktion
-  passes: false
+  passes: true
   needs:
     - STORY-1
   area: protocol
