@@ -14,6 +14,29 @@ fn main() {
     if metadata(&args) {
         return;
     }
+    if args.first().map(String::as_str) == Some("execute") {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).unwrap();
+        let files: Vec<device_development_mesh::network_processes::ManifestUpload> =
+            serde_json::from_str(&input).unwrap();
+        let workspace = std::env::temp_dir().join(format!("mesh-agent-job-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        for file in &files {
+            let path = std::path::Path::new(&file.path);
+            assert!(
+                !path.is_absolute()
+                    && path
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+            );
+            let destination = workspace.join(path);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::write(destination, file.contents.as_bytes()).unwrap();
+        }
+        println!("manifest_files={}", files.len());
+        std::fs::remove_dir_all(workspace).unwrap();
+        return;
+    }
     let registry = value(&args, "--registry");
     let transport = SecureTransport::load_or_create(value(&args, "--identity"), "agent").unwrap();
     let interval = Duration::from_millis(value(&args, "--heartbeat-ms").parse().unwrap());

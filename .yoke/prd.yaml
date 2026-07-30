@@ -107,7 +107,7 @@
       werden mit einem stabilen Recovery-Fehler ausgewiesen
     - Audit-Ereignisse verbinden Principal, Host, Device, Workspace, Job und
       Ergebnis über stabile IDs
-  passes: false
+  passes: true
   needs:
     - STORY-18
   area: e2e

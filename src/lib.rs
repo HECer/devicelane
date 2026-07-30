@@ -2147,6 +2147,39 @@ pub mod network_processes {
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, Deserialize, Serialize)]
+    pub struct ManifestUpload {
+        pub path: String,
+        pub contents: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    pub struct RunRequest {
+        pub principal_id: String,
+        pub host_id: String,
+        pub device_id: String,
+        pub workspace_id: String,
+        pub request_id: String,
+        pub manifest: Vec<ManifestUpload>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub struct NetworkEvent {
+        pub sequence: u64,
+        pub kind: String,
+        pub payload: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub struct AuditRecord {
+        pub principal_id: String,
+        pub host_id: String,
+        pub device_id: String,
+        pub workspace_id: String,
+        pub job_id: String,
+        pub result: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
     pub struct DeviceSnapshot {
         pub id: String,
         pub platform: String,
@@ -2168,12 +2201,24 @@ pub mod network_processes {
     pub enum Request {
         Heartbeat { host: HostSnapshot },
         List,
+        Run { operation: RunRequest },
+        Events { job_id: String, after: u64 },
     }
 
     #[derive(Deserialize, Serialize)]
     pub struct Response {
         pub accepted: bool,
         pub hosts: Vec<HostSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub job_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub events: Vec<NetworkEvent>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub audit: Vec<AuditRecord>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub artifact: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
     }
 }
 
