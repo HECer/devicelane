@@ -708,26 +708,41 @@ pub mod authorization {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Operation<'a> {
+        DiscoverDevices,
+        LeaseDevice,
         ReadLogs,
         StartProcess { device_id: &'a str },
+        StopProcess { device_id: &'a str },
         InstallDevice { device_id: &'a str },
+        ReadDeviceLogs { device_id: &'a str },
+        ReadArtifact { device_id: &'a str },
+        AttachDebugger { device_id: &'a str },
     }
 
     impl Operation<'_> {
         fn capability(&self) -> &str {
             match self {
+                Self::DiscoverDevices => "device.discover",
+                Self::LeaseDevice => "device.lease",
                 Self::ReadLogs => "logs.read",
                 Self::StartProcess { .. } => "process.start",
+                Self::StopProcess { .. } => "process.stop",
                 Self::InstallDevice { .. } => "device.install",
+                Self::ReadDeviceLogs { .. } => "logs.read",
+                Self::ReadArtifact { .. } => "artifact.read",
+                Self::AttachDebugger { .. } => "debug.attach",
             }
         }
 
         fn device_id(&self) -> Option<&str> {
             match self {
-                Self::ReadLogs => None,
-                Self::StartProcess { device_id } | Self::InstallDevice { device_id } => {
-                    Some(device_id)
-                }
+                Self::DiscoverDevices | Self::LeaseDevice | Self::ReadLogs => None,
+                Self::StartProcess { device_id }
+                | Self::StopProcess { device_id }
+                | Self::InstallDevice { device_id }
+                | Self::ReadDeviceLogs { device_id }
+                | Self::ReadArtifact { device_id }
+                | Self::AttachDebugger { device_id } => Some(device_id),
             }
         }
     }
@@ -865,6 +880,302 @@ pub mod authorization {
     impl Default for PolicyEngine {
         fn default() -> Self {
             Self::new()
+        }
+    }
+}
+
+pub mod device_adapter {
+    use crate::authorization::{AuthorizationError, LeaseId, Operation, PolicyEngine};
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AdapterError {
+        CapabilityDenied,
+        LeaseInactive,
+        UnsupportedCapability,
+        WaitingForDevice,
+    }
+
+    impl AdapterError {
+        pub fn code(self) -> &'static str {
+            match self {
+                Self::CapabilityDenied => "capability_denied",
+                Self::LeaseInactive => "lease_inactive",
+                Self::UnsupportedCapability => "unsupported_capability",
+                Self::WaitingForDevice => "waiting_for_device",
+            }
+        }
+    }
+
+    impl From<AuthorizationError> for AdapterError {
+        fn from(error: AuthorizationError) -> Self {
+            match error {
+                AuthorizationError::LeaseInactive => Self::LeaseInactive,
+                _ => Self::CapabilityDenied,
+            }
+        }
+    }
+
+    pub struct AdapterContext<'a> {
+        policy: &'a mut PolicyEngine,
+        actor: &'a str,
+        lease: Option<LeaseId>,
+    }
+
+    impl<'a> AdapterContext<'a> {
+        pub fn new(policy: &'a mut PolicyEngine, actor: &'a str) -> Self {
+            Self {
+                policy,
+                actor,
+                lease: None,
+            }
+        }
+
+        fn authorize<T>(
+            &mut self,
+            operation: Operation<'_>,
+            action: impl FnOnce() -> T,
+        ) -> Result<T, AdapterError> {
+            self.policy
+                .execute(self.actor, operation, self.lease, action)
+                .map_err(Into::into)
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct AdapterDevice {
+        pub id: String,
+        pub state: DeviceState,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum DeviceState {
+        Attached,
+        Detached,
+    }
+
+    mod sealed {
+        pub trait Sealed {}
+    }
+
+    pub trait DeviceAdapter: sealed::Sealed {
+        fn discover(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+        ) -> Result<Vec<AdapterDevice>, AdapterError>;
+        fn lease(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            lifetime: Duration,
+        ) -> Result<(), AdapterError>;
+        fn install(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            artifact: &[u8],
+        ) -> Result<(), AdapterError>;
+        fn launch(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            application: &str,
+        ) -> Result<(), AdapterError>;
+        fn stop(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<(), AdapterError>;
+        fn logs(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<Vec<u8>, AdapterError>;
+        fn artifact(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<Vec<u8>, AdapterError>;
+        fn attach_debugger(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<(), AdapterError>;
+    }
+
+    pub trait DeviceAdapterBackend {
+        fn discover(&mut self) -> Vec<AdapterDevice>;
+        fn install(&mut self, device_id: &str, artifact: &[u8]);
+        fn launch(&mut self, device_id: &str, application: &str) -> Result<(), AdapterError>;
+        fn stop(&mut self, device_id: &str);
+        fn logs(&mut self, device_id: &str) -> Vec<u8>;
+        fn artifact(&mut self, device_id: &str) -> Vec<u8>;
+        fn attach_debugger(&mut self, device_id: &str) -> Result<(), AdapterError>;
+    }
+
+    pub struct AuthorizedAdapter<B> {
+        backend: B,
+    }
+
+    impl<B> AuthorizedAdapter<B> {
+        pub fn from_backend(backend: B) -> Self {
+            Self { backend }
+        }
+    }
+
+    pub struct FakeBackend {
+        state: DeviceState,
+        installed: Vec<u8>,
+        logs: Vec<u8>,
+        running: bool,
+    }
+
+    pub type FakeDeviceAdapter = AuthorizedAdapter<FakeBackend>;
+
+    impl<B> sealed::Sealed for AuthorizedAdapter<B> {}
+
+    impl AuthorizedAdapter<FakeBackend> {
+        pub fn new() -> Self {
+            Self {
+                backend: FakeBackend {
+                    state: DeviceState::Attached,
+                    installed: Vec::new(),
+                    logs: Vec::new(),
+                    running: false,
+                },
+            }
+        }
+
+        pub fn set_state(&mut self, state: DeviceState) {
+            self.backend.state = state;
+        }
+    }
+
+    impl Default for AuthorizedAdapter<FakeBackend> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl<B: DeviceAdapterBackend> DeviceAdapter for AuthorizedAdapter<B> {
+        fn discover(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+        ) -> Result<Vec<AdapterDevice>, AdapterError> {
+            context.authorize(Operation::DiscoverDevices, || self.backend.discover())
+        }
+
+        fn lease(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            lifetime: Duration,
+        ) -> Result<(), AdapterError> {
+            context.authorize(Operation::LeaseDevice, || ())?;
+            context.lease = Some(context.policy.acquire_lease(
+                device_id,
+                context.actor,
+                lifetime,
+            )?);
+            Ok(())
+        }
+
+        fn install(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            artifact: &[u8],
+        ) -> Result<(), AdapterError> {
+            context.authorize(Operation::InstallDevice { device_id }, || ())?;
+            self.backend.install(device_id, artifact);
+            Ok(())
+        }
+
+        fn launch(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            application: &str,
+        ) -> Result<(), AdapterError> {
+            context.authorize(Operation::StartProcess { device_id }, || ())?;
+            self.backend.launch(device_id, application)
+        }
+
+        fn stop(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<(), AdapterError> {
+            context.authorize(Operation::StopProcess { device_id }, || ())?;
+            self.backend.stop(device_id);
+            Ok(())
+        }
+
+        fn logs(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<Vec<u8>, AdapterError> {
+            context.authorize(Operation::ReadDeviceLogs { device_id }, || {
+                self.backend.logs(device_id)
+            })
+        }
+
+        fn artifact(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<Vec<u8>, AdapterError> {
+            context.authorize(Operation::ReadArtifact { device_id }, || {
+                self.backend.artifact(device_id)
+            })
+        }
+
+        fn attach_debugger(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<(), AdapterError> {
+            context.authorize(Operation::AttachDebugger { device_id }, || ())?;
+            self.backend.attach_debugger(device_id)
+        }
+    }
+
+    impl DeviceAdapterBackend for FakeBackend {
+        fn discover(&mut self) -> Vec<AdapterDevice> {
+            vec![AdapterDevice {
+                id: "fake-1".to_owned(),
+                state: self.state,
+            }]
+        }
+
+        fn install(&mut self, _device_id: &str, artifact: &[u8]) {
+            self.installed = artifact.to_vec();
+        }
+
+        fn launch(&mut self, _device_id: &str, application: &str) -> Result<(), AdapterError> {
+            if self.state == DeviceState::Detached {
+                return Err(AdapterError::WaitingForDevice);
+            }
+            self.running = true;
+            self.logs = format!("{application} launched").into_bytes();
+            Ok(())
+        }
+
+        fn stop(&mut self, _device_id: &str) {
+            self.running = false;
+        }
+
+        fn logs(&mut self, _device_id: &str) -> Vec<u8> {
+            self.logs.clone()
+        }
+
+        fn artifact(&mut self, _device_id: &str) -> Vec<u8> {
+            self.installed.clone()
+        }
+
+        fn attach_debugger(&mut self, _device_id: &str) -> Result<(), AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
         }
     }
 }

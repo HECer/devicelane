@@ -58,7 +58,7 @@
       während launch liefert waiting_for_device
     - Dieselbe Contract-Suite kann später unverändert gegen Apple- und
       Android-Adapter ausgeführt werden
-  passes: false
+  passes: true
   needs:
     - STORY-15
   area: adapters
