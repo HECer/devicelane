@@ -42,7 +42,7 @@
       Veröffentlichung
     - Pfadtraversal, abgelaufene Artefakte und Zugriffe ohne passende Session
       werden abgelehnt
-  passes: false
+  passes: true
   needs:
     - STORY-14
   area: artifacts

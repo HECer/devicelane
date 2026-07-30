@@ -1069,6 +1069,216 @@ pub mod workspace {
     }
 }
 
+pub mod artifacts {
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Component, Path, PathBuf};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ArtifactMetadata {
+        pub sha256: String,
+        pub size: u64,
+        pub mime_type: String,
+        pub job_id: String,
+        pub expires_at: u64,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ArtifactRegistration {
+        id: String,
+        metadata: ArtifactMetadata,
+    }
+
+    impl ArtifactRegistration {
+        pub fn id(&self) -> String {
+            self.id.clone()
+        }
+
+        pub fn metadata(&self) -> &ArtifactMetadata {
+            &self.metadata
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ArtifactError {
+        PathTraversal,
+        Expired,
+        SessionDenied,
+        ChunkHashMismatch,
+        ChunkConflict,
+        NotPublished,
+        InvalidMetadata,
+        Io,
+    }
+
+    struct Entry {
+        metadata: ArtifactMetadata,
+        chunk_hashes: Vec<String>,
+        chunks: Vec<Option<Vec<u8>>>,
+        published: bool,
+    }
+
+    pub struct ArtifactStore {
+        root: PathBuf,
+        entries: HashMap<(String, String), Entry>,
+    }
+
+    impl ArtifactStore {
+        pub fn new(root: impl AsRef<Path>) -> Result<Self, ArtifactError> {
+            fs::create_dir_all(root.as_ref()).map_err(|_| ArtifactError::Io)?;
+            Ok(Self {
+                root: root.as_ref().to_owned(),
+                entries: HashMap::new(),
+            })
+        }
+
+        pub fn register(
+            &mut self,
+            session: &str,
+            metadata: ArtifactMetadata,
+            chunk_hashes: Vec<String>,
+            now: u64,
+        ) -> Result<ArtifactRegistration, ArtifactError> {
+            validate_name(session)?;
+            if metadata.expires_at <= now {
+                return Err(ArtifactError::Expired);
+            }
+            if metadata.sha256.len() != 64 || chunk_hashes.is_empty() {
+                return Err(ArtifactError::InvalidMetadata);
+            }
+            let id = metadata.sha256.clone();
+            let entry = Entry {
+                metadata: metadata.clone(),
+                chunks: vec![None; chunk_hashes.len()],
+                chunk_hashes,
+                published: false,
+            };
+            self.entries.insert((session.to_owned(), id.clone()), entry);
+            Ok(ArtifactRegistration { id, metadata })
+        }
+
+        pub fn missing_chunks(
+            &self,
+            session: &str,
+            id: &str,
+            now: u64,
+        ) -> Result<Vec<usize>, ArtifactError> {
+            let entry = self.entry(session, id, now)?;
+            Ok(entry
+                .chunks
+                .iter()
+                .enumerate()
+                .filter_map(|(index, chunk)| chunk.is_none().then_some(index))
+                .collect())
+        }
+
+        pub fn write_chunk(
+            &mut self,
+            session: &str,
+            id: &str,
+            index: usize,
+            contents: &[u8],
+            now: u64,
+        ) -> Result<(), ArtifactError> {
+            let key = self.key(session, id)?;
+            let entry = self.entries.get_mut(&key).unwrap();
+            if entry.metadata.expires_at <= now {
+                return Err(ArtifactError::Expired);
+            }
+            let slot = entry
+                .chunks
+                .get_mut(index)
+                .ok_or(ArtifactError::ChunkHashMismatch)?;
+            if let Some(existing) = slot {
+                return if existing == contents {
+                    Ok(())
+                } else {
+                    Err(ArtifactError::ChunkConflict)
+                };
+            }
+            if format!("{:x}", Sha256::digest(contents)) != entry.chunk_hashes[index] {
+                return Err(ArtifactError::ChunkHashMismatch);
+            }
+            let completes_upload = entry
+                .chunks
+                .iter()
+                .enumerate()
+                .all(|(chunk_index, chunk)| chunk_index == index || chunk.is_some());
+            if completes_upload {
+                let complete = entry
+                    .chunks
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(chunk_index, chunk)| {
+                        if chunk_index == index {
+                            contents.iter().copied()
+                        } else {
+                            chunk.as_ref().unwrap().iter().copied()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if complete.len() as u64 != entry.metadata.size
+                    || format!("{:x}", Sha256::digest(&complete)) != entry.metadata.sha256
+                {
+                    return Err(ArtifactError::ChunkHashMismatch);
+                }
+                let published = self.root.join(&entry.metadata.sha256);
+                let temporary = self.root.join(format!("{}.tmp", entry.metadata.sha256));
+                fs::write(&temporary, complete).map_err(|_| ArtifactError::Io)?;
+                fs::rename(temporary, published).map_err(|_| ArtifactError::Io)?;
+                *entry.chunks.get_mut(index).unwrap() = Some(contents.to_vec());
+                entry.published = true;
+            } else {
+                *entry.chunks.get_mut(index).unwrap() = Some(contents.to_vec());
+            }
+            Ok(())
+        }
+
+        pub fn read(&self, session: &str, id: &str, now: u64) -> Result<Vec<u8>, ArtifactError> {
+            let entry = self.entry(session, id, now)?;
+            if !entry.published {
+                return Err(ArtifactError::NotPublished);
+            }
+            fs::read(self.root.join(&entry.metadata.sha256)).map_err(|_| ArtifactError::Io)
+        }
+
+        fn entry(&self, session: &str, id: &str, now: u64) -> Result<&Entry, ArtifactError> {
+            let key = self.key(session, id)?;
+            let entry = self.entries.get(&key).unwrap();
+            if entry.metadata.expires_at <= now {
+                Err(ArtifactError::Expired)
+            } else {
+                Ok(entry)
+            }
+        }
+
+        fn key(&self, session: &str, id: &str) -> Result<(String, String), ArtifactError> {
+            validate_name(session)?;
+            let key = (session.to_owned(), id.to_owned());
+            if self.entries.contains_key(&key) {
+                Ok(key)
+            } else {
+                Err(ArtifactError::SessionDenied)
+            }
+        }
+    }
+
+    fn validate_name(name: &str) -> Result<(), ArtifactError> {
+        let path = Path::new(name);
+        if name.is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            Err(ArtifactError::PathTraversal)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 pub mod sessions {
     use crate::protocol::Event;
     use std::collections::HashMap;
