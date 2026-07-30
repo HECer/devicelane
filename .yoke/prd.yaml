@@ -90,7 +90,7 @@
       Rohprotokollkenntnis
     - Der Agent baut ausschließlich ausgehende Verbindungen auf und ein
       Offline-Agent bleibt mit letztem Snapshot sichtbar
-  passes: false
+  passes: true
   needs:
     - STORY-17
   area: networking

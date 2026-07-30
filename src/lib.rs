@@ -2143,6 +2143,40 @@ pub mod sessions {
     }
 }
 
+pub mod network_processes {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    pub struct DeviceSnapshot {
+        pub id: String,
+        pub platform: String,
+        pub state: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    pub struct HostSnapshot {
+        pub id: String,
+        pub operating_system: String,
+        pub architecture: String,
+        pub status: String,
+        pub capabilities: Vec<String>,
+        pub devices: Vec<DeviceSnapshot>,
+    }
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(tag = "request", rename_all = "snake_case")]
+    pub enum Request {
+        Heartbeat { host: HostSnapshot },
+        List,
+    }
+
+    #[derive(Deserialize, Serialize)]
+    pub struct Response {
+        pub accepted: bool,
+        pub hosts: Vec<HostSnapshot>,
+    }
+}
+
 pub mod preflight {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum PreflightError {
