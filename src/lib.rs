@@ -2199,10 +2199,22 @@ pub mod network_processes {
     #[derive(Deserialize, Serialize)]
     #[serde(tag = "request", rename_all = "snake_case")]
     pub enum Request {
-        Heartbeat { host: HostSnapshot },
+        Heartbeat {
+            host: HostSnapshot,
+        },
+        Complete {
+            job_id: String,
+            artifact: String,
+            events: Vec<NetworkEvent>,
+        },
         List,
-        Run { operation: RunRequest },
-        Events { job_id: String, after: u64 },
+        Run {
+            operation: RunRequest,
+        },
+        Events {
+            job_id: String,
+            after: u64,
+        },
     }
 
     #[derive(Deserialize, Serialize)]
@@ -2219,6 +2231,8 @@ pub mod network_processes {
         pub artifact: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub operation: Option<RunRequest>,
     }
 }
 

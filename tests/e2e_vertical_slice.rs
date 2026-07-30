@@ -84,7 +84,11 @@ fn real_vertical_slice_resumes_without_reexecution_and_survives_registry_restart
     assert_eq!(audit[0]["result"], "succeeded");
 }
 
-fn pair_process(binary: &str, registry_identity: &std::path::Path, peer_identity: &std::path::Path) {
+fn pair_process(
+    binary: &str,
+    registry_identity: &std::path::Path,
+    peer_identity: &std::path::Path,
+) {
     let pairing_address = free_address();
     let mut pairing_server = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_mesh-registry"))
@@ -154,11 +158,7 @@ fn registry(address: &str, identity: &std::path::Path) -> ChildGuard {
     )
 }
 
-fn agent(
-    address: &str,
-    identity: &std::path::Path,
-    workspaces: &std::path::Path,
-) -> ChildGuard {
+fn agent(address: &str, identity: &std::path::Path, workspaces: &std::path::Path) -> ChildGuard {
     ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_mesh-agent"))
             .args([

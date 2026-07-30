@@ -4,12 +4,11 @@ use device_development_mesh::network_processes::{
 use device_development_mesh::secure_transport::SecureTransport;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -28,6 +27,9 @@ struct DurableState {
     jobs: HashMap<String, Vec<NetworkEvent>>,
     artifacts: HashMap<String, String>,
     audit: Vec<AuditRecord>,
+    pending: HashMap<String, RunRequest>,
+    #[serde(skip)]
+    dispatched: HashSet<String>,
     #[serde(skip)]
     recovery_error: Option<String>,
 }
@@ -95,6 +97,7 @@ fn handle(
     let response = match request {
         Request::Heartbeat { mut host } => {
             host.status = "online".into();
+            let host_id = host.id.clone();
             entries.lock().unwrap().insert(
                 host.id.clone(),
                 Entry {
@@ -102,6 +105,44 @@ fn handle(
                     heartbeat: Instant::now(),
                 },
             );
+            let mut response = response();
+            let mut state = state.lock().unwrap();
+            if let Some((job_id, operation)) = state
+                .pending
+                .iter()
+                .find(|(job_id, operation)| {
+                    operation.host_id == host_id && !state.dispatched.contains(*job_id)
+                })
+                .map(|(job_id, operation)| (job_id.clone(), operation.clone()))
+            {
+                state.dispatched.insert(job_id.clone());
+                response.operation = Some(operation);
+                response.job_id = Some(job_id);
+            }
+            response
+        }
+        Request::Complete {
+            job_id,
+            artifact,
+            events,
+        } => {
+            let mut state = state.lock().unwrap();
+            if let Some(operation) = state.pending.remove(&job_id) {
+                let succeeded = events
+                    .last()
+                    .is_some_and(|event| event.kind == "exit" && event.payload == "0");
+                state.jobs.insert(job_id.clone(), events);
+                state.artifacts.insert(job_id.clone(), artifact);
+                state.audit.push(AuditRecord {
+                    principal_id: operation.principal_id,
+                    host_id: operation.host_id,
+                    device_id: operation.device_id,
+                    workspace_id: operation.workspace_id,
+                    job_id,
+                    result: if succeeded { "succeeded" } else { "failed" }.into(),
+                });
+                fs::write(state_path, serde_json::to_vec(&*state).unwrap()).unwrap();
+            }
             response()
         }
         Request::List => {
@@ -128,15 +169,14 @@ fn handle(
             }
         }
         Request::Run { operation } => {
-            let mut state = state.lock().unwrap();
-            if let Some(error) = &state.recovery_error {
+            if let Some(error) = &state.lock().unwrap().recovery_error {
                 Response {
                     accepted: false,
                     error: Some(error.clone()),
                     ..response()
                 }
             } else {
-                run(operation, &mut state, state_path)
+                run(operation, &state, state_path)
             }
         }
         Request::Events { job_id, after } => {
@@ -176,9 +216,10 @@ fn handle(
     let _ = stream.write_all(b"\n");
 }
 
-fn run(operation: RunRequest, state: &mut DurableState, state_path: &Path) -> Response {
+fn run(operation: RunRequest, shared: &Mutex<DurableState>, state_path: &Path) -> Response {
+    let mut state = shared.lock().unwrap();
     if let Some(job_id) = state.requests.get(&operation.request_id).cloned() {
-        return job_response(state, job_id);
+        return job_response(&state, job_id);
     }
     if !valid_id(&operation.host_id) || !valid_id(&operation.workspace_id) {
         return Response {
@@ -196,62 +237,30 @@ fn run(operation: RunRequest, state: &mut DurableState, state_path: &Path) -> Re
                     .all(|part| matches!(part, Component::Normal(_)))
         );
     }
-    let agent = std::env::current_exe()
-        .unwrap()
-        .with_file_name(if cfg!(windows) {
-            "mesh-agent.exe"
-        } else {
-            "mesh-agent"
-        });
-    let mut child = Command::new(agent)
-        .arg("execute")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&serde_json::to_vec(&operation.manifest).unwrap())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    let artifact = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let events = vec![
-        NetworkEvent {
-            sequence: 1,
-            kind: "started".into(),
-            payload: String::new(),
-        },
-        NetworkEvent {
-            sequence: 2,
-            kind: "stdout".into(),
-            payload: String::from_utf8_lossy(&output.stdout).into_owned(),
-        },
-        NetworkEvent {
-            sequence: 3,
-            kind: "exit".into(),
-            payload: output.status.code().unwrap_or(-1).to_string(),
-        },
-    ];
-    state.requests.insert(operation.request_id, job_id.clone());
-    state.jobs.insert(job_id.clone(), events);
-    state.artifacts.insert(job_id.clone(), artifact);
-    state.audit.push(AuditRecord {
-        principal_id: operation.principal_id,
-        host_id: operation.host_id,
-        device_id: operation.device_id,
-        workspace_id: operation.workspace_id,
-        job_id: job_id.clone(),
-        result: if output.status.success() {
-            "succeeded"
-        } else {
-            "failed"
+    state
+        .requests
+        .insert(operation.request_id.clone(), job_id.clone());
+    state.pending.insert(job_id.clone(), operation);
+    fs::write(state_path, serde_json::to_vec(&*state).unwrap()).unwrap();
+    drop(state);
+    for _ in 0..200 {
+        if let Some(response) = {
+            let state = shared.lock().unwrap();
+            state
+                .jobs
+                .contains_key(&job_id)
+                .then(|| job_response(&state, job_id.clone()))
+        } {
+            return response;
         }
-        .into(),
-    });
-    fs::write(state_path, serde_json::to_vec(state).unwrap()).unwrap();
-    job_response(state, job_id)
+        thread::sleep(Duration::from_millis(10));
+    }
+    Response {
+        accepted: false,
+        job_id: Some(job_id),
+        error: Some("agent_timeout".into()),
+        ..response()
+    }
 }
 
 fn job_response(state: &DurableState, job_id: String) -> Response {
@@ -279,6 +288,7 @@ fn response() -> Response {
         audit: vec![],
         artifact: None,
         error: None,
+        operation: None,
     }
 }
 fn write_response(stream: &mut impl Write, response: Response) {
