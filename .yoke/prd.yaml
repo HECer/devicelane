@@ -67,7 +67,7 @@
     - Signing wird ausschließlich über lokal vorhandene Identitäts- oder
       Profilreferenzen gewählt; Schlüsselmaterial und geschützte Buildvariablen
       erscheinen weder in Events noch Auditdaten
-  passes: false
+  passes: true
   needs:
     - STORY-23
   area: apple-build

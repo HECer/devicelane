@@ -2926,6 +2926,353 @@ pub mod apple_project_discovery {
     }
 }
 
+pub mod apple_build {
+    use crate::apple_project_discovery::ContainerKind;
+    use crate::artifacts::{ArtifactError, ArtifactMetadata, ArtifactStore};
+    use crate::process_execution::{
+        CancellationToken, EventKind, ProcessError, ProcessEvent, ProcessExecutor, ProcessRequest,
+        ProcessStream, TerminalStatus,
+    };
+    use sha2::{Digest, Sha256};
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::path::{Component, Path, PathBuf};
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum BuildAction {
+        Build,
+        Test,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    pub enum SigningReference {
+        Identity(String),
+        ProvisioningProfile(String),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct BuildPlan {
+        pub action: BuildAction,
+        pub container_kind: ContainerKind,
+        pub container: String,
+        pub scheme: String,
+        pub configuration: String,
+        pub destination: String,
+        pub derived_data: String,
+        pub result_bundle: String,
+        pub signing: Option<SigningReference>,
+        pub protected_build_settings: HashMap<String, String>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AppleBuildError {
+        InvalidPlan,
+        Process(ProcessError),
+        Artifact(ArtifactError),
+        Io,
+    }
+
+    impl BuildPlan {
+        pub fn arguments(&self) -> Result<Vec<String>, AppleBuildError> {
+            for path in [&self.container, &self.derived_data, &self.result_bundle] {
+                validate_relative(path)?;
+            }
+            let (container_flag, action) = match (self.container_kind, self.action) {
+                (ContainerKind::Project, BuildAction::Build) => ("-project", "build"),
+                (ContainerKind::Project, BuildAction::Test) => ("-project", "test"),
+                (ContainerKind::Workspace, BuildAction::Build) => ("-workspace", "build"),
+                (ContainerKind::Workspace, BuildAction::Test) => ("-workspace", "test"),
+            };
+            let mut args = vec![
+                action.into(),
+                container_flag.into(),
+                self.container.clone(),
+                "-scheme".into(),
+                self.scheme.clone(),
+                "-configuration".into(),
+                self.configuration.clone(),
+                "-destination".into(),
+                self.destination.clone(),
+                "-derivedDataPath".into(),
+                self.derived_data.clone(),
+                "-resultBundlePath".into(),
+                self.result_bundle.clone(),
+            ];
+            if let Some(signing) = &self.signing {
+                match signing {
+                    SigningReference::Identity(value) if !value.is_empty() => {
+                        args.push(format!("CODE_SIGN_IDENTITY={value}"))
+                    }
+                    SigningReference::ProvisioningProfile(value) if !value.is_empty() => {
+                        args.push(format!("PROVISIONING_PROFILE_SPECIFIER={value}"))
+                    }
+                    _ => return Err(AppleBuildError::InvalidPlan),
+                }
+            }
+            Ok(args)
+        }
+    }
+
+    pub struct AppleBuildJob {
+        workspace: PathBuf,
+        program: PathBuf,
+        environment: Vec<&'static str>,
+        prefix: Vec<String>,
+        local_signing_references: HashSet<SigningReference>,
+    }
+
+    pub struct AppleBuildStream {
+        inner: ProcessStream,
+        redact_output: bool,
+        journal: Vec<ProcessEvent>,
+    }
+
+    impl AppleBuildStream {
+        pub fn resume(&self, last_seen: u64) -> Vec<ProcessEvent> {
+            self.journal
+                .iter()
+                .filter(|event| event.sequence > last_seen)
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl Iterator for AppleBuildStream {
+        type Item = ProcessEvent;
+        fn next(&mut self) -> Option<Self::Item> {
+            let mut event = self.inner.next()?;
+            if self.redact_output && matches!(event.kind, EventKind::Stdout | EventKind::Stderr) {
+                event.payload = b"[REDACTED OUTPUT]".to_vec();
+            }
+            self.journal.push(event.clone());
+            Some(event)
+        }
+    }
+
+    impl AppleBuildJob {
+        pub fn new(
+            workspace: impl AsRef<Path>,
+            program: PathBuf,
+            environment: impl IntoIterator<Item = &'static str>,
+        ) -> Result<Self, ProcessError> {
+            Self::with_prefix(
+                workspace,
+                program,
+                environment,
+                std::iter::empty::<String>(),
+            )
+        }
+
+        pub fn with_prefix(
+            workspace: impl AsRef<Path>,
+            program: PathBuf,
+            environment: impl IntoIterator<Item = &'static str>,
+            prefix: impl IntoIterator<Item = impl Into<String>>,
+        ) -> Result<Self, ProcessError> {
+            let workspace = fs::canonicalize(workspace).map_err(|_| ProcessError::Io)?;
+            let program = fs::canonicalize(program).map_err(|_| ProcessError::ProgramDenied)?;
+            Ok(Self {
+                workspace,
+                program,
+                environment: environment.into_iter().collect(),
+                prefix: prefix.into_iter().map(Into::into).collect(),
+                local_signing_references: HashSet::new(),
+            })
+        }
+
+        pub fn with_local_signing_references(
+            mut self,
+            references: impl IntoIterator<Item = SigningReference>,
+        ) -> Self {
+            self.local_signing_references = references.into_iter().collect();
+            self
+        }
+
+        pub fn start(
+            &self,
+            plan: &BuildPlan,
+            timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> Result<AppleBuildStream, AppleBuildError> {
+            if plan
+                .signing
+                .as_ref()
+                .is_some_and(|reference| !self.local_signing_references.contains(reference))
+            {
+                return Err(AppleBuildError::InvalidPlan);
+            }
+            let mut args = self.prefix.clone();
+            args.extend(plan.arguments()?);
+            let executor = ProcessExecutor::new(
+                &self.workspace,
+                [self.program.clone()],
+                self.environment.iter().copied(),
+            )
+            .map_err(AppleBuildError::Process)?;
+            let inner = executor
+                .start(
+                    ProcessRequest {
+                        program: self.program.clone(),
+                        args,
+                        working_directory: "lease/job".into(),
+                        environment: plan.protected_build_settings.clone(),
+                    },
+                    timeout,
+                    cancellation,
+                )
+                .map_err(AppleBuildError::Process)?;
+            Ok(AppleBuildStream {
+                inner,
+                redact_output: !plan.protected_build_settings.is_empty(),
+                journal: Vec::new(),
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn execute(
+            &self,
+            job_id: &str,
+            session: &str,
+            plan: BuildPlan,
+            store: &mut ArtifactStore,
+            now: u64,
+            expires_at: u64,
+            timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> Result<AppleBuildResult, AppleBuildError> {
+            let events = self
+                .start(&plan, timeout, cancellation)?
+                .collect::<Vec<_>>();
+            let mut artifacts = Vec::new();
+            if matches!(
+                events.last().map(|event| &event.kind),
+                Some(EventKind::Terminal(TerminalStatus::Exited(0)))
+            ) {
+                let job_root = self.workspace.join("lease/job");
+                for path in output_paths(&job_root).map_err(|_| AppleBuildError::Io)? {
+                    let contents = pack(&path).map_err(|_| AppleBuildError::Io)?;
+                    let sha256 = format!("{:x}", Sha256::digest(&contents));
+                    let registration = store
+                        .register(
+                            session,
+                            ArtifactMetadata {
+                                sha256: sha256.clone(),
+                                size: contents.len() as u64,
+                                mime_type: "application/octet-stream".into(),
+                                job_id: job_id.into(),
+                                expires_at,
+                            },
+                            vec![sha256.clone()],
+                            now,
+                        )
+                        .map_err(AppleBuildError::Artifact)?;
+                    store
+                        .write_chunk(session, &registration.id(), 0, &contents, now)
+                        .map_err(AppleBuildError::Artifact)?;
+                    artifacts.push(AppleBuildArtifact { sha256 });
+                }
+            }
+            Ok(AppleBuildResult {
+                events,
+                artifacts,
+                audit: format!("xcodebuild {:?} {}", plan.action, plan.scheme),
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct AppleBuildArtifact {
+        pub sha256: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct AppleBuildResult {
+        pub events: Vec<ProcessEvent>,
+        pub artifacts: Vec<AppleBuildArtifact>,
+        pub audit: String,
+    }
+
+    impl AppleBuildResult {
+        pub fn resume(&self, last_seen: u64) -> Vec<ProcessEvent> {
+            self.events
+                .iter()
+                .filter(|event| event.sequence > last_seen)
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn validate_relative(value: &str) -> Result<(), AppleBuildError> {
+        let path = Path::new(value);
+        if value.is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            Err(AppleBuildError::InvalidPlan)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn output_paths(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+        fn visit(path: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
+            for entry in fs::read_dir(path)? {
+                let path = entry?.path();
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir()
+                    && matches!(
+                        path.extension().and_then(|v| v.to_str()),
+                        Some("app" | "dSYM" | "xcresult")
+                    )
+                {
+                    found.push(path);
+                } else if metadata.is_dir() {
+                    visit(&path, found)?;
+                }
+            }
+            Ok(())
+        }
+        let mut found = Vec::new();
+        visit(root, &mut found)?;
+        found.sort();
+        Ok(found)
+    }
+
+    fn pack(root: &Path) -> std::io::Result<Vec<u8>> {
+        fn visit(root: &Path, path: &Path, out: &mut Vec<u8>) -> std::io::Result<()> {
+            let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+            entries.sort_by_key(|entry| entry.path());
+            for entry in entries {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    visit(root, &path, out)?;
+                } else {
+                    let relative = path.strip_prefix(root).unwrap().to_string_lossy();
+                    let bytes = fs::read(&path)?;
+                    out.extend_from_slice(relative.as_bytes());
+                    out.push(0);
+                    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                    out.extend_from_slice(&bytes);
+                }
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        visit(root, root, &mut out)?;
+        Ok(out)
+    }
+}
+
 pub mod apple_discovery {
     use crate::preflight::{AppleTool, AppleToolRunner};
     use crate::process_execution::{CancellationToken, EventKind, ProcessEvent, TerminalStatus};
