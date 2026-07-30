@@ -4,10 +4,11 @@ use device_development_mesh::process_execution::{
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn workspace(name: &str) -> PathBuf {
     let path = env::temp_dir().join(format!("mesh-process-{name}-{}", std::process::id()));
@@ -84,6 +85,46 @@ fn allowed_helper_runs_in_workspace_with_clean_environment_and_sequenced_events(
             .filter(|event| matches!(event.kind, EventKind::Terminal(_)))
             .count(),
         1
+    );
+}
+
+#[test]
+fn stdout_is_available_before_the_process_exits() {
+    let root = workspace("streaming");
+    fs::create_dir(root.join("job")).unwrap();
+    let request = request(&[
+        "--ignored",
+        "--exact",
+        "process_helper_streams_before_exit",
+        "--nocapture",
+    ]);
+
+    let started_at = Instant::now();
+    let mut stream = executor(&root)
+        .start(request, Duration::from_secs(5), CancellationToken::new())
+        .unwrap();
+    let mut saw_first_output = false;
+    while started_at.elapsed() < Duration::from_millis(500) {
+        let event = stream
+            .next_timeout(Duration::from_millis(100))
+            .expect("event before helper exits");
+        if event.kind == EventKind::Stdout
+            && String::from_utf8_lossy(&event.payload).contains("first")
+        {
+            saw_first_output = true;
+            break;
+        }
+    }
+    assert!(saw_first_output, "stdout was buffered until process exit");
+
+    let remaining = stream.collect::<Vec<_>>();
+    assert!(remaining.iter().any(|event| {
+        event.kind == EventKind::Stdout
+            && String::from_utf8_lossy(&event.payload).contains("second")
+    }));
+    assert_eq!(
+        remaining.last().unwrap().kind,
+        EventKind::Terminal(TerminalStatus::Exited(0))
     );
 }
 
@@ -225,6 +266,15 @@ fn process_helper_reports_context() {
     );
     println!("cwd={}", env::current_dir().unwrap().display());
     eprintln!("helper-stderr");
+}
+
+#[test]
+#[ignore]
+fn process_helper_streams_before_exit() {
+    println!("first");
+    std::io::stdout().flush().unwrap();
+    thread::sleep(Duration::from_millis(800));
+    println!("second");
 }
 
 #[test]
