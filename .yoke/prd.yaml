@@ -160,7 +160,7 @@
     - Deinstallation entfernt nur die explizit installierte LaunchAgent-Datei
       und Programmdateien; Identität und Auditdaten bleiben standardmäßig
       erhalten
-  passes: false
+  passes: true
   needs:
     - STORY-28
   area: mac-bootstrap
