@@ -269,7 +269,7 @@
       AppleCancel oder AppleProgress noch Agent-Heartbeats vortäuschen können
       und dass ein langsamer Writer bei Lease-Ablauf nie mit dem promovierten
       Writer desselben Geräts überlappt
-  passes: false
+  passes: true
   needs:
     - STORY-33
   area: distributed-device-leases

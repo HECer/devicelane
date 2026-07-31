@@ -10,13 +10,14 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Write},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
 };
 const NAME: &str = "mesh-agent";
+const REGISTRY_RPC_TIMEOUT: Duration = Duration::from_millis(250);
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if metadata(&args) {
@@ -80,6 +81,7 @@ fn main() {
         .filter_map(|binding| parse_device_binding(&binding))
         .collect();
     let running = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
+    let device_writers = Arc::new((Mutex::new(HashSet::<String>::new()), Condvar::new()));
     let mut host = HostSnapshot {
         id: value(&args, "--id"),
         operating_system: value(&args, "--os"),
@@ -160,6 +162,7 @@ fn main() {
                             host.capabilities.clone(),
                             host.devices.clone(),
                             Arc::clone(&running),
+                            Arc::clone(&device_writers),
                             response.lease_grant,
                         );
                     }
@@ -267,6 +270,7 @@ fn start_apple_job(
     capabilities: Vec<String>,
     devices: Vec<DeviceSnapshot>,
     running: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    device_writers: Arc<(Mutex<HashSet<String>>, Condvar)>,
     lease_grant: Option<device_development_mesh::network_processes::LeaseGrant>,
 ) {
     let cancellation = CancellationToken::new();
@@ -289,7 +293,7 @@ fn start_apple_job(
             .map(|device| device.id)
             .collect();
         let workspace = host_workspace.join(&operation.workspace_path);
-        let grant_valid = if operation.operation.mutates_device() {
+        let grant_authentic = if operation.operation.mutates_device() {
             lease_grant.as_ref().is_some_and(|grant| {
                 grant.job_id == job_id
                     && grant.device_id == operation.device_id.clone().unwrap_or_default()
@@ -301,22 +305,11 @@ fn start_apple_job(
                             &grant.signature,
                         )
                         .is_ok()
-                    && rpc(
-                        &registry,
-                        &transport,
-                        &Request::Lease {
-                            operation:
-                                device_development_mesh::network_processes::LeaseRequest::Validate {
-                                    grant: grant.clone(),
-                                },
-                        },
-                    )
-                    .is_some_and(|response| response.lease_status.as_deref() == Some("active"))
             })
         } else {
             true
         };
-        let valid = grant_valid
+        let valid = grant_authentic
             && AppleAgent::new(
                 &host_workspace,
                 capabilities.iter().cloned(),
@@ -422,34 +415,66 @@ fn start_apple_job(
         let mut events = Vec::new();
         let mut artifact_bytes = Vec::new();
         let mut succeeded = false;
-        if valid
-            && let Ok(runner) = AppleToolRunner::new(&host_workspace, configured_tools)
-            && let Ok(process_events) = runner.execute(
-                selected_tool,
-                arguments,
-                &operation.workspace_path,
-                HashMap::new(),
-                Duration::from_secs(60),
-                cancellation.clone(),
-            )
-        {
-            succeeded = process_events.last().is_some_and(|event| {
-                matches!(
-                    event.kind,
-                    EventKind::Terminal(
-                        device_development_mesh::process_execution::TerminalStatus::Exited(0)
-                    )
-                )
-            });
-            for event in process_events {
-                if event.kind == EventKind::Stdout {
-                    artifact_bytes.extend_from_slice(&event.payload);
-                    events.push(network_event(
-                        events.len() as u64 + 2,
-                        "stdout",
-                        &String::from_utf8_lossy(&event.payload),
-                    ));
+        if valid && let Ok(runner) = AppleToolRunner::new(&host_workspace, configured_tools) {
+            let writer_device = operation
+                .operation
+                .mutates_device()
+                .then(|| operation.device_id.clone().unwrap());
+            if let Some(device_id) = &writer_device {
+                let (writers, available) = &*device_writers;
+                let mut writers = writers.lock().unwrap();
+                while writers.contains(device_id) {
+                    writers = available.wait(writers).unwrap();
                 }
+                writers.insert(device_id.clone());
+            }
+            let lease_active = writer_device.is_none()
+                || lease_grant.as_ref().is_some_and(|grant| {
+                    rpc(
+                        &registry,
+                        &transport,
+                        &Request::Lease {
+                            operation:
+                                device_development_mesh::network_processes::LeaseRequest::Validate {
+                                    grant: grant.clone(),
+                                },
+                        },
+                    )
+                    .is_some_and(|response| response.lease_status.as_deref() == Some("active"))
+                });
+            if lease_active
+                && let Ok(process_events) = runner.execute(
+                    selected_tool,
+                    arguments,
+                    &operation.workspace_path,
+                    HashMap::new(),
+                    Duration::from_secs(60),
+                    cancellation.clone(),
+                )
+            {
+                succeeded = process_events.last().is_some_and(|event| {
+                    matches!(
+                        event.kind,
+                        EventKind::Terminal(
+                            device_development_mesh::process_execution::TerminalStatus::Exited(0)
+                        )
+                    )
+                });
+                for event in process_events {
+                    if event.kind == EventKind::Stdout {
+                        artifact_bytes.extend_from_slice(&event.payload);
+                        events.push(network_event(
+                            events.len() as u64 + 2,
+                            "stdout",
+                            &String::from_utf8_lossy(&event.payload),
+                        ));
+                    }
+                }
+            }
+            if let Some(device_id) = writer_device {
+                let (writers, available) = &*device_writers;
+                writers.lock().unwrap().remove(&device_id);
+                available.notify_all();
             }
         }
         let artifact_id = succeeded
@@ -514,13 +539,24 @@ fn publish_artifact(
 }
 
 fn rpc(registry: &str, transport: &SecureTransport, request: &Request) -> Option<Response> {
-    let stream = TcpStream::connect(registry).ok()?;
+    let stream = registry_stream(registry)?;
     let mut stream = transport.connect_tls(stream, "registry").ok()?;
     serde_json::to_writer(&mut stream, request).ok()?;
     stream.write_all(b"\n").ok()?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).ok()?;
     serde_json::from_str(&line).ok()
+}
+
+fn registry_stream(registry: &str) -> Option<TcpStream> {
+    for address in registry.to_socket_addrs().ok()? {
+        if let Ok(stream) = TcpStream::connect_timeout(&address, REGISTRY_RPC_TIMEOUT) {
+            stream.set_read_timeout(Some(REGISTRY_RPC_TIMEOUT)).ok()?;
+            stream.set_write_timeout(Some(REGISTRY_RPC_TIMEOUT)).ok()?;
+            return Some(stream);
+        }
+    }
+    None
 }
 
 fn network_event(
@@ -543,7 +579,7 @@ fn send_apple_progress(
     terminal: bool,
 ) -> bool {
     for _ in 0..20 {
-        if let Ok(stream) = TcpStream::connect(registry)
+        if let Some(stream) = registry_stream(registry)
             && let Ok(mut stream) = transport.connect_tls(stream, "registry")
             && serde_json::to_writer(
                 &mut stream,
@@ -659,5 +695,35 @@ fn metadata(a: &[String]) -> bool {
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_rpc_returns_when_the_tls_peer_stalls() {
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            SecureTransport::load_or_create(root.path().join("registry"), "registry").unwrap();
+        let mut agent =
+            SecureTransport::load_or_create(root.path().join("agent"), "agent").unwrap();
+        agent.trust("registry", registry.certificate_der()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let stalled_peer = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(900));
+        });
+
+        let started = Instant::now();
+        assert!(rpc(&address, &agent, &Request::List).is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "stalled registry held the device writer for {:?}",
+            started.elapsed()
+        );
+        stalled_peer.join().unwrap();
     }
 }

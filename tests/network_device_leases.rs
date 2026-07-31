@@ -230,6 +230,65 @@ fn authorized_agent_detach_promotes_the_waiting_client() {
 }
 
 #[test]
+fn agent_detach_recovers_a_writer_after_terminal_progress_is_lost() {
+    let mut harness = Harness::start(Duration::from_millis(800));
+    let owned = acquire(&harness, &harness.client_a, 30_000);
+    assert_eq!(
+        lease(
+            &harness.address,
+            &harness.client_b,
+            &LeaseRequest::Queue {
+                device_id: DEVICE.into(),
+                lifetime_ms: 30_000,
+            },
+        )["lease_status"],
+        "queued"
+    );
+    cli_json(
+        &harness.address,
+        &harness.client_a,
+        "apple-run",
+        &apple_request("lost-terminal", &grant_id(&owned)),
+    );
+    wait_until("mutating tool start", || {
+        mutation_lines(&harness.marker).contains(&"mutation-start".into())
+    });
+    harness._agent.kill().unwrap();
+    harness._agent.wait().unwrap();
+    wait_until("orphaned tool completion", || {
+        mutation_lines(&harness.marker).contains(&"mutation-end".into())
+    });
+
+    let detached_inventory = rpc(
+        &harness.address,
+        &harness.agent,
+        &Request::Heartbeat {
+            host: HostSnapshot {
+                id: "mac-1".into(),
+                operating_system: "macos".into(),
+                architecture: "aarch64".into(),
+                status: "online".into(),
+                capabilities: vec!["apple.simulator@1".into()],
+                devices: Vec::new(),
+            },
+        },
+    );
+    assert_eq!(detached_inventory["accepted"], true, "{detached_inventory}");
+    let detached = lease(
+        &harness.address,
+        &harness.agent,
+        &LeaseRequest::AgentDetach {
+            device_id: DEVICE.into(),
+        },
+    );
+    assert_eq!(detached["lease_status"], "detached", "{detached}");
+    assert_eq!(
+        current_grant(&harness, &harness.client_b)["lease_grant"]["client_id"],
+        "client-b"
+    );
+}
+
+#[test]
 fn heartbeat_from_another_agent_cannot_detach_the_lease_owners_device() {
     let harness = Harness::start(Duration::ZERO);
     let owned = acquire(&harness, &harness.client_a, 30_000);
@@ -269,6 +328,148 @@ fn heartbeat_from_another_agent_cannot_detach_the_lease_owners_device() {
 }
 
 #[test]
+fn detached_device_without_a_writer_can_migrate_to_another_agent() {
+    let mut harness = Harness::start(Duration::ZERO);
+    harness._agent.kill().unwrap();
+    harness._agent.wait().unwrap();
+    let detached = rpc(
+        &harness.address,
+        &harness.agent,
+        &Request::Heartbeat {
+            host: HostSnapshot {
+                id: "mac-1".into(),
+                operating_system: "macos".into(),
+                architecture: "aarch64".into(),
+                status: "online".into(),
+                capabilities: vec!["apple.simulator@1".into()],
+                devices: Vec::new(),
+            },
+        },
+    );
+    assert_eq!(detached["accepted"], true, "{detached}");
+
+    let migrated = rpc(
+        &harness.address,
+        &harness.agent_b,
+        &Request::Heartbeat {
+            host: HostSnapshot {
+                id: "mac-2".into(),
+                operating_system: "macos".into(),
+                architecture: "aarch64".into(),
+                status: "online".into(),
+                capabilities: vec!["apple.simulator@1".into()],
+                devices: vec![DeviceSnapshot {
+                    id: DEVICE.into(),
+                    platform: "ios".into(),
+                    state: "connected".into(),
+                }],
+            },
+        },
+    );
+    assert_eq!(
+        migrated["accepted"], true,
+        "detached device remained bound to the old agent: {migrated}"
+    );
+}
+
+#[test]
+fn reconnected_device_keeps_its_agent_owner_after_writer_terminal() {
+    let mut harness = Harness::start_with_heartbeat(Duration::from_millis(2_000), 4_000);
+    let owned = acquire(&harness, &harness.client_a, 30_000);
+    let job = cli_json(
+        &harness.address,
+        &harness.client_a,
+        "apple-run",
+        &apple_request("transient-detach", &grant_id(&owned)),
+    );
+    wait_until("mutating tool start", || {
+        mutation_lines(&harness.marker).contains(&"mutation-start".into())
+    });
+    for devices in [
+        Vec::new(),
+        vec![DeviceSnapshot {
+            id: DEVICE.into(),
+            platform: "ios".into(),
+            state: "connected".into(),
+        }],
+    ] {
+        assert_eq!(
+            rpc(
+                &harness.address,
+                &harness.agent,
+                &Request::Heartbeat {
+                    host: HostSnapshot {
+                        id: "mac-1".into(),
+                        operating_system: "macos".into(),
+                        architecture: "aarch64".into(),
+                        status: "online".into(),
+                        capabilities: vec!["apple.simulator@1".into()],
+                        devices,
+                    },
+                },
+            )["accepted"],
+            true
+        );
+    }
+    wait_for_terminal(
+        &harness.address,
+        &harness.client_a,
+        job["job_id"].as_str().unwrap(),
+    );
+    harness._agent.kill().unwrap();
+    harness._agent.wait().unwrap();
+
+    let takeover = rpc(
+        &harness.address,
+        &harness.agent_b,
+        &Request::Heartbeat {
+            host: HostSnapshot {
+                id: "mac-2".into(),
+                operating_system: "macos".into(),
+                architecture: "aarch64".into(),
+                status: "online".into(),
+                capabilities: vec!["apple.simulator@1".into()],
+                devices: vec![DeviceSnapshot {
+                    id: DEVICE.into(),
+                    platform: "ios".into(),
+                    state: "connected".into(),
+                }],
+            },
+        },
+    );
+    assert_eq!(
+        takeover["accepted"], false,
+        "reconnect lost the live device owner after terminal progress: {takeover}"
+    );
+}
+
+#[test]
+fn paired_client_cannot_publish_an_agent_heartbeat() {
+    let harness = Harness::start(Duration::ZERO);
+
+    let forged = rpc(
+        &harness.address,
+        &harness.client_b,
+        &Request::Heartbeat {
+            host: HostSnapshot {
+                id: "forged-mac".into(),
+                operating_system: "macos".into(),
+                architecture: "aarch64".into(),
+                status: "online".into(),
+                capabilities: vec!["apple.simulator@1".into()],
+                devices: vec![DeviceSnapshot {
+                    id: "forged-device".into(),
+                    platform: "ios".into(),
+                    state: "connected".into(),
+                }],
+            },
+        },
+    );
+
+    assert_eq!(forged["accepted"], false, "{forged}");
+}
+
+#[test]
 fn forged_workspace_lease_and_grant_cannot_run_a_mutation_but_observer_reads_events() {
     let harness = Harness::start(Duration::ZERO);
 
@@ -299,8 +500,8 @@ fn forged_workspace_lease_and_grant_cannot_run_a_mutation_but_observer_reads_eve
 
 #[test]
 fn expired_writer_finishes_before_the_promoted_writer_starts() {
-    let harness = Harness::start(Duration::from_millis(650));
-    let first = acquire(&harness, &harness.client_a, 120);
+    let harness = Harness::start(Duration::from_millis(1_200));
+    let first = acquire(&harness, &harness.client_a, 800);
     assert_eq!(
         lease(
             &harness.address,
@@ -330,7 +531,7 @@ fn expired_writer_finishes_before_the_promoted_writer_starts() {
             == 1
     });
 
-    thread::sleep(Duration::from_millis(160));
+    thread::sleep(Duration::from_millis(850));
     let promoted = current_grant(&harness, &harness.client_b);
     let second_job = cli_json(
         &harness.address,
@@ -416,6 +617,10 @@ struct Harness {
 
 impl Harness {
     fn start(mutation_delay: Duration) -> Self {
+        Self::start_with_heartbeat(mutation_delay, 50)
+    }
+
+    fn start_with_heartbeat(mutation_delay: Duration, heartbeat_ms: u64) -> Self {
         let root = tempfile::tempdir().unwrap();
         let address = free_address();
         let registry = root.path().join("registry");
@@ -482,7 +687,7 @@ impl Harness {
                 "--simctl",
                 simctl.to_str().unwrap(),
                 "--heartbeat-ms",
-                "50",
+                &heartbeat_ms.to_string(),
                 "--capability",
                 "apple.simulator@1",
                 "--device",
@@ -602,6 +807,10 @@ fn start_registry(address: &str, identity: &Path) -> ChildGuard {
             identity.to_str().unwrap(),
             "--offline-after-ms",
             "500",
+            "--agent-peer",
+            "agent",
+            "--agent-peer",
+            "agent-b",
         ],
     )
 }

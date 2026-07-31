@@ -41,6 +41,8 @@ struct DurableState {
     #[serde(skip)]
     host_peers: HashMap<String, String>,
     #[serde(skip)]
+    device_peers: HashMap<String, String>,
+    #[serde(skip)]
     dispatched: HashSet<String>,
     #[serde(skip)]
     cancelled: HashSet<String>,
@@ -75,11 +77,18 @@ struct WaitingLease {
     lifetime: Duration,
 }
 
+struct DeviceWriter {
+    job_id: String,
+}
+
 #[derive(Default)]
 struct LeaseBook {
     next_id: u64,
     active: HashMap<String, DeviceLease>,
     waiting: Vec<WaitingLease>,
+    writers: HashMap<String, DeviceWriter>,
+    pending_release: HashSet<String>,
+    pending_detach: HashSet<String>,
 }
 
 impl LeaseBook {
@@ -96,6 +105,28 @@ impl LeaseBook {
     }
 
     fn release_device(&mut self, device_id: &str) {
+        if self.writers.contains_key(device_id) {
+            self.pending_release.insert(device_id.into());
+            return;
+        }
+        self.release_device_now(device_id);
+    }
+
+    fn force_release_device(&mut self, device_id: &str) {
+        self.writers.remove(device_id);
+        self.pending_release.remove(device_id);
+        self.pending_detach.remove(device_id);
+        self.release_device_now(device_id);
+    }
+
+    fn detach_inventory(&mut self, device_id: &str) {
+        if self.writers.contains_key(device_id) {
+            self.pending_detach.insert(device_id.into());
+        }
+        self.release_device(device_id);
+    }
+
+    fn release_device_now(&mut self, device_id: &str) {
         self.active.remove(device_id);
         if let Some(index) = self
             .waiting
@@ -150,6 +181,12 @@ fn main() {
     let transport = Arc::new(SecureTransport::load_or_create(&identity, "registry").unwrap());
     let listener = TcpListener::bind(value(&args, "--listen")).unwrap();
     let offline = Duration::from_millis(value(&args, "--offline-after-ms").parse().unwrap());
+    let configured_agents = values(&args, "--agent-peer");
+    let agent_peers = Arc::new(if configured_agents.is_empty() {
+        HashSet::from(["agent".into()])
+    } else {
+        configured_agents.into_iter().collect()
+    });
     let entries = Arc::new(Mutex::new(HashMap::new()));
     let state_path = identity.join("vertical-slice.json");
     let state = Arc::new(Mutex::new(load_state(&state_path)));
@@ -158,12 +195,13 @@ fn main() {
     )));
     let leases = Arc::new(Mutex::new(LeaseBook::default()));
     for stream in listener.incoming() {
-        let (transport, entries, state, artifacts, leases, state_path) = (
+        let (transport, entries, state, artifacts, leases, agent_peers, state_path) = (
             Arc::clone(&transport),
             Arc::clone(&entries),
             Arc::clone(&state),
             Arc::clone(&artifacts),
             Arc::clone(&leases),
+            Arc::clone(&agent_peers),
             state_path.clone(),
         );
         thread::spawn(move || {
@@ -175,6 +213,7 @@ fn main() {
                 state,
                 artifacts,
                 leases,
+                agent_peers,
                 &state_path,
             )
         });
@@ -190,6 +229,7 @@ fn handle(
     state: Arc<Mutex<DurableState>>,
     artifacts: Arc<Mutex<NetworkArtifacts>>,
     leases: Arc<Mutex<LeaseBook>>,
+    agent_peers: Arc<HashSet<String>>,
     state_path: &Path,
 ) {
     stream
@@ -224,6 +264,53 @@ fn handle(
     };
     let response = match request {
         Request::Heartbeat { mut host } => {
+            if !agent_peers.contains(&peer_id) {
+                return write_response(&mut stream, error_response("agent_access_denied"));
+            }
+            let connected: HashSet<_> = host
+                .devices
+                .iter()
+                .filter(|device| device.state == "connected")
+                .map(|device| device.id.clone())
+                .collect();
+            {
+                let mut state = state.lock().unwrap();
+                if state
+                    .host_peers
+                    .get(&host.id)
+                    .is_some_and(|owner| owner != &peer_id)
+                    || connected.iter().any(|device| {
+                        state
+                            .device_peers
+                            .get(device)
+                            .is_some_and(|owner| owner != &peer_id)
+                    })
+                {
+                    return write_response(&mut stream, error_response("agent_identity_mismatch"));
+                }
+                let detached: Vec<_> = state
+                    .device_peers
+                    .iter()
+                    .filter(|(device, owner)| *owner == &peer_id && !connected.contains(*device))
+                    .map(|(device, _)| device.clone())
+                    .collect();
+                state.host_peers.insert(host.id.clone(), peer_id.clone());
+                for device in &connected {
+                    state.device_peers.insert(device.clone(), peer_id.clone());
+                }
+                let mut leases = leases.lock().unwrap();
+                for device in &connected {
+                    leases.pending_detach.remove(device);
+                }
+                for device in &detached {
+                    let writer_active = leases.writers.contains_key(device);
+                    leases.detach_inventory(device);
+                    if !writer_active {
+                        state.device_peers.remove(device);
+                    }
+                }
+            }
+            leases.lock().unwrap().expire();
             host.status = "online".into();
             let host_id = host.id.clone();
             entries.lock().unwrap().insert(
@@ -234,27 +321,7 @@ fn handle(
                 },
             );
             let mut response = response();
-            {
-                let connected: HashSet<_> = host
-                    .devices
-                    .iter()
-                    .filter(|device| device.state == "connected")
-                    .map(|device| device.id.clone())
-                    .collect();
-                let detached: Vec<_> = leases
-                    .lock()
-                    .unwrap()
-                    .active
-                    .keys()
-                    .filter(|device| !connected.contains(*device))
-                    .cloned()
-                    .collect();
-                for device in detached {
-                    leases.lock().unwrap().release_device(&device);
-                }
-            }
             let mut state = state.lock().unwrap();
-            state.host_peers.insert(host_id.clone(), peer_id.clone());
             if let Some((job_id, operation)) = state
                 .pending
                 .iter()
@@ -273,12 +340,18 @@ fn handle(
                 .find(|(job_id, _)| {
                     state.apple_hosts.get(*job_id) == Some(&host_id)
                         && !state.dispatched.contains(*job_id)
+                        && state.apple_pending.get(*job_id).is_none_or(|operation| {
+                            !operation.operation.mutates_device()
+                                || operation.device_id.as_ref().is_none_or(|device_id| {
+                                    !leases.lock().unwrap().writers.contains_key(device_id)
+                                })
+                        })
                 })
                 .map(|(job_id, operation)| (job_id.clone(), operation.clone()))
             {
-                state.dispatched.insert(job_id.clone());
                 response.apple_operation = Some(operation);
                 response.job_id = Some(job_id);
+                let mut dispatch = true;
                 if let Some(request) = response.apple_operation.as_ref()
                     && request.operation.mutates_device()
                     && let (Some(device_id), Some(lease_id)) =
@@ -303,10 +376,31 @@ fn handle(
                             signature: Vec::new(),
                         };
                         grant.signature = transport.sign(&grant.signed_payload()).unwrap();
+                        leases.writers.insert(
+                            device_id.clone(),
+                            DeviceWriter {
+                                job_id: response.job_id.clone().unwrap(),
+                            },
+                        );
                         response.lease_grant = Some(grant);
                     } else {
+                        let rejected_job = response.job_id.clone().unwrap();
                         response.apple_operation = None;
+                        state.apple_pending.remove(&rejected_job);
+                        state
+                            .jobs
+                            .entry(rejected_job)
+                            .or_default()
+                            .push(NetworkEvent {
+                                sequence: 1,
+                                kind: "rejected".into(),
+                                payload: "lease_inactive".into(),
+                            });
+                        dispatch = false;
                     }
+                }
+                if dispatch {
+                    state.dispatched.insert(response.job_id.clone().unwrap());
                 }
             }
             response.cancel_jobs = state.cancelled.iter().cloned().collect();
@@ -503,6 +597,9 @@ fn handle(
             terminal,
         } => {
             let mut state = state.lock().unwrap();
+            if state.job_agents.get(&job_id) != Some(&peer_id) {
+                return write_response(&mut stream, error_response("apple_progress_access_denied"));
+            }
             let existing = state.jobs.entry(job_id.clone()).or_default();
             for event in events {
                 if !existing
@@ -513,6 +610,22 @@ fn handle(
                 }
             }
             if terminal {
+                let mut leases = leases.lock().unwrap();
+                let finished_devices: Vec<_> = leases
+                    .writers
+                    .iter()
+                    .filter(|(_, writer)| writer.job_id == job_id)
+                    .map(|(device, _)| device.clone())
+                    .collect();
+                for device in finished_devices {
+                    leases.writers.remove(&device);
+                    if leases.pending_release.remove(&device) {
+                        leases.release_device(&device);
+                    }
+                    if leases.pending_detach.remove(&device) {
+                        state.device_peers.remove(&device);
+                    }
+                }
                 state.apple_pending.remove(&job_id);
                 state.cancelled.remove(&job_id);
             }
@@ -521,8 +634,20 @@ fn handle(
         }
         Request::AppleCancel { job_id } => {
             let mut state = state.lock().unwrap();
-            if state.apple_pending.contains_key(&job_id) {
-                state.cancelled.insert(job_id);
+            if state.job_clients.get(&job_id) != Some(&peer_id) {
+                error_response("apple_cancel_access_denied")
+            } else if state.apple_pending.contains_key(&job_id) {
+                if state.dispatched.contains(&job_id) {
+                    state.cancelled.insert(job_id);
+                } else {
+                    state.apple_pending.remove(&job_id);
+                    state.jobs.entry(job_id).or_default().push(NetworkEvent {
+                        sequence: 1,
+                        kind: "cancelled".into(),
+                        payload: String::new(),
+                    });
+                }
+                fs::write(state_path, serde_json::to_vec(&*state).unwrap()).unwrap();
                 response()
             } else {
                 Response {
@@ -635,7 +760,15 @@ fn handle(
             }
         }
         Request::Lease { operation } => {
-            lease(operation, &peer_id, &mut leases.lock().unwrap(), transport)
+            let mut state = state.lock().unwrap();
+            lease(
+                operation,
+                &peer_id,
+                &agent_peers,
+                &mut state.device_peers,
+                &mut leases.lock().unwrap(),
+                transport,
+            )
         }
     };
     let _ = serde_json::to_writer(&mut stream, &response);
@@ -645,6 +778,8 @@ fn handle(
 fn lease(
     operation: LeaseRequest,
     peer_id: &str,
+    agent_peers: &HashSet<String>,
+    device_peers: &mut HashMap<String, String>,
     leases: &mut LeaseBook,
     transport: &SecureTransport,
 ) -> Response {
@@ -740,6 +875,11 @@ fn lease(
             };
         }
         LeaseRequest::Validate { grant } => {
+            if !agent_peers.contains(peer_id)
+                || device_peers.get(&grant.device_id).map(String::as_str) != Some(peer_id)
+            {
+                return error_response("lease_validation_access_denied");
+            }
             let active = leases.active.get(&grant.device_id).is_some_and(|lease| {
                 lease.id == grant.lease_id && lease.client_id == grant.client_id
             });
@@ -771,7 +911,13 @@ fn lease(
             };
         }
         LeaseRequest::AgentDetach { device_id } => {
-            leases.release_device(&device_id);
+            if !agent_peers.contains(peer_id)
+                || device_peers.get(&device_id).map(String::as_str) != Some(peer_id)
+            {
+                return error_response("agent_detach_access_denied");
+            }
+            leases.force_release_device(&device_id);
+            device_peers.remove(&device_id);
             return Response {
                 lease_status: Some("detached".into()),
                 ..response()
@@ -1101,6 +1247,7 @@ fn load_state(path: &Path) -> DurableState {
         },
     }
 }
+
 fn value(args: &[String], name: &str) -> String {
     args.iter()
         .position(|v| v == name)
@@ -1108,6 +1255,14 @@ fn value(args: &[String], name: &str) -> String {
         .unwrap()
         .clone()
 }
+
+fn values(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == name)
+        .map(|pair| pair[1].clone())
+        .collect()
+}
+
 fn metadata(args: &[String]) -> bool {
     if args == ["--help"] {
         println!("{NAME} --listen ADDRESS --identity DIRECTORY --offline-after-ms MILLISECONDS");
@@ -1117,5 +1272,81 @@ fn metadata(args: &[String]) -> bool {
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lease_with_waiter_and_writer() -> LeaseBook {
+        let mut leases = LeaseBook::default();
+        leases.insert("sim-1".into(), "client-a".into(), Duration::from_secs(30));
+        leases.waiting.push(WaitingLease {
+            device_id: "sim-1".into(),
+            client_id: "client-b".into(),
+            lifetime: Duration::from_secs(30),
+        });
+        leases.writers.insert(
+            "sim-1".into(),
+            DeviceWriter {
+                job_id: "job-1".into(),
+            },
+        );
+        leases
+    }
+
+    #[test]
+    fn active_writer_reservation_does_not_expire_before_terminal_progress() {
+        let mut leases = LeaseBook::default();
+        leases.writers.insert(
+            "sim-1".into(),
+            DeviceWriter {
+                job_id: "job-1".into(),
+            },
+        );
+        thread::sleep(Duration::from_millis(5));
+
+        leases.expire();
+
+        assert!(
+            leases.writers.contains_key("sim-1"),
+            "wall-clock expiry opened a second writer before terminal progress"
+        );
+    }
+
+    #[test]
+    fn inventory_detach_defers_lease_promotion_until_terminal_progress() {
+        let mut leases = lease_with_waiter_and_writer();
+
+        leases.detach_inventory("sim-1");
+
+        assert_eq!(leases.active["sim-1"].client_id, "client-a");
+        assert_eq!(leases.waiting[0].client_id, "client-b");
+        assert!(leases.writers.contains_key("sim-1"));
+    }
+
+    #[test]
+    fn explicit_agent_detach_clears_a_stale_writer_and_promotes_the_waiter() {
+        let root = tempfile::tempdir().unwrap();
+        let transport = SecureTransport::load_or_create(root.path(), "registry").unwrap();
+        let mut leases = lease_with_waiter_and_writer();
+        let agents = HashSet::from(["agent".into()]);
+        let mut devices = HashMap::from([("sim-1".into(), "agent".into())]);
+
+        let response = lease(
+            LeaseRequest::AgentDetach {
+                device_id: "sim-1".into(),
+            },
+            "agent",
+            &agents,
+            &mut devices,
+            &mut leases,
+            &transport,
+        );
+
+        assert_eq!(response.lease_status.as_deref(), Some("detached"));
+        assert!(!leases.writers.contains_key("sim-1"));
+        assert_eq!(leases.active["sim-1"].client_id, "client-b");
     }
 }
