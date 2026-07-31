@@ -10,12 +10,14 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Mutex, MutexGuard},
     thread,
     time::Duration,
 };
 use tempfile::TempDir;
 
 const CHUNK: usize = 4;
+static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn transfers_apple_artifacts_in_bounded_resumable_chunks_over_mtls() {
@@ -263,6 +265,7 @@ fn transfer_fixture(path: impl AsRef<Path>) {
 }
 
 struct Setup {
+    _network_test_lock: MutexGuard<'static, ()>,
     _root: TempDir,
     _registry: ChildGuard,
     registry_path: PathBuf,
@@ -275,6 +278,9 @@ struct Setup {
 
 impl Setup {
     fn new() -> Self {
+        let network_test_lock = NETWORK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = tempfile::tempdir().unwrap();
         let registry_path = root.path().join("registry");
         let agent_path = root.path().join("agent");
@@ -289,6 +295,7 @@ impl Setup {
         let cli = SecureTransport::load_or_create(cli_path, "cli").unwrap();
         let outsider = SecureTransport::load_or_create(outsider_path, "outsider").unwrap();
         let setup = Self {
+            _network_test_lock: network_test_lock,
             _root: root,
             _registry: registry,
             registry_path,
