@@ -26,68 +26,6 @@ fn doctor_emits_machine_readable_checks_and_repairs() {
     }
 }
 
-#[cfg(windows)]
-#[test]
-fn doctor_rejects_an_additional_windows_acl_principal() {
-    for target in ["", "private-key.der"] {
-        let workspace = tempfile::tempdir().unwrap();
-        let identity = workspace.path().join("identity");
-        let _ = doctor(&identity);
-        restrict_to_current_user(&identity);
-        restrict_to_current_user(&identity.join("private-key.der"));
-        assert_eq!(permission_status(&doctor(&identity)), "ok");
-        let path = identity.join(target);
-        assert!(
-            Command::new("icacls")
-                .arg(path)
-                .args(["/grant", "*S-1-5-32-544:F"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert_eq!(permission_status(&doctor(&identity)), "repair");
-    }
-}
-
-#[cfg(windows)]
-fn restrict_to_current_user(path: &std::path::Path) {
-    let account = String::from_utf8(Command::new("whoami").output().unwrap().stdout).unwrap();
-    assert!(
-        Command::new("icacls")
-            .arg(path)
-            .args([
-                "/inheritance:r",
-                "/grant:r",
-                &format!("{}:F", account.trim()),
-            ])
-            .status()
-            .unwrap()
-            .success()
-    );
-}
-
-#[cfg(windows)]
-fn doctor(identity: &std::path::Path) -> Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
-        .args(["doctor", "--identity", identity.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    serde_json::from_slice(&output.stdout).unwrap()
-}
-
-#[cfg(windows)]
-fn permission_status(report: &Value) -> &str {
-    report["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|check| check["id"] == "file_permissions")
-        .unwrap()["status"]
-        .as_str()
-        .unwrap()
-}
-
 #[test]
 fn bootstrap_assets_define_idempotent_setup_and_real_hardware_gates() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

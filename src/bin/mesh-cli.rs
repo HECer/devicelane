@@ -781,23 +781,55 @@ fn windows_acl_restrictive(path: &Path, account: &str, sid: Option<&str>) -> boo
         return false;
     };
     let acl = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    output.status.success()
-        && acl.lines().filter(|line| line.contains(":(")).all(|line| {
-            line.split_once(":(").is_some_and(|(principal, _)| {
-                let principal = principal.trim_end();
-                principal == account
-                    || sid.is_some_and(|sid| {
-                        principal == sid
-                            || principal
-                                .strip_suffix(sid)
-                                .is_some_and(|prefix| prefix.ends_with(char::is_whitespace))
-                    })
-                    || principal
-                        .strip_suffix(account)
-                        .is_some_and(|prefix| prefix.ends_with(char::is_whitespace))
-                    || principal.ends_with("\\system")
-                    || principal.contains("\\logonsessionid_")
-                    || principal.contains("mandatory label\\")
-            })
+    output.status.success() && windows_acl_text_restrictive(&acl, account, sid)
+}
+
+#[cfg(windows)]
+fn windows_acl_text_restrictive(acl: &str, account: &str, sid: Option<&str>) -> bool {
+    let acl = acl.to_ascii_lowercase();
+    acl.lines().filter(|line| line.contains(":(")).all(|line| {
+        line.split_once(":(").is_some_and(|(principal, _)| {
+            let principal = principal.trim_end();
+            principal == account
+                || sid.is_some_and(|sid| {
+                    principal == sid
+                        || principal
+                            .strip_suffix(sid)
+                            .is_some_and(|prefix| prefix.ends_with(char::is_whitespace))
+                })
+                || principal
+                    .strip_suffix(account)
+                    .is_some_and(|prefix| prefix.ends_with(char::is_whitespace))
+                || principal.ends_with("\\system")
+                || principal.contains("\\logonsessionid_")
+                || principal.contains("mandatory label\\")
         })
+    })
+}
+
+#[cfg(all(test, windows))]
+mod windows_acl_tests {
+    use super::windows_acl_text_restrictive;
+
+    const ACCOUNT: &str = "runner\\ci-user";
+    const SID: &str = "s-1-5-21-1000";
+
+    #[test]
+    fn accepts_only_the_current_identity_and_non_discretionary_principals() {
+        assert!(windows_acl_text_restrictive(
+            "C:\\identity RUNNER\\ci-user:(F)\n                  NT AUTHORITY\\SYSTEM:(F)\nMandatory Label\\High Mandatory Level:(NW)",
+            ACCOUNT,
+            Some(SID)
+        ));
+        assert!(windows_acl_text_restrictive(
+            "C:\\identity S-1-5-21-1000:(F)",
+            ACCOUNT,
+            Some(SID)
+        ));
+        assert!(!windows_acl_text_restrictive(
+            "C:\\identity RUNNER\\ci-user:(F)\n                  BUILTIN\\Administrators:(F)",
+            ACCOUNT,
+            Some(SID)
+        ));
+    }
 }
