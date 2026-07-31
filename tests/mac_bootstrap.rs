@@ -62,6 +62,48 @@ fn launch_agent_is_restricted_absolute_and_contains_no_secrets() {
 }
 
 #[test]
+fn production_launch_agent_uses_resolved_apple_tools_without_dummy_devices() {
+    let setup = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-mac.sh"),
+    )
+    .unwrap();
+
+    for tool in [
+        "xcodebuild",
+        "devicectl",
+        "simctl",
+        "xcresulttool",
+        "xctrace",
+        "lldb-dap",
+    ] {
+        assert!(
+            setup.contains(&format!("xcrun --find {tool}")),
+            "setup must resolve {tool} through xcrun"
+        );
+    }
+    for argument in ["--xcodebuild", "--devicectl", "--simctl"] {
+        assert!(
+            setup.contains(argument),
+            "LaunchAgent must receive {argument}"
+        );
+    }
+    assert!(!setup.contains("<string>process.start@1</string>"));
+    assert!(!setup.contains("<string>none:ios:disconnected</string>"));
+}
+
+#[test]
+fn production_install_rejects_loopback_controller_and_unresolved_tools() {
+    let setup = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-mac.sh"),
+    )
+    .unwrap();
+
+    assert!(setup.contains("production controller must not use loopback"));
+    assert!(setup.contains("unable to resolve required Apple tool"));
+    assert!(setup.contains("test -x"));
+}
+
+#[test]
 #[cfg(unix)]
 fn dry_run_has_no_side_effects_and_reports_only_handoff_and_diagnostics() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

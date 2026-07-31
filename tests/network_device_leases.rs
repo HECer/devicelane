@@ -1,43 +1,775 @@
 use device_development_mesh::{
-    network_processes::{LeaseGrant, LeaseRequest},
+    network_processes::{
+        DeviceSnapshot, HostSnapshot, LeaseGrant, LeaseRequest, NetworkEvent, Request,
+    },
+    remote_apple_protocol::{AppleOperation, AppleRequest, RemoteProtocolVersion},
     secure_transport::SecureTransport,
 };
+use std::{
+    io::{BufRead, BufReader, Write},
+    net::{TcpListener, TcpStream},
+    path::{Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+const DEVICE: &str = "sim-1";
 
 #[test]
-fn registry_lease_grants_are_signed_and_job_bound() {
-    let root = tempfile::tempdir().unwrap();
-    let registry_root = root.path().join("registry");
-    let agent_root = root.path().join("agent");
-    let registry = SecureTransport::load_or_create(&registry_root, "registry").unwrap();
-    let mut agent = SecureTransport::load_or_create(&agent_root, "agent").unwrap();
-    agent.trust("registry", registry.certificate_der()).unwrap();
-    let mut grant = LeaseGrant {
-        lease_id: "lease-1".into(),
-        device_id: "iphone-1".into(),
-        client_id: "client-a".into(),
-        job_id: "job-1".into(),
-        expires_at_ms: 1000,
-        signature: Vec::new(),
-    };
-    grant.signature = registry.sign(&grant.signed_payload()).unwrap();
+fn lease_rpc_covers_acquire_renew_queue_release_revoke_and_one_writer() {
+    let harness = Harness::start(Duration::ZERO);
 
-    assert_eq!(grant.job_id, "job-1");
-    assert!(
-        agent
-            .verify_peer_signature("registry", &grant.signed_payload(), &grant.signature)
-            .is_ok()
-    );
-    grant.job_id = "job-2".into();
-    assert!(
-        agent
-            .verify_peer_signature("registry", &grant.signed_payload(), &grant.signature)
-            .is_err()
-    );
-    assert!(matches!(
-        LeaseRequest::Acquire {
-            device_id: "iphone-1".into(),
-            lifetime_ms: 1000,
+    let first = lease(
+        &harness.address,
+        &harness.client_a,
+        &LeaseRequest::Acquire {
+            device_id: DEVICE.into(),
+            lifetime_ms: 30_000,
         },
-        LeaseRequest::Acquire { .. }
-    ));
+    );
+    assert_eq!(first["lease_status"], "acquired");
+    let first_id = grant_id(&first);
+    assert_eq!(first["lease_grant"]["client_id"], "client-a");
+
+    let conflicting = lease(
+        &harness.address,
+        &harness.client_b,
+        &LeaseRequest::Acquire {
+            device_id: DEVICE.into(),
+            lifetime_ms: 30_000,
+        },
+    );
+    assert_eq!(conflicting["error"], "device_already_leased");
+
+    let renewed = lease(
+        &harness.address,
+        &harness.client_a,
+        &LeaseRequest::Renew {
+            lease_id: first_id.clone(),
+            lifetime_ms: 30_000,
+        },
+    );
+    assert_eq!(renewed["lease_status"], "renewed");
+    assert_eq!(grant_id(&renewed), first_id);
+
+    let queued = lease(
+        &harness.address,
+        &harness.client_b,
+        &LeaseRequest::Queue {
+            device_id: DEVICE.into(),
+            lifetime_ms: 30_000,
+        },
+    );
+    assert_eq!(queued["lease_status"], "queued");
+    assert!(queued["lease_grant"].is_null());
+
+    let released = lease(
+        &harness.address,
+        &harness.client_a,
+        &LeaseRequest::Release { lease_id: first_id },
+    );
+    assert_eq!(released["lease_status"], "released");
+
+    let promoted_b = lease(
+        &harness.address,
+        &harness.client_b,
+        &LeaseRequest::Queue {
+            device_id: DEVICE.into(),
+            lifetime_ms: 30_000,
+        },
+    );
+    assert_eq!(promoted_b["lease_status"], "acquired");
+    assert_eq!(promoted_b["lease_grant"]["client_id"], "client-b");
+    let second_id = grant_id(&promoted_b);
+
+    let queued_a = lease(
+        &harness.address,
+        &harness.client_a,
+        &LeaseRequest::Queue {
+            device_id: DEVICE.into(),
+            lifetime_ms: 30_000,
+        },
+    );
+    assert_eq!(queued_a["lease_status"], "queued");
+
+    let revoked = lease(
+        &harness.address,
+        &harness.client_b,
+        &LeaseRequest::Revoke {
+            lease_id: second_id,
+        },
+    );
+    assert_eq!(revoked["lease_status"], "revoked");
+
+    let promoted_a = lease(
+        &harness.address,
+        &harness.client_a,
+        &LeaseRequest::Queue {
+            device_id: DEVICE.into(),
+            lifetime_ms: 30_000,
+        },
+    );
+    assert_eq!(promoted_a["lease_status"], "acquired");
+    assert_eq!(promoted_a["lease_grant"]["client_id"], "client-a");
+}
+
+#[test]
+fn disconnect_and_expiry_promote_the_next_paired_client_in_order() {
+    let harness = Harness::start(Duration::ZERO);
+    let first = acquire(&harness, &harness.client_a, 30_000);
+
+    assert_eq!(
+        lease(
+            &harness.address,
+            &harness.client_b,
+            &LeaseRequest::Queue {
+                device_id: DEVICE.into(),
+                lifetime_ms: 30_000,
+            },
+        )["lease_status"],
+        "queued"
+    );
+    assert_eq!(
+        lease(
+            &harness.address,
+            &harness.client_a,
+            &LeaseRequest::Disconnect,
+        )["lease_status"],
+        "disconnected"
+    );
+
+    let promoted_b = current_grant(&harness, &harness.client_b);
+    assert_eq!(promoted_b["lease_grant"]["client_id"], "client-b");
+    assert_ne!(grant_id(&promoted_b), grant_id(&first));
+    let promoted_b_id = grant_id(&promoted_b);
+
+    assert_eq!(
+        lease(
+            &harness.address,
+            &harness.client_a,
+            &LeaseRequest::Queue {
+                device_id: DEVICE.into(),
+                lifetime_ms: 30_000,
+            },
+        )["lease_status"],
+        "queued"
+    );
+    assert_eq!(
+        lease(
+            &harness.address,
+            &harness.client_b,
+            &LeaseRequest::Renew {
+                lease_id: promoted_b_id,
+                lifetime_ms: 75,
+            },
+        )["lease_status"],
+        "renewed"
+    );
+
+    thread::sleep(Duration::from_millis(125));
+    let promoted_a = current_grant(&harness, &harness.client_a);
+    assert_eq!(promoted_a["lease_grant"]["client_id"], "client-a");
+}
+
+#[test]
+fn paired_client_cannot_issue_agent_detach() {
+    let harness = Harness::start(Duration::ZERO);
+    let owned = acquire(&harness, &harness.client_a, 30_000);
+
+    let unauthorized = lease(
+        &harness.address,
+        &harness.client_b,
+        &LeaseRequest::AgentDetach {
+            device_id: DEVICE.into(),
+        },
+    );
+    assert_eq!(
+        unauthorized["accepted"], false,
+        "a paired client detached an agent-owned device: {unauthorized}"
+    );
+
+    let still_owned = lease(
+        &harness.address,
+        &harness.client_a,
+        &LeaseRequest::Renew {
+            lease_id: grant_id(&owned),
+            lifetime_ms: 30_000,
+        },
+    );
+    assert_eq!(still_owned["lease_status"], "renewed");
+}
+
+#[test]
+fn authorized_agent_detach_promotes_the_waiting_client() {
+    let harness = Harness::start(Duration::ZERO);
+    acquire(&harness, &harness.client_a, 30_000);
+    assert_eq!(
+        lease(
+            &harness.address,
+            &harness.client_b,
+            &LeaseRequest::Queue {
+                device_id: DEVICE.into(),
+                lifetime_ms: 30_000,
+            },
+        )["lease_status"],
+        "queued"
+    );
+
+    let detached = lease(
+        &harness.address,
+        &harness.agent,
+        &LeaseRequest::AgentDetach {
+            device_id: DEVICE.into(),
+        },
+    );
+    assert_eq!(detached["lease_status"], "detached");
+
+    let promoted = current_grant(&harness, &harness.client_b);
+    assert_eq!(promoted["lease_grant"]["client_id"], "client-b");
+}
+
+#[test]
+fn heartbeat_from_another_agent_cannot_detach_the_lease_owners_device() {
+    let harness = Harness::start(Duration::ZERO);
+    let owned = acquire(&harness, &harness.client_a, 30_000);
+
+    let heartbeat = rpc(
+        &harness.address,
+        &harness.agent_b,
+        &Request::Heartbeat {
+            host: HostSnapshot {
+                id: "mac-2".into(),
+                operating_system: "macos".into(),
+                architecture: "aarch64".into(),
+                status: "online".into(),
+                capabilities: vec!["apple.simulator@1".into()],
+                devices: vec![DeviceSnapshot {
+                    id: "sim-2".into(),
+                    platform: "ios".into(),
+                    state: "connected".into(),
+                }],
+            },
+        },
+    );
+    assert_eq!(heartbeat["accepted"], true, "{heartbeat}");
+
+    let still_owned = lease(
+        &harness.address,
+        &harness.client_a,
+        &LeaseRequest::Renew {
+            lease_id: grant_id(&owned),
+            lifetime_ms: 30_000,
+        },
+    );
+    assert_eq!(
+        still_owned["lease_status"], "renewed",
+        "another agent's inventory detached this device: {still_owned}"
+    );
+}
+
+#[test]
+fn forged_workspace_lease_and_grant_cannot_run_a_mutation_but_observer_reads_events() {
+    let harness = Harness::start(Duration::ZERO);
+
+    let forged = apple_request("forged", "forged-lease");
+    let rejected = cli_json(&harness.address, &harness.client_a, "apple-run", &forged);
+    assert_eq!(rejected["accepted"], false);
+    assert_eq!(rejected["error"], "lease_inactive");
+    assert_eq!(mutation_lines(&harness.marker), Vec::<String>::new());
+
+    let owned = acquire(&harness, &harness.client_a, 30_000);
+    let legitimate = cli_json(
+        &harness.address,
+        &harness.client_a,
+        "apple-run",
+        &apple_request("legitimate", &grant_id(&owned)),
+    );
+    let job_id = legitimate["job_id"].as_str().unwrap();
+    let terminal = wait_for_terminal(&harness.address, &harness.client_b, job_id);
+    assert_eq!(
+        terminal["kind"], "completed",
+        "observer could not read the legitimate job terminal event: {terminal}"
+    );
+    assert_eq!(
+        mutation_lines(&harness.marker),
+        ["mutation-start", "mutation-end"]
+    );
+}
+
+#[test]
+fn expired_writer_finishes_before_the_promoted_writer_starts() {
+    let harness = Harness::start(Duration::from_millis(650));
+    let first = acquire(&harness, &harness.client_a, 120);
+    assert_eq!(
+        lease(
+            &harness.address,
+            &harness.client_b,
+            &LeaseRequest::Queue {
+                device_id: DEVICE.into(),
+                lifetime_ms: 30_000,
+            },
+        )["lease_status"],
+        "queued"
+    );
+
+    let first_job = cli_json(
+        &harness.address,
+        &harness.client_a,
+        "apple-run",
+        &apple_request("slow-a", &grant_id(&first)),
+    )["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_until("first mutating tool start", || {
+        mutation_lines(&harness.marker)
+            .iter()
+            .filter(|line| *line == "mutation-start")
+            .count()
+            == 1
+    });
+
+    thread::sleep(Duration::from_millis(160));
+    let promoted = current_grant(&harness, &harness.client_b);
+    let second_job = cli_json(
+        &harness.address,
+        &harness.client_b,
+        "apple-run",
+        &apple_request("slow-b", &grant_id(&promoted)),
+    )["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for_terminal(&harness.address, &harness.client_a, &first_job);
+    wait_for_terminal(&harness.address, &harness.client_b, &second_job);
+
+    assert_eq!(
+        mutation_lines(&harness.marker),
+        [
+            "mutation-start",
+            "mutation-end",
+            "mutation-start",
+            "mutation-end"
+        ],
+        "two mutating tools overlapped after lease expiry"
+    );
+}
+
+#[test]
+fn observer_cannot_cancel_or_publish_progress_for_another_clients_job() {
+    let harness = Harness::start(Duration::from_millis(650));
+    let owned = acquire(&harness, &harness.client_a, 30_000);
+    let accepted = cli_json(
+        &harness.address,
+        &harness.client_a,
+        "apple-run",
+        &apple_request("owned-job", &grant_id(&owned)),
+    );
+    let job_id = accepted["job_id"].as_str().unwrap().to_owned();
+
+    wait_until("owned mutating tool start", || {
+        mutation_lines(&harness.marker).contains(&"mutation-start".into())
+    });
+    let cancelled = rpc(
+        &harness.address,
+        &harness.client_b,
+        &Request::AppleCancel {
+            job_id: job_id.clone(),
+        },
+    );
+    assert_eq!(
+        cancelled["accepted"], false,
+        "observer cancelled another client's job: {cancelled}"
+    );
+
+    let forged_progress = rpc(
+        &harness.address,
+        &harness.client_b,
+        &Request::AppleProgress {
+            job_id,
+            events: vec![NetworkEvent {
+                sequence: 999,
+                kind: "completed".into(),
+                payload: "forged".into(),
+            }],
+            terminal: true,
+        },
+    );
+    assert_eq!(
+        forged_progress["accepted"], false,
+        "observer published progress for another client's job: {forged_progress}"
+    );
+}
+
+struct Harness {
+    _root: tempfile::TempDir,
+    address: String,
+    client_a: PathBuf,
+    client_b: PathBuf,
+    agent: PathBuf,
+    agent_b: PathBuf,
+    marker: PathBuf,
+    _registry: ChildGuard,
+    _agent: ChildGuard,
+}
+
+impl Harness {
+    fn start(mutation_delay: Duration) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let address = free_address();
+        let registry = root.path().join("registry");
+        let agent = root.path().join("agent");
+        let agent_b = root.path().join("agent-b");
+        let client_a = root.path().join("client-a");
+        let client_b = root.path().join("client-b");
+        pair(&registry, "registry", &agent, "agent");
+        pair(&registry, "registry", &agent_b, "agent-b");
+        pair(&registry, "registry", &client_a, "client-a");
+        pair(&registry, "registry", &client_b, "client-b");
+
+        let workspace_root = root.path().join("workspaces");
+        let project = workspace_root.join("mac-1/project");
+        std::fs::create_dir_all(project.join(".leases")).unwrap();
+        let marker = root.path().join("apple-tools.log");
+        let xcodebuild = fake_tool(root.path(), "xcodebuild", &marker, mutation_delay);
+        let devicectl = fake_tool(root.path(), "devicectl", &marker, mutation_delay);
+        let simctl = fake_tool(root.path(), "simctl", &marker, mutation_delay);
+
+        let client_transport = SecureTransport::load_or_create(&client_a, "client-a").unwrap();
+        let mut forged_grant = LeaseGrant {
+            lease_id: "forged-lease".into(),
+            device_id: DEVICE.into(),
+            client_id: "client-a".into(),
+            job_id: "forged-job".into(),
+            expires_at_ms: u64::MAX,
+            signature: Vec::new(),
+        };
+        forged_grant.signature = client_transport
+            .sign(&forged_grant.signed_payload())
+            .unwrap();
+        std::fs::write(
+            project.join("lease-grant.json"),
+            serde_json::to_vec(&forged_grant).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".leases").join(DEVICE),
+            b"forged-lease\nclient-a\n",
+        )
+        .unwrap();
+
+        let registry_process = start_registry(&address, &registry);
+        let agent_process = spawn(
+            env!("CARGO_BIN_EXE_mesh-agent"),
+            &[
+                "--registry",
+                &address,
+                "--identity",
+                agent.to_str().unwrap(),
+                "--id",
+                "mac-1",
+                "--os",
+                "macos",
+                "--arch",
+                "aarch64",
+                "--workspace-root",
+                workspace_root.to_str().unwrap(),
+                "--xcodebuild",
+                xcodebuild.to_str().unwrap(),
+                "--devicectl",
+                devicectl.to_str().unwrap(),
+                "--simctl",
+                simctl.to_str().unwrap(),
+                "--heartbeat-ms",
+                "50",
+                "--capability",
+                "apple.simulator@1",
+                "--device",
+                "sim-1:ios:connected",
+            ],
+        );
+        wait_for_host(&address, &client_a);
+
+        Self {
+            _root: root,
+            address,
+            client_a,
+            client_b,
+            agent,
+            agent_b,
+            marker,
+            _registry: registry_process,
+            _agent: agent_process,
+        }
+    }
+}
+
+fn acquire(harness: &Harness, identity: &Path, lifetime_ms: u64) -> serde_json::Value {
+    let response = lease(
+        &harness.address,
+        identity,
+        &LeaseRequest::Acquire {
+            device_id: DEVICE.into(),
+            lifetime_ms,
+        },
+    );
+    assert_eq!(response["lease_status"], "acquired", "{response}");
+    response
+}
+
+fn current_grant(harness: &Harness, identity: &Path) -> serde_json::Value {
+    let response = lease(
+        &harness.address,
+        identity,
+        &LeaseRequest::Queue {
+            device_id: DEVICE.into(),
+            lifetime_ms: 30_000,
+        },
+    );
+    assert_eq!(response["lease_status"], "acquired", "{response}");
+    response
+}
+
+fn grant_id(response: &serde_json::Value) -> String {
+    response["lease_grant"]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn lease(address: &str, identity: &Path, request: &LeaseRequest) -> serde_json::Value {
+    cli_json(address, identity, "lease", request)
+}
+
+fn apple_request(suffix: &str, lease_id: &str) -> AppleRequest {
+    AppleRequest {
+        version: RemoteProtocolVersion { major: 1, minor: 0 },
+        request_id: format!("request-{suffix}"),
+        idempotency_key: format!("idempotency-{suffix}"),
+        capability: "apple.simulator@1".into(),
+        workspace_path: "project".into(),
+        device_id: Some(DEVICE.into()),
+        lease_id: Some(lease_id.into()),
+        operation: AppleOperation::InstallApp {
+            app_path: "build/MeshApp.app".into(),
+        },
+    }
+}
+
+fn wait_for_terminal(address: &str, identity: &Path, job_id: &str) -> serde_json::Value {
+    let mut terminal = None;
+    wait_until("terminal event", || {
+        terminal = cli_json(
+            address,
+            identity,
+            "events",
+            &serde_json::json!({"job_id": job_id, "after": 0}),
+        )["events"]
+            .as_array()
+            .and_then(|events| {
+                events
+                    .iter()
+                    .find(|event| {
+                        matches!(
+                            event["kind"].as_str(),
+                            Some("completed" | "rejected" | "cancelled")
+                        )
+                    })
+                    .cloned()
+            });
+        terminal.is_some()
+    });
+    terminal.unwrap()
+}
+
+fn mutation_lines(marker: &Path) -> Vec<String> {
+    std::fs::read_to_string(marker)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("mutation-"))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn start_registry(address: &str, identity: &Path) -> ChildGuard {
+    spawn(
+        env!("CARGO_BIN_EXE_mesh-registry"),
+        &[
+            "--listen",
+            address,
+            "--identity",
+            identity.to_str().unwrap(),
+            "--offline-after-ms",
+            "500",
+        ],
+    )
+}
+
+fn fake_tool(root: &Path, name: &str, marker: &Path, mutation_delay: Duration) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = root.join(format!("{name}.cmd"));
+        std::fs::write(
+            &path,
+            format!(
+                "@echo off\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"install\" goto mutation\r\nif \"%1\"==\"-version\" goto version\r\nif \"{name}\"==\"devicectl\" if \"%1\"==\"list\" goto devices\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"list\" goto simulators\r\necho tool-output {name} %*\r\nexit /b 0\r\n:mutation\r\necho mutation-start>>\"{}\"\r\npowershell.exe -NoProfile -Command \"Start-Sleep -Milliseconds {}\"\r\necho mutation-end>>\"{}\"\r\necho installed\r\nexit /b 0\r\n:version\r\necho Xcode 16\r\nexit /b 0\r\n:devices\r\necho {{\"result\":{{\"devices\":[]}}}}\r\nexit /b 0\r\n:simulators\r\necho {{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}\r\nexit /b 0\r\n",
+                marker.display(),
+                mutation_delay.as_millis(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        path
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ '{name}' = simctl ] && [ \"$1\" = install ]; then\n  echo mutation-start >> '{}'\n  sleep {}\n  echo mutation-end >> '{}'\n  echo installed\n  exit 0\nfi\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && [ \"$1\" = list ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && [ \"$1\" = list ] && echo '{{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}' && exit 0\necho \"tool-output {name} $*\"\n",
+                marker.display(),
+                mutation_delay.as_secs_f64(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+}
+
+fn cli<T: serde::Serialize>(address: &str, identity: &Path, command: &str, body: &T) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
+        .args([
+            "--registry",
+            address,
+            "--identity",
+            identity.to_str().unwrap(),
+            command,
+            "--json-request",
+            &serde_json::to_string(body).unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("mesh-cli timed out");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+fn cli_json<T: serde::Serialize>(
+    address: &str,
+    identity: &Path,
+    command: &str,
+    body: &T,
+) -> serde_json::Value {
+    let output = cli(address, identity, command, body);
+    assert!(
+        output.status.success(),
+        "mesh-cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn rpc(address: &str, identity: &Path, request: &Request) -> serde_json::Value {
+    let transport = SecureTransport::load_or_create(identity, "test-peer").unwrap();
+    let stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut stream = transport.connect_tls(stream, "registry").unwrap();
+    serde_json::to_writer(&mut stream, request).unwrap();
+    stream.write_all(b"\n").unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    serde_json::from_str(&response).unwrap()
+}
+
+fn wait_for_host(address: &str, identity: &Path) {
+    wait_until("host", || {
+        Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
+            .args([
+                "--registry",
+                address,
+                "--identity",
+                identity.to_str().unwrap(),
+                "list",
+                "--json",
+            ])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success() && String::from_utf8_lossy(&output.stdout).contains("mac-1")
+            })
+    });
+}
+
+fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {label}");
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn pair(registry: &Path, registry_id: &str, peer: &Path, peer_id: &str) {
+    let mut left = SecureTransport::load_or_create(registry, registry_id).unwrap();
+    let mut right = SecureTransport::load_or_create(peer, peer_id).unwrap();
+    let code = left.issue_pairing_code(Duration::from_secs(10));
+    left.accept_pairing(&code, right.certificate_der(), Duration::ZERO)
+        .unwrap();
+    right.trust(registry_id, left.certificate_der()).unwrap();
+}
+
+fn free_address() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+fn spawn(path: &str, args: &[&str]) -> ChildGuard {
+    ChildGuard(
+        Command::new(path)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+struct ChildGuard(Child);
+
+impl std::ops::Deref for ChildGuard {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }

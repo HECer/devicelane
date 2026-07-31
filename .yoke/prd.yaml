@@ -265,7 +265,11 @@
     - Der Agent akzeptiert mutierende Apple-Aktionen nur mit einem von der
       Registry signierten, jobgebundenen Lease-Grant und prüft ihn direkt vor
       jeder Toolausführung erneut
-  passes: true
+    - Prozess-Tests beweisen, dass Observer weder AgentDetach noch fremdes
+      AppleCancel oder AppleProgress noch Agent-Heartbeats vortäuschen können
+      und dass ein langsamer Writer bei Lease-Ablauf nie mit dem promovierten
+      Writer desselben Geräts überlappt
+  passes: false
   needs:
     - STORY-33
   area: distributed-device-leases
