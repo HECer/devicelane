@@ -55,7 +55,7 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
             "--simctl",
             simctl.to_str().unwrap(),
             "--heartbeat-ms",
-            "25",
+            "100",
             "--capability",
             "apple.project@1",
             "--capability",
