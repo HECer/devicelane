@@ -8,13 +8,11 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
 use std::time::Duration;
 
-fn workspace() -> PathBuf {
-    let root = env::temp_dir().join(format!("mesh-apple-build-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("lease/job")).unwrap();
+fn workspace() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("lease/job")).unwrap();
     root
 }
 
@@ -66,7 +64,7 @@ fn creates_explicit_typed_build_and_test_plans_inside_lease() {
 #[test]
 fn streams_resumable_redacted_events_and_registers_success_outputs() {
     let root = workspace();
-    let mut store = ArtifactStore::new(root.join("artifacts")).unwrap();
+    let mut store = ArtifactStore::new(root.path().join("artifacts")).unwrap();
     let job = AppleBuildJob::with_prefix(
         &root,
         env::current_exe().unwrap(),
@@ -129,7 +127,7 @@ fn streams_resumable_redacted_events_and_registers_success_outputs() {
 #[test]
 fn rejects_signing_reference_that_is_not_locally_available() {
     let root = workspace();
-    let mut store = ArtifactStore::new(root.join("artifacts")).unwrap();
+    let mut store = ArtifactStore::new(root.path().join("artifacts")).unwrap();
     let job = AppleBuildJob::new(&root, env::current_exe().unwrap(), ["API_TOKEN"]).unwrap();
     assert!(
         job.execute(
@@ -149,7 +147,7 @@ fn rejects_signing_reference_that_is_not_locally_available() {
 #[test]
 fn build_stream_preserves_live_output_while_redacting_only_secret_values() {
     let root = workspace();
-    let exit_marker = root.join("stream-helper-exited");
+    let exit_marker = root.path().join("stream-helper-exited");
     let job = AppleBuildJob::with_prefix(
         &root,
         env::current_exe().unwrap(),
