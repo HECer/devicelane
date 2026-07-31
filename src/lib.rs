@@ -235,7 +235,7 @@ pub mod process_execution {
             self.0.store(true, Ordering::Release);
         }
 
-        fn is_cancelled(&self) -> bool {
+        pub fn is_cancelled(&self) -> bool {
             self.0.load(Ordering::Acquire)
         }
     }
@@ -5513,6 +5513,237 @@ pub mod remote_apple_protocol {
     ) {
         let mut state = state.lock().unwrap();
         let events = state.events.get_mut(job_id).unwrap();
+        if events.iter().any(|event| event.terminal) {
+            return;
+        }
+        events.push(ProgressEvent {
+            sequence: events.len() as u64 + 1,
+            kind: kind.into(),
+            payload: payload.into(),
+            terminal,
+        });
+    }
+}
+
+pub mod remote_apple_agent {
+    use crate::process_execution::CancellationToken;
+    use crate::remote_apple_protocol::{AppleAgent, AppleRequest, ProgressEvent, ProtocolError};
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct AgentDiscovery {
+        pub capabilities: HashSet<String>,
+        pub devices: HashSet<String>,
+    }
+
+    type Discover = dyn Fn() -> AgentDiscovery + Send + Sync;
+    type Execute = dyn Fn(AppleRequest, CancellationToken, &dyn Fn(&str)) -> Result<String, String>
+        + Send
+        + Sync;
+
+    struct Job {
+        request: AppleRequest,
+        cancellation: CancellationToken,
+        events: Vec<ProgressEvent>,
+    }
+
+    struct State {
+        next_job: u64,
+        request_jobs: HashMap<String, String>,
+        idempotency_jobs: HashMap<String, String>,
+        jobs: HashMap<String, Job>,
+    }
+
+    pub struct RemoteAppleAgent {
+        workspace_root: PathBuf,
+        discover: Arc<Discover>,
+        execute: Arc<Execute>,
+        state: Arc<Mutex<State>>,
+    }
+
+    pub struct RemoteAppleRegistry {
+        agent: RemoteAppleAgent,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct RemoteAcceptedJob {
+        job_id: String,
+    }
+
+    impl RemoteAcceptedJob {
+        pub fn job_id(&self) -> &str {
+            &self.job_id
+        }
+    }
+
+    impl RemoteAppleAgent {
+        pub fn new(
+            workspace_root: impl AsRef<Path>,
+            discover: impl Fn() -> AgentDiscovery + Send + Sync + 'static,
+            execute: impl Fn(AppleRequest, CancellationToken, &dyn Fn(&str)) -> Result<String, String>
+            + Send
+            + Sync
+            + 'static,
+        ) -> Result<Self, ProtocolError> {
+            let workspace_root = std::fs::canonicalize(workspace_root).map_err(|_| {
+                ProtocolError::new("workspace_path_denied", "workspace is unavailable")
+            })?;
+            Ok(Self {
+                workspace_root,
+                discover: Arc::new(discover),
+                execute: Arc::new(execute),
+                state: Arc::new(Mutex::new(State {
+                    next_job: 1,
+                    request_jobs: HashMap::new(),
+                    idempotency_jobs: HashMap::new(),
+                    jobs: HashMap::new(),
+                })),
+            })
+        }
+
+        fn submit(&self, request: AppleRequest) -> Result<RemoteAcceptedJob, ProtocolError> {
+            let discovered = (self.discover)();
+            AppleAgent::new(
+                &self.workspace_root,
+                discovered.capabilities,
+                discovered.devices,
+            )?
+            .validate(&request)?;
+
+            let mut state = self.state.lock().unwrap();
+            let known = state
+                .request_jobs
+                .get(&request.request_id)
+                .or_else(|| state.idempotency_jobs.get(&request.idempotency_key))
+                .cloned();
+            if let Some(job_id) = known {
+                if state
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|job| same_operation(&job.request, &request))
+                {
+                    return Ok(RemoteAcceptedJob { job_id });
+                }
+                return Err(ProtocolError::new(
+                    "idempotency_conflict",
+                    "request identifier was reused for a different operation",
+                ));
+            }
+
+            let job_id = format!("remote-apple-job-{}", state.next_job);
+            state.next_job += 1;
+            let cancellation = CancellationToken::new();
+            state
+                .request_jobs
+                .insert(request.request_id.clone(), job_id.clone());
+            state
+                .idempotency_jobs
+                .insert(request.idempotency_key.clone(), job_id.clone());
+            state.jobs.insert(
+                job_id.clone(),
+                Job {
+                    request: request.clone(),
+                    cancellation: cancellation.clone(),
+                    events: vec![ProgressEvent {
+                        sequence: 1,
+                        kind: "accepted".into(),
+                        payload: String::new(),
+                        terminal: false,
+                    }],
+                },
+            );
+            drop(state);
+
+            let execute = Arc::clone(&self.execute);
+            let jobs = Arc::clone(&self.state);
+            let thread_job_id = job_id.clone();
+            std::thread::spawn(move || {
+                let progress_jobs = Arc::clone(&jobs);
+                let progress_job_id = thread_job_id.clone();
+                let progress = move |payload: &str| {
+                    append(&progress_jobs, &progress_job_id, "progress", payload, false)
+                };
+                let result = execute(request, cancellation.clone(), &progress);
+                let (kind, payload) = match result {
+                    Ok(payload) => ("succeeded", payload),
+                    Err(payload) if cancellation.is_cancelled() => ("cancelled", payload),
+                    Err(payload) => ("failed", payload),
+                };
+                append(&jobs, &thread_job_id, kind, &payload, true);
+            });
+            Ok(RemoteAcceptedJob { job_id })
+        }
+
+        fn events(&self, job_id: &str, after: u64) -> Result<Vec<ProgressEvent>, ProtocolError> {
+            let state = self.state.lock().unwrap();
+            let job = state
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| ProtocolError::new("unknown_job", "job is not available"))?;
+            if after > job.events.len() as u64 {
+                return Err(ProtocolError::new(
+                    "invalid_event_cursor",
+                    "event cursor is beyond the job",
+                ));
+            }
+            Ok(job
+                .events
+                .iter()
+                .filter(|event| event.sequence > after)
+                .cloned()
+                .collect())
+        }
+
+        fn cancel(&self, job_id: &str) -> Result<(), ProtocolError> {
+            let state = self.state.lock().unwrap();
+            let job = state
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| ProtocolError::new("unknown_job", "job is not available"))?;
+            job.cancellation.cancel();
+            Ok(())
+        }
+    }
+
+    impl RemoteAppleRegistry {
+        pub fn new(agent: RemoteAppleAgent) -> Self {
+            Self { agent }
+        }
+
+        pub fn submit(&self, request: AppleRequest) -> Result<RemoteAcceptedJob, ProtocolError> {
+            let wire = serde_json::to_string(&request)
+                .map_err(|_| ProtocolError::new("invalid_request", "request fields are invalid"))?;
+            let forwarded = serde_json::from_str(&wire)
+                .map_err(|_| ProtocolError::new("invalid_request", "request fields are invalid"))?;
+            self.agent.submit(forwarded)
+        }
+
+        pub fn events(
+            &self,
+            job_id: &str,
+            after: u64,
+        ) -> Result<Vec<ProgressEvent>, ProtocolError> {
+            self.agent.events(job_id, after)
+        }
+
+        pub fn cancel(&self, job_id: &str) -> Result<(), ProtocolError> {
+            self.agent.cancel(job_id)
+        }
+    }
+
+    fn same_operation(left: &AppleRequest, right: &AppleRequest) -> bool {
+        left.version == right.version
+            && left.capability == right.capability
+            && left.workspace_path == right.workspace_path
+            && left.device_id == right.device_id
+            && left.operation == right.operation
+    }
+
+    fn append(state: &Arc<Mutex<State>>, job_id: &str, kind: &str, payload: &str, terminal: bool) {
+        let mut state = state.lock().unwrap();
+        let events = &mut state.jobs.get_mut(job_id).unwrap().events;
         if events.iter().any(|event| event.terminal) {
             return;
         }

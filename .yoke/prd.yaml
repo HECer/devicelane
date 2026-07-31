@@ -200,7 +200,7 @@
       sind über das Netzwerk nicht darstellbar
     - Progress, Cancel und Reconnect funktionieren während eines laufenden
       Fake-xcodebuild-Prozesses ohne doppelte Ausführung
-  passes: false
+  passes: true
   needs:
     - STORY-30
   area: remote-apple-agent
