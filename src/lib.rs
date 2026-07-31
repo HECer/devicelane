@@ -618,6 +618,7 @@ pub mod identity {
 
 pub mod secure_transport {
     use rand::{RngCore, rngs::OsRng};
+    use ring::{rand::SystemRandom, signature};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use rustls::{
         ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
@@ -748,6 +749,41 @@ pub mod secure_transport {
 
         pub fn machine_id(&self) -> &str {
             &self.id
+        }
+
+        pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, TransportError> {
+            let key = signature::EcdsaKeyPair::from_pkcs8(
+                &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+                &self.private_key,
+                &SystemRandom::new(),
+            )
+            .map_err(|_| TransportError::InvalidCertificate)?;
+            Ok(key
+                .sign(&SystemRandom::new(), message)
+                .map_err(|_| TransportError::InvalidCertificate)?
+                .as_ref()
+                .to_vec())
+        }
+
+        pub fn verify_peer_signature(
+            &self,
+            peer_id: &str,
+            message: &[u8],
+            signature_bytes: &[u8],
+        ) -> Result<(), TransportError> {
+            use x509_parser::prelude::FromDer;
+            let certificate = self
+                .trusted
+                .get(peer_id)
+                .ok_or(TransportError::UntrustedPeer)?;
+            let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate)
+                .map_err(|_| TransportError::InvalidCertificate)?;
+            signature::UnparsedPublicKey::new(
+                &signature::ECDSA_P256_SHA256_ASN1,
+                parsed.public_key().subject_public_key.data.as_ref(),
+            )
+            .verify(message, signature_bytes)
+            .map_err(|_| TransportError::InvalidCertificate)
         }
 
         pub fn issue_pairing_code(&mut self, lifetime: Duration) -> String {
@@ -3091,6 +3127,39 @@ pub mod network_processes {
         pub bytes: Vec<u8>,
     }
 
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(tag = "action", rename_all = "snake_case")]
+    pub enum LeaseRequest {
+        Acquire { device_id: String, lifetime_ms: u64 },
+        Renew { lease_id: String, lifetime_ms: u64 },
+        Queue { device_id: String, lifetime_ms: u64 },
+        Release { lease_id: String },
+        Revoke { lease_id: String },
+        Validate { grant: LeaseGrant },
+        Disconnect,
+        AgentDetach { device_id: String },
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub struct LeaseGrant {
+        pub lease_id: String,
+        pub device_id: String,
+        pub client_id: String,
+        pub job_id: String,
+        pub expires_at_ms: u64,
+        pub signature: Vec<u8>,
+    }
+
+    impl LeaseGrant {
+        pub fn signed_payload(&self) -> Vec<u8> {
+            format!(
+                "{}\0{}\0{}\0{}\0{}",
+                self.lease_id, self.device_id, self.client_id, self.job_id, self.expires_at_ms
+            )
+            .into_bytes()
+        }
+    }
+
     #[derive(Deserialize, Serialize)]
     #[serde(tag = "request", rename_all = "snake_case")]
     pub enum Request {
@@ -3146,6 +3215,9 @@ pub mod network_processes {
         ArtifactInfo {
             artifact_id: String,
         },
+        Lease {
+            operation: LeaseRequest,
+        },
     }
 
     #[derive(Deserialize, Serialize)]
@@ -3174,6 +3246,10 @@ pub mod network_processes {
         pub artifact_chunk: Option<ArtifactChunk>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub confirmed_offset: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub lease_grant: Option<LeaseGrant>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub lease_status: Option<String>,
     }
 }
 
@@ -5292,6 +5368,17 @@ pub mod remote_apple_protocol {
                     | Self::InstallApp { .. }
                     | Self::LaunchApp { .. }
                     | Self::ReadAppLogs { .. }
+                    | Self::RunXcTest { .. }
+            )
+        }
+
+        pub fn mutates_device(&self) -> bool {
+            matches!(
+                self,
+                Self::PhysicalDevice
+                    | Self::Diagnostics
+                    | Self::InstallApp { .. }
+                    | Self::LaunchApp { .. }
                     | Self::RunXcTest { .. }
             )
         }

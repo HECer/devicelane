@@ -160,6 +160,7 @@ fn main() {
                             host.capabilities.clone(),
                             host.devices.clone(),
                             Arc::clone(&running),
+                            response.lease_grant,
                         );
                     }
                 }
@@ -266,6 +267,7 @@ fn start_apple_job(
     capabilities: Vec<String>,
     devices: Vec<DeviceSnapshot>,
     running: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    lease_grant: Option<device_development_mesh::network_processes::LeaseGrant>,
 ) {
     let cancellation = CancellationToken::new();
     running
@@ -287,14 +289,41 @@ fn start_apple_job(
             .map(|device| device.id)
             .collect();
         let workspace = host_workspace.join(&operation.workspace_path);
-        let valid = AppleAgent::new(
-            &host_workspace,
-            capabilities.iter().cloned(),
-            devices.iter().cloned(),
-        )
-        .and_then(|agent| agent.validate(&operation))
-        .is_ok()
-            && lease_is_active(&host_workspace, &operation)
+        let grant_valid = if operation.operation.mutates_device() {
+            lease_grant.as_ref().is_some_and(|grant| {
+                grant.job_id == job_id
+                    && grant.device_id == operation.device_id.clone().unwrap_or_default()
+                    && grant.lease_id == operation.lease_id.clone().unwrap_or_default()
+                    && transport
+                        .verify_peer_signature(
+                            "registry",
+                            &grant.signed_payload(),
+                            &grant.signature,
+                        )
+                        .is_ok()
+                    && rpc(
+                        &registry,
+                        &transport,
+                        &Request::Lease {
+                            operation:
+                                device_development_mesh::network_processes::LeaseRequest::Validate {
+                                    grant: grant.clone(),
+                                },
+                        },
+                    )
+                    .is_some_and(|response| response.lease_status.as_deref() == Some("active"))
+            })
+        } else {
+            true
+        };
+        let valid = grant_valid
+            && AppleAgent::new(
+                &host_workspace,
+                capabilities.iter().cloned(),
+                devices.iter().cloned(),
+            )
+            .and_then(|agent| agent.validate(&operation))
+            .is_ok()
             && std::fs::canonicalize(&workspace)
                 .ok()
                 .is_some_and(|path| path.starts_with(&host_workspace));
@@ -492,33 +521,6 @@ fn rpc(registry: &str, transport: &SecureTransport, request: &Request) -> Option
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).ok()?;
     serde_json::from_str(&line).ok()
-}
-
-fn lease_is_active(
-    workspace: &std::path::Path,
-    operation: &device_development_mesh::remote_apple_protocol::AppleRequest,
-) -> bool {
-    if !operation.operation.requires_device() {
-        return operation.lease_id.is_none();
-    }
-    let (Some(device_id), Some(lease_id)) = (&operation.device_id, &operation.lease_id) else {
-        return false;
-    };
-    if !valid_component(device_id) || !valid_component(lease_id) {
-        return false;
-    }
-    workspace
-        .join(".leases")
-        .join(device_id)
-        .join(lease_id)
-        .is_file()
-}
-
-fn valid_component(value: &str) -> bool {
-    !value.is_empty()
-        && std::path::Path::new(value)
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn network_event(

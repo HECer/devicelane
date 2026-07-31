@@ -1,5 +1,5 @@
 use device_development_mesh::{
-    network_processes::{ManifestUpload, RunRequest},
+    network_processes::{LeaseRequest, ManifestUpload, RunRequest},
     remote_apple_protocol::{AppleOperation, AppleRequest, RemoteProtocolVersion},
     secure_transport::SecureTransport,
 };
@@ -133,17 +133,21 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
     .enumerate()
     {
         let requires_device = operation.requires_device();
-        let lease_id = requires_device.then(|| format!("lease-{index}"));
-        if let Some(lease_id) = &lease_id {
-            let device_id = "sim-1";
-            let lease = workspace_root
-                .join("mac-1/.leases")
-                .join(device_id)
-                .join(lease_id);
-            std::fs::create_dir_all(lease.parent().unwrap()).unwrap();
-            std::fs::write(lease, "client-1").unwrap();
-        }
-        let request = apple_request(index, operation.clone(), lease_id);
+        let lease_id = requires_device.then(|| {
+            cli_json(
+                &address,
+                &first_identity,
+                "lease",
+                &LeaseRequest::Acquire {
+                    device_id: "sim-1".into(),
+                    lifetime_ms: 30_000,
+                },
+            )["lease_grant"]["lease_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        });
+        let request = apple_request(index, operation.clone(), lease_id.clone());
         let accepted = cli_json(&address, &first_identity, "apple-run", &request);
         let job_id = accepted["job_id"].as_str().unwrap().to_owned();
         let terminal = wait_for_terminal(&address, &first_identity, &job_id);
@@ -167,6 +171,15 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
             format!("{:x}", Sha256::digest(&bytes))
         );
         assert!(!bytes.is_empty());
+        if let Some(lease_id) = lease_id {
+            let released = cli_json(
+                &address,
+                &first_identity,
+                "lease",
+                &LeaseRequest::Release { lease_id },
+            );
+            assert_eq!(released["lease_status"], "released");
+        }
     }
 
     let observed = cli_json(

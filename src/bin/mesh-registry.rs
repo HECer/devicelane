@@ -1,6 +1,6 @@
 use device_development_mesh::network_processes::{
-    ArtifactChunk, AuditRecord, HostSnapshot, NetworkArtifactMetadata, NetworkEvent, Request,
-    Response, RunRequest,
+    ArtifactChunk, AuditRecord, HostSnapshot, LeaseGrant, LeaseRequest, NetworkArtifactMetadata,
+    NetworkEvent, Request, Response, RunRequest,
 };
 use device_development_mesh::remote_apple_protocol::{AppleRequest, validate_request_envelope};
 use device_development_mesh::secure_transport::SecureTransport;
@@ -62,6 +62,67 @@ struct NetworkArtifacts {
     entries: HashMap<String, NetworkArtifact>,
 }
 
+struct DeviceLease {
+    id: String,
+    device_id: String,
+    client_id: String,
+    expires: Instant,
+}
+
+struct WaitingLease {
+    device_id: String,
+    client_id: String,
+    lifetime: Duration,
+}
+
+#[derive(Default)]
+struct LeaseBook {
+    next_id: u64,
+    active: HashMap<String, DeviceLease>,
+    waiting: Vec<WaitingLease>,
+}
+
+impl LeaseBook {
+    fn expire(&mut self) {
+        let expired: Vec<_> = self
+            .active
+            .iter()
+            .filter(|(_, lease)| Instant::now() >= lease.expires)
+            .map(|(device, _)| device.clone())
+            .collect();
+        for device in expired {
+            self.release_device(&device);
+        }
+    }
+
+    fn release_device(&mut self, device_id: &str) {
+        self.active.remove(device_id);
+        if let Some(index) = self
+            .waiting
+            .iter()
+            .position(|waiting| waiting.device_id == device_id)
+        {
+            let waiting = self.waiting.remove(index);
+            self.insert(waiting.device_id, waiting.client_id, waiting.lifetime);
+        }
+    }
+
+    fn insert(&mut self, device_id: String, client_id: String, lifetime: Duration) -> String {
+        self.next_id += 1;
+        let id = format!("lease-{}", self.next_id);
+        self.active.insert(
+            device_id.clone(),
+            DeviceLease {
+                id: id.clone(),
+                device_id,
+                client_id,
+                expires: Instant::now() + lifetime,
+            },
+        );
+        id
+    }
+}
+
 impl NetworkArtifacts {
     fn new(root: PathBuf) -> Self {
         fs::create_dir_all(&root).unwrap();
@@ -95,12 +156,14 @@ fn main() {
     let artifacts = Arc::new(Mutex::new(NetworkArtifacts::new(
         identity.join("artifacts"),
     )));
+    let leases = Arc::new(Mutex::new(LeaseBook::default()));
     for stream in listener.incoming() {
-        let (transport, entries, state, artifacts, state_path) = (
+        let (transport, entries, state, artifacts, leases, state_path) = (
             Arc::clone(&transport),
             Arc::clone(&entries),
             Arc::clone(&state),
             Arc::clone(&artifacts),
+            Arc::clone(&leases),
             state_path.clone(),
         );
         thread::spawn(move || {
@@ -111,12 +174,14 @@ fn main() {
                 entries,
                 state,
                 artifacts,
+                leases,
                 &state_path,
             )
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle(
     stream: TcpStream,
     transport: &SecureTransport,
@@ -124,6 +189,7 @@ fn handle(
     entries: Arc<Mutex<HashMap<String, Entry>>>,
     state: Arc<Mutex<DurableState>>,
     artifacts: Arc<Mutex<NetworkArtifacts>>,
+    leases: Arc<Mutex<LeaseBook>>,
     state_path: &Path,
 ) {
     stream
@@ -163,11 +229,30 @@ fn handle(
             entries.lock().unwrap().insert(
                 host.id.clone(),
                 Entry {
-                    host,
+                    host: host.clone(),
                     heartbeat: Instant::now(),
                 },
             );
             let mut response = response();
+            {
+                let connected: HashSet<_> = host
+                    .devices
+                    .iter()
+                    .filter(|device| device.state == "connected")
+                    .map(|device| device.id.clone())
+                    .collect();
+                let detached: Vec<_> = leases
+                    .lock()
+                    .unwrap()
+                    .active
+                    .keys()
+                    .filter(|device| !connected.contains(*device))
+                    .cloned()
+                    .collect();
+                for device in detached {
+                    leases.lock().unwrap().release_device(&device);
+                }
+            }
             let mut state = state.lock().unwrap();
             state.host_peers.insert(host_id.clone(), peer_id.clone());
             if let Some((job_id, operation)) = state
@@ -194,6 +279,35 @@ fn handle(
                 state.dispatched.insert(job_id.clone());
                 response.apple_operation = Some(operation);
                 response.job_id = Some(job_id);
+                if let Some(request) = response.apple_operation.as_ref()
+                    && request.operation.mutates_device()
+                    && let (Some(device_id), Some(lease_id)) =
+                        (request.device_id.as_ref(), request.lease_id.as_ref())
+                {
+                    let mut leases = leases.lock().unwrap();
+                    leases.expire();
+                    if let Some(lease) = leases.active.get(device_id)
+                        && &lease.id == lease_id
+                        && state.job_clients.get(response.job_id.as_ref().unwrap())
+                            == Some(&lease.client_id)
+                    {
+                        let mut grant = LeaseGrant {
+                            lease_id: lease.id.clone(),
+                            device_id: lease.device_id.clone(),
+                            client_id: lease.client_id.clone(),
+                            job_id: response.job_id.clone().unwrap(),
+                            expires_at_ms: lease
+                                .expires
+                                .saturating_duration_since(Instant::now())
+                                .as_millis() as u64,
+                            signature: Vec::new(),
+                        };
+                        grant.signature = transport.sign(&grant.signed_payload()).unwrap();
+                        response.lease_grant = Some(grant);
+                    } else {
+                        response.apple_operation = None;
+                    }
+                }
             }
             response.cancel_jobs = state.cancelled.iter().cloned().collect();
             response
@@ -298,6 +412,18 @@ fn handle(
                         ..response()
                     },
                 );
+            }
+            if operation.operation.mutates_device() {
+                let mut leases = leases.lock().unwrap();
+                leases.expire();
+                let active = operation.device_id.as_ref().is_some_and(|device_id| {
+                    leases.active.get(device_id).is_some_and(|lease| {
+                        operation.lease_id.as_ref() == Some(&lease.id) && lease.client_id == peer_id
+                    })
+                });
+                if !active {
+                    return write_response(&mut stream, error_response("lease_inactive"));
+                }
             }
             let mut state = state.lock().unwrap();
             let job_id = if let Some(job_id) = state.apple_requests.get(&operation.idempotency_key)
@@ -508,9 +634,172 @@ fn handle(
                 }
             }
         }
+        Request::Lease { operation } => {
+            lease(operation, &peer_id, &mut leases.lock().unwrap(), transport)
+        }
     };
     let _ = serde_json::to_writer(&mut stream, &response);
     let _ = stream.write_all(b"\n");
+}
+
+fn lease(
+    operation: LeaseRequest,
+    peer_id: &str,
+    leases: &mut LeaseBook,
+    transport: &SecureTransport,
+) -> Response {
+    leases.expire();
+    let result = match operation {
+        LeaseRequest::Acquire {
+            device_id,
+            lifetime_ms,
+        } => {
+            if leases.active.contains_key(&device_id) {
+                return error_response("device_already_leased");
+            }
+            let id = leases.insert(
+                device_id.clone(),
+                peer_id.into(),
+                Duration::from_millis(lifetime_ms),
+            );
+            (id, "acquired")
+        }
+        LeaseRequest::Queue {
+            device_id,
+            lifetime_ms,
+        } => {
+            if let Some(active) = leases.active.get(&device_id) {
+                if active.client_id == peer_id {
+                    (active.id.clone(), "acquired")
+                } else {
+                    if !leases.waiting.iter().any(|waiting| {
+                        waiting.device_id == device_id && waiting.client_id == peer_id
+                    }) {
+                        leases.waiting.push(WaitingLease {
+                            device_id,
+                            client_id: peer_id.into(),
+                            lifetime: Duration::from_millis(lifetime_ms),
+                        });
+                    }
+                    return Response {
+                        lease_status: Some("queued".into()),
+                        ..response()
+                    };
+                }
+            } else {
+                let id = leases.insert(
+                    device_id,
+                    peer_id.into(),
+                    Duration::from_millis(lifetime_ms),
+                );
+                (id, "acquired")
+            }
+        }
+        LeaseRequest::Renew {
+            lease_id,
+            lifetime_ms,
+        } => {
+            let Some(lease) = leases
+                .active
+                .values_mut()
+                .find(|lease| lease.id == lease_id && lease.client_id == peer_id)
+            else {
+                return error_response("lease_inactive");
+            };
+            lease.expires = Instant::now() + Duration::from_millis(lifetime_ms);
+            (lease.id.clone(), "renewed")
+        }
+        LeaseRequest::Release { lease_id } => {
+            let Some(device) = leases
+                .active
+                .values()
+                .find(|lease| lease.id == lease_id && lease.client_id == peer_id)
+                .map(|lease| lease.device_id.clone())
+            else {
+                return error_response("lease_inactive");
+            };
+            leases.release_device(&device);
+            return Response {
+                lease_status: Some("released".into()),
+                ..response()
+            };
+        }
+        LeaseRequest::Revoke { lease_id } => {
+            let Some(device) = leases
+                .active
+                .values()
+                .find(|lease| lease.id == lease_id && lease.client_id == peer_id)
+                .map(|lease| lease.device_id.clone())
+            else {
+                return error_response("lease_inactive");
+            };
+            leases.release_device(&device);
+            return Response {
+                lease_status: Some("revoked".into()),
+                ..response()
+            };
+        }
+        LeaseRequest::Validate { grant } => {
+            let active = leases.active.get(&grant.device_id).is_some_and(|lease| {
+                lease.id == grant.lease_id && lease.client_id == grant.client_id
+            });
+            return if active {
+                Response {
+                    lease_status: Some("active".into()),
+                    ..response()
+                }
+            } else {
+                error_response("lease_inactive")
+            };
+        }
+        LeaseRequest::Disconnect => {
+            let devices: Vec<_> = leases
+                .active
+                .values()
+                .filter(|lease| lease.client_id == peer_id)
+                .map(|lease| lease.device_id.clone())
+                .collect();
+            leases
+                .waiting
+                .retain(|waiting| waiting.client_id != peer_id);
+            for device in devices {
+                leases.release_device(&device);
+            }
+            return Response {
+                lease_status: Some("disconnected".into()),
+                ..response()
+            };
+        }
+        LeaseRequest::AgentDetach { device_id } => {
+            leases.release_device(&device_id);
+            return Response {
+                lease_status: Some("detached".into()),
+                ..response()
+            };
+        }
+    };
+    let lease = leases
+        .active
+        .values()
+        .find(|lease| lease.id == result.0)
+        .unwrap();
+    let mut grant = LeaseGrant {
+        lease_id: lease.id.clone(),
+        device_id: lease.device_id.clone(),
+        client_id: lease.client_id.clone(),
+        job_id: String::new(),
+        expires_at_ms: lease
+            .expires
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64,
+        signature: Vec::new(),
+    };
+    grant.signature = transport.sign(&grant.signed_payload()).unwrap();
+    Response {
+        lease_grant: Some(grant),
+        lease_status: Some(result.1.into()),
+        ..response()
+    }
 }
 
 fn run(operation: RunRequest, shared: &Mutex<DurableState>, state_path: &Path) -> Response {
@@ -593,6 +882,8 @@ fn response() -> Response {
         artifact_metadata: None,
         artifact_chunk: None,
         confirmed_offset: None,
+        lease_grant: None,
+        lease_status: None,
     }
 }
 

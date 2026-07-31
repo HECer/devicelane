@@ -1,6 +1,6 @@
 use device_development_mesh::{
     apple_discovery::AppleDiscovery,
-    network_processes::{Request, Response, RunRequest},
+    network_processes::{LeaseRequest, Request, Response, RunRequest},
     preflight::{AppleTool, AppleToolRunner},
     secure_transport::SecureTransport,
 };
@@ -109,7 +109,7 @@ fn main() {
         .find(|item| {
             matches!(
                 item.as_str(),
-                "list" | "run" | "events" | "apple-run" | "apple-cancel"
+                "list" | "run" | "events" | "apple-run" | "apple-cancel" | "lease"
             )
         })
         .map(String::as_str)
@@ -137,6 +137,9 @@ fn main() {
                 job_id: body["job_id"].as_str().unwrap().into(),
             }
         }
+        "lease" => Request::Lease {
+            operation: serde_json::from_str::<LeaseRequest>(&value(&a, "--json-request")).unwrap(),
+        },
         _ => unreachable!(),
     };
     serde_json::to_writer(&mut stream, &request).unwrap();
