@@ -773,6 +773,7 @@ fn windows_acl_restrictive(path: &Path, account: &str) -> bool {
                         .is_some_and(|prefix| prefix.ends_with(char::is_whitespace))
                     || principal.ends_with("\\system")
                     || principal.contains("\\logonsessionid_")
+                    || principal.contains("mandatory label\\")
             })
         })
 }

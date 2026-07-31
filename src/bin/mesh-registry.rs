@@ -1178,7 +1178,8 @@ fn run(operation: RunRequest, shared: &Mutex<DurableState>, state_path: &Path) -
     drop(state);
     // Keep the legacy synchronous manifest RPC tolerant of a busy development
     // host. New Apple jobs are accepted asynchronously and do not use this wait.
-    for _ in 0..1500 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
         if let Some(response) = {
             let state = shared.lock().unwrap();
             state

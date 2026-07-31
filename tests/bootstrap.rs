@@ -45,6 +45,7 @@ fn doctor_rejects_an_additional_windows_acl_principal() {
     }
 }
 
+#[cfg(windows)]
 fn doctor(identity: &std::path::Path) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
         .args(["doctor", "--identity", identity.to_str().unwrap()])
@@ -54,6 +55,7 @@ fn doctor(identity: &std::path::Path) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+#[cfg(windows)]
 fn permission_status(report: &Value) -> &str {
     report["checks"]
         .as_array()
