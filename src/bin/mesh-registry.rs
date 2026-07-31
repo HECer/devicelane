@@ -1,13 +1,14 @@
 use device_development_mesh::network_processes::{
-    AuditRecord, HostSnapshot, NetworkEvent, Request, Response, RunRequest,
+    ArtifactChunk, AuditRecord, HostSnapshot, NetworkArtifactMetadata, NetworkEvent, Request,
+    Response, RunRequest,
 };
 use device_development_mesh::remote_apple_protocol::{AppleRequest, validate_request_envelope};
 use device_development_mesh::secure_transport::SecureTransport;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    fs,
-    io::{BufRead, BufReader, Write},
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::{TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
@@ -33,12 +34,46 @@ struct DurableState {
     apple_requests: HashMap<String, String>,
     apple_operations: HashMap<String, AppleRequest>,
     apple_hosts: HashMap<String, String>,
+    #[serde(default)]
+    job_clients: HashMap<String, String>,
+    #[serde(default)]
+    job_agents: HashMap<String, String>,
+    #[serde(skip)]
+    host_peers: HashMap<String, String>,
     #[serde(skip)]
     dispatched: HashSet<String>,
     #[serde(skip)]
     cancelled: HashSet<String>,
     #[serde(skip)]
     recovery_error: Option<String>,
+}
+
+const MAX_ARTIFACT_CHUNK: u64 = 64 * 1024;
+
+struct NetworkArtifact {
+    metadata: NetworkArtifactMetadata,
+    participants: HashSet<String>,
+    confirmed_offset: u64,
+    published: bool,
+}
+
+struct NetworkArtifacts {
+    root: PathBuf,
+    entries: HashMap<String, NetworkArtifact>,
+}
+
+impl NetworkArtifacts {
+    fn new(root: PathBuf) -> Self {
+        fs::create_dir_all(&root).unwrap();
+        Self {
+            root,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.partial"))
+    }
 }
 
 fn main() {
@@ -57,11 +92,15 @@ fn main() {
     let entries = Arc::new(Mutex::new(HashMap::new()));
     let state_path = identity.join("vertical-slice.json");
     let state = Arc::new(Mutex::new(load_state(&state_path)));
+    let artifacts = Arc::new(Mutex::new(NetworkArtifacts::new(
+        identity.join("artifacts"),
+    )));
     for stream in listener.incoming() {
-        let (transport, entries, state, state_path) = (
+        let (transport, entries, state, artifacts, state_path) = (
             Arc::clone(&transport),
             Arc::clone(&entries),
             Arc::clone(&state),
+            Arc::clone(&artifacts),
             state_path.clone(),
         );
         thread::spawn(move || {
@@ -71,6 +110,7 @@ fn main() {
                 offline,
                 entries,
                 state,
+                artifacts,
                 &state_path,
             )
         });
@@ -83,6 +123,7 @@ fn handle(
     offline: Duration,
     entries: Arc<Mutex<HashMap<String, Entry>>>,
     state: Arc<Mutex<DurableState>>,
+    artifacts: Arc<Mutex<NetworkArtifacts>>,
     state_path: &Path,
 ) {
     stream
@@ -94,8 +135,22 @@ fn handle(
     let Ok(mut stream) = transport.accept_tls(stream) else {
         return;
     };
+    let Some(peer_certificate) = stream
+        .conn
+        .peer_certificates()
+        .and_then(|items| items.first())
+    else {
+        return;
+    };
+    let Ok(peer_id) = transport.peer_id(peer_certificate.as_ref()) else {
+        return;
+    };
     let mut line = String::new();
-    if BufReader::new(&mut stream).read_line(&mut line).is_err() {
+    if BufReader::new(&mut stream)
+        .take(512 * 1024)
+        .read_line(&mut line)
+        .is_err()
+    {
         return;
     }
     let Ok(request) = serde_json::from_str(&line) else {
@@ -114,6 +169,7 @@ fn handle(
             );
             let mut response = response();
             let mut state = state.lock().unwrap();
+            state.host_peers.insert(host_id.clone(), peer_id.clone());
             if let Some((job_id, operation)) = state
                 .pending
                 .iter()
@@ -297,6 +353,15 @@ fn handle(
                     .insert(operation.idempotency_key.clone(), operation.clone());
                 state.apple_pending.insert(job_id.clone(), operation);
                 state.apple_hosts.insert(job_id.clone(), target);
+                state.job_clients.insert(job_id.clone(), peer_id.clone());
+                if let Some(agent) = state
+                    .apple_hosts
+                    .get(&job_id)
+                    .and_then(|host| state.host_peers.get(host))
+                    .cloned()
+                {
+                    state.job_agents.insert(job_id.clone(), agent);
+                }
                 state.jobs.insert(job_id.clone(), Vec::new());
                 fs::write(state_path, serde_json::to_vec(&*state).unwrap()).unwrap();
                 job_id
@@ -341,6 +406,92 @@ fn handle(
                 }
             }
         }
+        Request::ArtifactRegister {
+            job_id,
+            name,
+            media_type,
+            total_size,
+            sha256,
+        } => {
+            let state = state.lock().unwrap();
+            let host_peer = state.job_agents.get(&job_id);
+            if host_peer != Some(&peer_id) {
+                error_response("artifact_access_denied")
+            } else if total_size == 0
+                || sha256.len() != 64
+                || !valid_id(&name)
+                || media_type.is_empty()
+            {
+                error_response("invalid_artifact_metadata")
+            } else {
+                let id = format!(
+                    "{:x}",
+                    Sha256::digest(format!("{job_id}\0{name}\0{sha256}").as_bytes())
+                );
+                let mut participants = HashSet::from([peer_id.clone()]);
+                if let Some(client) = state.job_clients.get(&job_id) {
+                    participants.insert(client.clone());
+                }
+                drop(state);
+                let metadata = NetworkArtifactMetadata {
+                    id: id.clone(),
+                    job_id,
+                    name,
+                    media_type,
+                    total_size,
+                    sha256,
+                };
+                artifacts
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .entry(id)
+                    .or_insert_with(|| NetworkArtifact {
+                        metadata: metadata.clone(),
+                        participants,
+                        confirmed_offset: 0,
+                        published: false,
+                    });
+                Response {
+                    artifact_metadata: Some(metadata),
+                    ..response()
+                }
+            }
+        }
+        Request::ArtifactWrite {
+            artifact_id,
+            offset,
+            total_size,
+            sha256,
+            chunk_sha256,
+            bytes,
+        } => write_artifact(
+            &mut artifacts.lock().unwrap(),
+            &peer_id,
+            &artifact_id,
+            offset,
+            ArtifactWrite {
+                total_size,
+                sha256: &sha256,
+                chunk_sha256: &chunk_sha256,
+                bytes: &bytes,
+            },
+        ),
+        Request::ArtifactRead {
+            artifact_id,
+            offset,
+            length,
+            total_size,
+            sha256,
+        } => read_artifact(
+            &artifacts.lock().unwrap(),
+            &peer_id,
+            &artifact_id,
+            offset,
+            length,
+            total_size,
+            &sha256,
+        ),
     };
     let _ = serde_json::to_writer(&mut stream, &response);
     let _ = stream.write_all(b"\n");
@@ -421,6 +572,172 @@ fn response() -> Response {
         operation: None,
         apple_operation: None,
         cancel_jobs: vec![],
+        artifact_metadata: None,
+        artifact_chunk: None,
+        confirmed_offset: None,
+    }
+}
+
+fn error_response(error: &str) -> Response {
+    Response {
+        accepted: false,
+        error: Some(error.into()),
+        ..response()
+    }
+}
+
+struct ArtifactWrite<'a> {
+    total_size: u64,
+    sha256: &'a str,
+    chunk_sha256: &'a str,
+    bytes: &'a [u8],
+}
+
+fn write_artifact(
+    store: &mut NetworkArtifacts,
+    peer_id: &str,
+    artifact_id: &str,
+    offset: u64,
+    write: ArtifactWrite<'_>,
+) -> Response {
+    let Some(entry) = store.entries.get(artifact_id) else {
+        return error_response("unknown_artifact");
+    };
+    if !entry.participants.contains(peer_id) {
+        return error_response("artifact_access_denied");
+    }
+    if write.total_size != entry.metadata.total_size || write.sha256 != entry.metadata.sha256 {
+        return error_response("artifact_metadata_mismatch");
+    }
+    if write.bytes.is_empty()
+        || write.bytes.len() as u64 > MAX_ARTIFACT_CHUNK
+        || offset.saturating_add(write.bytes.len() as u64) > write.total_size
+    {
+        return error_response("invalid_chunk_length");
+    }
+    if format!("{:x}", Sha256::digest(write.bytes)) != write.chunk_sha256 {
+        return error_response("chunk_hash_mismatch");
+    }
+    let path = store.path(artifact_id);
+    if offset < entry.confirmed_offset {
+        if offset + write.bytes.len() as u64 > entry.confirmed_offset {
+            return error_response("invalid_offset");
+        }
+        let mut existing = vec![0; write.bytes.len()];
+        let read_matches = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .and_then(|mut file| {
+                file.seek(SeekFrom::Start(offset))?;
+                file.read_exact(&mut existing)
+            })
+            .is_ok()
+            && existing == write.bytes;
+        return if read_matches {
+            Response {
+                confirmed_offset: Some(entry.confirmed_offset),
+                ..response()
+            }
+        } else {
+            error_response("chunk_conflict")
+        };
+    }
+    if offset != entry.confirmed_offset {
+        return error_response("invalid_offset");
+    }
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(_) => return error_response("artifact_io"),
+    };
+    if file.write_all(write.bytes).is_err() {
+        return error_response("artifact_io");
+    }
+    let next_offset = entry.confirmed_offset + write.bytes.len() as u64;
+    if next_offset == entry.metadata.total_size {
+        let Ok(aggregate_hash) = hash_file(&path) else {
+            return error_response("artifact_io");
+        };
+        if aggregate_hash != entry.metadata.sha256 {
+            if OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(entry.confirmed_offset))
+                .is_err()
+            {
+                return error_response("artifact_io");
+            }
+            return error_response("artifact_hash_mismatch");
+        }
+    }
+    let entry = store.entries.get_mut(artifact_id).unwrap();
+    entry.confirmed_offset = next_offset;
+    if next_offset == entry.metadata.total_size {
+        entry.published = true;
+    }
+    Response {
+        confirmed_offset: Some(entry.confirmed_offset),
+        ..response()
+    }
+}
+
+fn hash_file(path: &Path) -> std::io::Result<String> {
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; MAX_ARTIFACT_CHUNK as usize];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn read_artifact(
+    store: &NetworkArtifacts,
+    peer_id: &str,
+    artifact_id: &str,
+    offset: u64,
+    length: u64,
+    total_size: u64,
+    sha256: &str,
+) -> Response {
+    let Some(entry) = store.entries.get(artifact_id) else {
+        return error_response("unknown_artifact");
+    };
+    if !entry.participants.contains(peer_id) {
+        return error_response("artifact_access_denied");
+    }
+    if !entry.published {
+        return error_response("artifact_not_published");
+    }
+    if total_size != entry.metadata.total_size || sha256 != entry.metadata.sha256 {
+        return error_response("artifact_metadata_mismatch");
+    }
+    if length == 0 || length > MAX_ARTIFACT_CHUNK || offset >= total_size {
+        return error_response("invalid_offset");
+    }
+    let read_length = length.min(total_size - offset) as usize;
+    let mut bytes = vec![0; read_length];
+    let result = OpenOptions::new()
+        .read(true)
+        .open(store.path(artifact_id))
+        .and_then(|mut file| {
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut bytes)
+        });
+    if result.is_err() {
+        return error_response("artifact_io");
+    }
+    Response {
+        artifact_chunk: Some(ArtifactChunk {
+            offset,
+            total_size,
+            sha256: sha256.into(),
+            bytes,
+        }),
+        ..response()
     }
 }
 fn write_response(stream: &mut impl Write, response: Response) {

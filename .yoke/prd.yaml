@@ -191,8 +191,9 @@
   acceptance:
     - tests/remote_apple_agent.rs startet die gebauten mesh-registry-,
       mesh-agent- und mesh-cli-Binaries als getrennte Betriebssystemprozesse,
-      paart sie über echtes mTLS und beweist mit einem Marker im Agent-Workspace,
-      dass ein typisierter Apple-Job ausschließlich dort AppleToolRunner ausführt
+      paart sie über echtes mTLS und beweist mit einem Marker im
+      Agent-Workspace, dass ein typisierter Apple-Job ausschließlich dort
+      AppleToolRunner ausführt
     - Der Test muss den Apple-Request über die öffentliche network_processes-
       Request-Nachricht und den CLI-Socket senden; ein direkter Aufruf von
       RemoteAppleRegistry oder RemoteAppleAgent allein erfüllt die Story nicht
@@ -221,7 +222,7 @@
       gibt Artefakte nur an autorisierte Teilnehmer des Jobs aus
     - Manipulierte Chunks, unbekannte Artefakte und ungültige Offsets liefern
       stabile Fehler ohne Teildatei als erfolgreich zu markieren
-  passes: false
+  passes: true
   needs:
     - STORY-31
   area: remote-artifacts
