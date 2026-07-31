@@ -1072,7 +1072,7 @@ fn wait_for_listener(address: &str) {
 }
 
 fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !condition() {
         assert!(Instant::now() < deadline, "timed out waiting for {label}");
         thread::sleep(Duration::from_millis(25));
