@@ -1,5 +1,6 @@
 use device_development_mesh::{
     apple_discovery::AppleDiscovery,
+    mac_bootstrap::validate_production_launch_agent,
     network_processes::{LeaseRequest, Request, Response, RunRequest},
     preflight::{AppleTool, AppleToolRunner},
     secure_transport::SecureTransport,
@@ -21,6 +22,21 @@ fn main() {
     }
     if a.first().map(String::as_str) == Some("doctor") {
         doctor(Path::new(&value(&a, "--identity")));
+        return;
+    }
+    if a.first().map(String::as_str) == Some("validate-launch-agent") {
+        let plist = fs::read_to_string(value(&a, "--plist")).unwrap();
+        let tools = values(&a, "--tool");
+        let tool_refs: Vec<_> = tools.iter().map(String::as_str).collect();
+        if let Err(error) = validate_production_launch_agent(
+            &plist,
+            &value(&a, "--controller-host"),
+            &value(&a, "--developer-dir"),
+            &tool_refs,
+        ) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
         return;
     }
     if a.first().map(String::as_str) == Some("apple-discover") {
@@ -188,6 +204,12 @@ fn value(a: &[String], n: &str) -> String {
         .and_then(|i| a.get(i + 1))
         .unwrap()
         .clone()
+}
+fn values(a: &[String], n: &str) -> Vec<String> {
+    a.windows(2)
+        .filter(|pair| pair[0] == n)
+        .map(|pair| pair[1].clone())
+        .collect()
 }
 fn metadata(a: &[String]) -> bool {
     if a == ["--help"] {

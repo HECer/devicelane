@@ -886,6 +886,10 @@ pub mod secure_transport {
             certificate_dns_name(certificate)
         }
 
+        pub fn identity_id(&self) -> Result<String, TransportError> {
+            certificate_dns_name(&self.certificate)
+        }
+
         pub fn connect_tls(
             &self,
             mut stream: TcpStream,
@@ -6042,3 +6046,4 @@ mod tests {
         assert_eq!(env!("CARGO_PKG_NAME"), "device-development-mesh");
     }
 }
+pub mod mac_bootstrap;

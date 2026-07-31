@@ -1,5 +1,5 @@
+use device_development_mesh::mac_bootstrap::validate_production_launch_agent;
 use std::fs;
-#[cfg(unix)]
 use std::process::Command;
 
 #[test]
@@ -63,10 +63,9 @@ fn launch_agent_is_restricted_absolute_and_contains_no_secrets() {
 
 #[test]
 fn production_launch_agent_uses_resolved_apple_tools_without_dummy_devices() {
-    let setup = fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-mac.sh"),
-    )
-    .unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let setup = fs::read_to_string(root.join("scripts/setup-mac.sh")).unwrap();
+    let agent = fs::read_to_string(root.join("src/bin/mesh-agent.rs")).unwrap();
 
     for tool in [
         "xcodebuild",
@@ -77,18 +76,33 @@ fn production_launch_agent_uses_resolved_apple_tools_without_dummy_devices() {
         "lldb-dap",
     ] {
         assert!(
-            setup.contains(&format!("xcrun --find {tool}")),
+            setup.contains(&format!("--find {tool}")),
             "setup must resolve {tool} through xcrun"
         );
     }
-    for argument in ["--xcodebuild", "--devicectl", "--simctl"] {
+    for argument in [
+        "--xcodebuild",
+        "--devicectl",
+        "--simctl",
+        "--xcresulttool",
+        "--xctrace",
+        "--lldb-dap",
+    ] {
         assert!(
             setup.contains(argument),
             "LaunchAgent must receive {argument}"
         );
+        assert!(
+            agent.contains(&format!("optional_value(&args, \"{argument}\")")),
+            "mesh-agent must consume {argument}"
+        );
     }
     assert!(!setup.contains("<string>process.start@1</string>"));
     assert!(!setup.contains("<string>none:ios:disconnected</string>"));
+    assert!(agent.contains("optional_value(&args, \"--peer-id\")"));
+    assert!(setup.contains("--agent-peer $PEER_ID"));
+    assert!(setup.contains("/usr/bin/uuidgen"));
+    assert!(setup.contains("<string>--peer-id</string>"));
 }
 
 #[test]
@@ -101,6 +115,108 @@ fn production_install_rejects_loopback_controller_and_unresolved_tools() {
     assert!(setup.contains("production controller must not use loopback"));
     assert!(setup.contains("unable to resolve required Apple tool"));
     assert!(setup.contains("test -x"));
+    assert!(setup.contains("MESH_BOOTSTRAP_TEST_MODE"));
+    assert!(setup.contains("PLIST_STAGE"));
+    assert!(setup.contains("\"$PLUTIL\" -lint \"$PLIST_STAGE\""));
+    assert!(setup.contains("mv \"$PLIST_STAGE\" \"$PLIST_PATH\""));
+}
+
+#[test]
+fn rendered_production_plist_rejects_fake_loopback_and_unresolved_configuration() {
+    let setup = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-mac.sh"),
+    )
+    .unwrap();
+    let template = setup
+        .split("cat >\"$PLIST_STAGE\" <<EOF\n")
+        .nth(1)
+        .and_then(|tail| tail.split("\nEOF").next())
+        .expect("setup must render one staged LaunchAgent plist");
+    let developer = "/Applications/Xcode.app/Contents/Developer";
+    let tools = [
+        format!("{developer}/usr/bin/xcodebuild"),
+        format!("{developer}/usr/bin/devicectl"),
+        format!("{developer}/usr/bin/simctl"),
+        format!("{developer}/usr/bin/xcresulttool"),
+        format!("{developer}/usr/bin/xctrace"),
+        format!("{developer}/usr/bin/lldb-dap"),
+    ];
+    let mut rendered = template
+        .replace("$PLIST_PROGRAM_PATH", "/Users/dev/.local/bin/mesh-agent")
+        .replace("$PLIST_REGISTRY_ADDRESS", "192.0.2.10:7443")
+        .replace(
+            "$PLIST_IDENTITY_DIR",
+            "/Users/dev/Library/Application Support/Mesh/identity",
+        )
+        .replace(
+            "$PLIST_PEER_ID",
+            "mac-agent-11111111-1111-1111-1111-111111111111",
+        )
+        .replace(
+            "$PLIST_WORKSPACE_DIR",
+            "/Users/dev/Library/Application Support/Mesh/workspaces",
+        )
+        .replace("$PLIST_LOG_DIR", "/Users/dev/Library/Logs/Mesh")
+        .replace("$PLIST_XCODEBUILD", &tools[0])
+        .replace("$PLIST_DEVICECTL", &tools[1])
+        .replace("$PLIST_SIMCTL", &tools[2])
+        .replace("$PLIST_XCRESULTTOOL", &tools[3])
+        .replace("$PLIST_XCTRACE", &tools[4])
+        .replace("$PLIST_LLDB_DAP", &tools[5])
+        .replace("$(uname -m)", "arm64");
+    let tool_refs: Vec<_> = tools.iter().map(String::as_str).collect();
+
+    assert!(
+        validate_production_launch_agent(&rendered, "192.0.2.10", developer, &tool_refs).is_ok()
+    );
+    let loopback_plist = rendered.replace("192.0.2.10:7443", "127.0.0.1:7443");
+    assert!(
+        validate_production_launch_agent(&loopback_plist, "127.0.0.1", developer, &tool_refs)
+            .is_err()
+    );
+    assert!(
+        validate_production_launch_agent(&loopback_plist, "192.0.2.10", developer, &tool_refs)
+            .is_err()
+    );
+    for loopback in ["LOCALHOST", "0:0:0:0:0:0:0:1", "0.0.0.0"] {
+        assert!(
+            validate_production_launch_agent(&rendered, loopback, developer, &tool_refs).is_err(),
+            "accepted loopback controller {loopback}"
+        );
+    }
+    let mut fake_tools = tool_refs.clone();
+    fake_tools[0] = "/tmp/fake-xcodebuild";
+    assert!(
+        validate_production_launch_agent(&rendered, "192.0.2.10", developer, &fake_tools).is_err()
+    );
+    rendered.push_str("$PLIST_UNRESOLVED");
+    assert!(
+        validate_production_launch_agent(&rendered, "192.0.2.10", developer, &tool_refs).is_err()
+    );
+}
+
+#[test]
+fn fresh_agent_identity_reports_and_reuses_its_unique_peer_id() {
+    let identity = tempfile::tempdir().unwrap();
+    let expected = "mac-agent-11111111-2222-3333-4444-555555555555";
+    for _ in 0..2 {
+        let output = Command::new(env!("CARGO_BIN_EXE_mesh-agent"))
+            .args([
+                "peer-id",
+                "--identity",
+                identity.path().to_str().unwrap(),
+                "--peer-id",
+                expected,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+    }
 }
 
 #[test]

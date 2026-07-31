@@ -17,15 +17,23 @@ use std::{
     time::{Duration, Instant},
 };
 const NAME: &str = "mesh-agent";
+const DEFAULT_PEER_ID: &str = "agent";
 const REGISTRY_RPC_TIMEOUT: Duration = Duration::from_millis(250);
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let peer_id = optional_value(&args, "--peer-id").unwrap_or_else(|| DEFAULT_PEER_ID.into());
     if metadata(&args) {
+        return;
+    }
+    if args.first().map(String::as_str) == Some("peer-id") {
+        let identity =
+            SecureTransport::load_or_create(value(&args, "--identity"), &peer_id).unwrap();
+        println!("{}", identity.identity_id().unwrap());
         return;
     }
     if args.first().map(String::as_str) == Some("pair") {
         let mut identity =
-            SecureTransport::load_or_create(value(&args, "--identity"), "agent").unwrap();
+            SecureTransport::load_or_create(value(&args, "--identity"), &peer_id).unwrap();
         let mut reader = BufReader::new(TcpStream::connect(value(&args, "--address")).unwrap());
         let mut challenge = String::new();
         reader.read_line(&mut challenge).unwrap();
@@ -64,7 +72,7 @@ fn main() {
     }
     let registry = value(&args, "--registry");
     let transport =
-        Arc::new(SecureTransport::load_or_create(value(&args, "--identity"), "agent").unwrap());
+        Arc::new(SecureTransport::load_or_create(value(&args, "--identity"), &peer_id).unwrap());
     let interval = Duration::from_millis(value(&args, "--heartbeat-ms").parse().unwrap());
     let workspace_root = std::path::PathBuf::from(
         optional_value(&args, "--workspace-root")
@@ -75,6 +83,9 @@ fn main() {
     let xcodebuild = optional_value(&args, "--xcodebuild");
     let devicectl = optional_value(&args, "--devicectl");
     let simctl = optional_value(&args, "--simctl");
+    let xcresulttool = optional_value(&args, "--xcresulttool");
+    let xctrace = optional_value(&args, "--xctrace");
+    let lldb_dap = optional_value(&args, "--lldb-dap");
     let legacy_capabilities = values(&args, "--capability");
     let legacy_devices: Vec<_> = values(&args, "--device")
         .into_iter()
@@ -159,6 +170,9 @@ fn main() {
                             tool,
                             devicectl.clone(),
                             simctl.clone(),
+                            xcresulttool.clone(),
+                            xctrace.clone(),
+                            lldb_dap.clone(),
                             host.capabilities.clone(),
                             host.devices.clone(),
                             Arc::clone(&running),
@@ -267,6 +281,9 @@ fn start_apple_job(
     tool: String,
     devicectl: Option<String>,
     simctl: Option<String>,
+    xcresulttool: Option<String>,
+    xctrace: Option<String>,
+    lldb_dap: Option<String>,
     capabilities: Vec<String>,
     devices: Vec<DeviceSnapshot>,
     running: Arc<Mutex<HashMap<String, CancellationToken>>>,
@@ -278,13 +295,16 @@ fn start_apple_job(
         .lock()
         .unwrap()
         .insert(job_id.clone(), cancellation.clone());
-    send_apple_progress(
+    if !send_apple_progress(
         &registry,
         &transport,
         &job_id,
         vec![network_event(1, "started", "")],
         false,
-    );
+    ) {
+        running.lock().unwrap().remove(&job_id);
+        return;
+    }
     thread::spawn(move || {
         let capabilities: HashSet<_> = capabilities.into_iter().collect();
         let devices: HashSet<_> = devices
@@ -411,6 +431,15 @@ fn start_apple_job(
         }
         if let Some(path) = simctl {
             configured_tools.push((AppleTool::Simctl, path.into()));
+        }
+        if let Some(path) = xcresulttool {
+            configured_tools.push((AppleTool::Xcresulttool, path.into()));
+        }
+        if let Some(path) = xctrace {
+            configured_tools.push((AppleTool::Xctrace, path.into()));
+        }
+        if let Some(path) = lldb_dap {
+            configured_tools.push((AppleTool::LldbDap, path.into()));
         }
         let mut events = Vec::new();
         let mut artifact_bytes = Vec::new();
@@ -593,13 +622,22 @@ fn send_apple_progress(
             && stream.write_all(b"\n").is_ok()
         {
             let mut response = String::new();
-            if BufReader::new(stream).read_line(&mut response).is_ok() {
+            if BufReader::new(stream).read_line(&mut response).is_ok()
+                && progress_acknowledged(&response)
+            {
                 return true;
             }
         }
         thread::sleep(Duration::from_millis(10));
     }
     false
+}
+
+fn progress_acknowledged(response: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(response)
+        .ok()
+        .and_then(|value| value["accepted"].as_bool())
+        == Some(true)
 }
 
 fn complete(
@@ -701,6 +739,17 @@ fn metadata(a: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_ack_requires_an_accepted_registry_response() {
+        assert!(progress_acknowledged(
+            r#"{"accepted":true,"hosts":[],"events":[],"audit":[],"cancel_jobs":[]}"#
+        ));
+        assert!(!progress_acknowledged(
+            r#"{"accepted":false,"hosts":[],"events":[],"audit":[],"cancel_jobs":[],"error":"persistence_failed"}"#
+        ));
+        assert!(!progress_acknowledged("not-json"));
+    }
 
     #[test]
     fn registry_rpc_returns_when_the_tls_peer_stalls() {

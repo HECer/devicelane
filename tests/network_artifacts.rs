@@ -8,7 +8,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
     time::Duration,
@@ -195,6 +195,34 @@ fn aggregate_hash_failure_does_not_confirm_or_publish_the_final_chunk() {
     assert!(retry.confirmed_offset.is_none());
 }
 
+#[test]
+fn resumes_and_publishes_a_partial_artifact_after_registry_restart() {
+    let mut setup = Setup::new();
+    let contents = b"abcdefgh";
+    let first = &contents[..CHUNK];
+    let metadata = setup.register("restart.trace", contents);
+
+    assert_eq!(setup.write(&metadata, 0, first).confirmed_offset, Some(4));
+    setup.restart_registry();
+
+    let resumed = setup.write(&metadata, CHUNK as u64, &contents[CHUNK..]);
+    assert!(resumed.error.is_none(), "{:?}", resumed.error);
+    assert_eq!(resumed.confirmed_offset, Some(contents.len() as u64));
+
+    let downloaded = setup.rpc(
+        &setup.cli,
+        Request::ArtifactRead {
+            artifact_id: metadata.id.clone(),
+            offset: 0,
+            length: contents.len() as u64,
+            total_size: contents.len() as u64,
+            sha256: hash(contents),
+        },
+    );
+    assert!(downloaded.error.is_none(), "{:?}", downloaded.error);
+    assert_eq!(downloaded.artifact_chunk.unwrap().bytes, contents);
+}
+
 fn transfer_fixture(path: impl AsRef<Path>) {
     let setup = Setup::new();
     let contents = fs::read(path.as_ref()).unwrap();
@@ -237,6 +265,7 @@ fn transfer_fixture(path: impl AsRef<Path>) {
 struct Setup {
     _root: TempDir,
     _registry: ChildGuard,
+    registry_path: PathBuf,
     address: String,
     agent: SecureTransport,
     cli: SecureTransport,
@@ -255,27 +284,14 @@ impl Setup {
         pair(&registry_path, "registry", &cli_path, "cli");
         pair(&registry_path, "registry", &outsider_path, "outsider");
         let address = free_address();
-        let registry = ChildGuard(
-            Command::new(env!("CARGO_BIN_EXE_mesh-registry"))
-                .args([
-                    "--listen",
-                    &address,
-                    "--identity",
-                    registry_path.to_str().unwrap(),
-                    "--offline-after-ms",
-                    "10000",
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap(),
-        );
+        let registry = start_registry(&address, &registry_path);
         let agent = SecureTransport::load_or_create(agent_path, "agent").unwrap();
         let cli = SecureTransport::load_or_create(cli_path, "cli").unwrap();
         let outsider = SecureTransport::load_or_create(outsider_path, "outsider").unwrap();
         let setup = Self {
             _root: root,
             _registry: registry,
+            registry_path,
             address,
             agent,
             cli,
@@ -358,6 +374,12 @@ impl Setup {
         )
     }
 
+    fn restart_registry(&mut self) {
+        self._registry.0.kill().unwrap();
+        self._registry.0.wait().unwrap();
+        self._registry = start_registry(&self.address, &self.registry_path);
+    }
+
     fn rpc(&self, identity: &SecureTransport, request: Request) -> Response {
         let stream = connect(&self.address);
         let mut stream = identity.connect_tls(stream, "registry").unwrap();
@@ -367,6 +389,24 @@ impl Setup {
         BufReader::new(stream).read_line(&mut line).unwrap();
         serde_json::from_str(&line).unwrap()
     }
+}
+
+fn start_registry(address: &str, identity: &Path) -> ChildGuard {
+    ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_mesh-registry"))
+            .args([
+                "--listen",
+                address,
+                "--identity",
+                identity.to_str().unwrap(),
+                "--offline-after-ms",
+                "10000",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    )
 }
 
 fn hash(bytes: &[u8]) -> String {

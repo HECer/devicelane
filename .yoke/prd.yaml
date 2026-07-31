@@ -288,7 +288,7 @@
     - Ein plattformunabhängiger Produktionskonfigurationstest scheitert, wenn
       Fake-Toolpfade, Loopback-Controller oder unaufgelöste Apple-Tools in der
       installierten Plist verbleiben
-  passes: false
+  passes: true
   needs:
     - STORY-34
   area: production-bootstrap

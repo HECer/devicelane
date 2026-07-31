@@ -173,6 +173,83 @@ fn disconnect_and_expiry_promote_the_next_paired_client_in_order() {
 }
 
 #[test]
+fn registry_restart_preserves_the_active_lease_and_fifo_waiters() {
+    let mut harness = Harness::start(Duration::ZERO);
+    let first = acquire(&harness, &harness.client_a, 30_000);
+    let first_id = grant_id(&first);
+
+    for identity in [&harness.client_b, &harness.client_c] {
+        let queued = lease(
+            &harness.address,
+            identity,
+            &LeaseRequest::Queue {
+                device_id: DEVICE.into(),
+                lifetime_ms: 30_000,
+            },
+        );
+        assert_eq!(queued["lease_status"], "queued", "{queued}");
+    }
+
+    harness._registry.kill().unwrap();
+    harness._registry.wait().unwrap();
+    harness._registry = start_registry(&harness.address, &harness._root.path().join("registry"));
+    wait_for_host(&harness.address, &harness.client_a);
+
+    let forged = cli_json(
+        &harness.address,
+        &harness.client_c,
+        "apple-run",
+        &apple_request("forged-after-restart", &first_id),
+    );
+    assert_eq!(forged["accepted"], false, "{forged}");
+    assert_eq!(forged["error"], "lease_inactive", "{forged}");
+
+    let renewed = lease(
+        &harness.address,
+        &harness.client_a,
+        &LeaseRequest::Renew {
+            lease_id: first_id.clone(),
+            lifetime_ms: 30_000,
+        },
+    );
+    assert_eq!(renewed["lease_status"], "renewed", "{renewed}");
+    assert_eq!(grant_id(&renewed), first_id);
+
+    let released = lease(
+        &harness.address,
+        &harness.client_a,
+        &LeaseRequest::Release {
+            lease_id: first_id.clone(),
+        },
+    );
+    assert_eq!(released["lease_status"], "released", "{released}");
+
+    let still_queued_c = lease(
+        &harness.address,
+        &harness.client_c,
+        &LeaseRequest::Queue {
+            device_id: DEVICE.into(),
+            lifetime_ms: 30_000,
+        },
+    );
+    assert_eq!(still_queued_c["lease_status"], "queued", "{still_queued_c}");
+    assert!(still_queued_c["lease_grant"].is_null(), "{still_queued_c}");
+
+    let promoted_b = current_grant(&harness, &harness.client_b);
+    assert_eq!(promoted_b["lease_grant"]["client_id"], "client-b");
+    assert_ne!(grant_id(&promoted_b), first_id);
+
+    let reused = cli_json(
+        &harness.address,
+        &harness.client_a,
+        "apple-run",
+        &apple_request("reused-after-release", &first_id),
+    );
+    assert_eq!(reused["accepted"], false, "{reused}");
+    assert_eq!(reused["error"], "lease_inactive", "{reused}");
+}
+
+#[test]
 fn paired_client_cannot_issue_agent_detach() {
     let harness = Harness::start(Duration::ZERO);
     let owned = acquire(&harness, &harness.client_a, 30_000);
@@ -325,6 +402,41 @@ fn heartbeat_from_another_agent_cannot_detach_the_lease_owners_device() {
         still_owned["lease_status"], "renewed",
         "another agent's inventory detached this device: {still_owned}"
     );
+}
+
+#[test]
+fn registry_restart_preserves_the_authenticated_host_and_device_owner() {
+    let mut harness = Harness::start(Duration::ZERO);
+    harness._agent.kill().unwrap();
+    harness._agent.wait().unwrap();
+    harness._registry.kill().unwrap();
+    harness._registry.wait().unwrap();
+    harness._registry = start_registry(&harness.address, &harness._root.path().join("registry"));
+
+    let takeover = rpc(
+        &harness.address,
+        &harness.agent_b,
+        &Request::Heartbeat {
+            host: HostSnapshot {
+                id: "mac-1".into(),
+                operating_system: "macos".into(),
+                architecture: "aarch64".into(),
+                status: "online".into(),
+                capabilities: vec!["apple.simulator@1".into()],
+                devices: vec![DeviceSnapshot {
+                    id: DEVICE.into(),
+                    platform: "ios-simulator".into(),
+                    state: "connected".into(),
+                }],
+            },
+        },
+    );
+
+    assert_eq!(
+        takeover["accepted"], false,
+        "a second trusted agent took over persisted host/device IDs: {takeover}"
+    );
+    assert_eq!(takeover["error"], "agent_identity_mismatch", "{takeover}");
 }
 
 #[test]
@@ -608,6 +720,7 @@ struct Harness {
     address: String,
     client_a: PathBuf,
     client_b: PathBuf,
+    client_c: PathBuf,
     agent: PathBuf,
     agent_b: PathBuf,
     marker: PathBuf,
@@ -628,10 +741,12 @@ impl Harness {
         let agent_b = root.path().join("agent-b");
         let client_a = root.path().join("client-a");
         let client_b = root.path().join("client-b");
+        let client_c = root.path().join("client-c");
         pair(&registry, "registry", &agent, "agent");
         pair(&registry, "registry", &agent_b, "agent-b");
         pair(&registry, "registry", &client_a, "client-a");
         pair(&registry, "registry", &client_b, "client-b");
+        pair(&registry, "registry", &client_c, "client-c");
 
         let workspace_root = root.path().join("workspaces");
         let project = workspace_root.join("mac-1/project");
@@ -701,6 +816,7 @@ impl Harness {
             address,
             client_a,
             client_b,
+            client_c,
             agent,
             agent_b,
             marker,
