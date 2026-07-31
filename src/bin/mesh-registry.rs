@@ -540,7 +540,9 @@ fn run(operation: RunRequest, shared: &Mutex<DurableState>, state_path: &Path) -
     state.pending.insert(job_id.clone(), operation);
     fs::write(state_path, serde_json::to_vec(&*state).unwrap()).unwrap();
     drop(state);
-    for _ in 0..500 {
+    // Keep the legacy synchronous manifest RPC tolerant of a busy development
+    // host. New Apple jobs are accepted asynchronously and do not use this wait.
+    for _ in 0..1500 {
         if let Some(response) = {
             let state = shared.lock().unwrap();
             state

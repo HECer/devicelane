@@ -95,10 +95,10 @@ fn main() {
     }
     let stream = connect(&address);
     stream
-        // A Run RPC may legitimately wait up to two seconds for an agent.
-        // Keep the client deadline comfortably beyond the server deadline so
+        // A legacy Run RPC may wait up to fifteen seconds for a busy agent.
+        // Keep the client deadline beyond the server deadline so
         // the registry can return its structured `agent_timeout` response.
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(Duration::from_secs(20)))
         .unwrap();
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))

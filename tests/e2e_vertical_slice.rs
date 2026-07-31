@@ -17,7 +17,8 @@ fn real_vertical_slice_resumes_without_reexecution_and_survives_registry_restart
 
     let address = free_address();
     let mut registry_process = registry(&address, &registry_id);
-    let _agent_process = agent(&address, &agent_id, &agent_workspaces);
+    let mut agent_process = agent(&address, &agent_id, &agent_workspaces);
+    wait_for_host(&address, &cli_id);
     let request = serde_json::json!({
         "principal_id": "principal-1", "host_id": "mac-1", "device_id": "iphone-1",
         "workspace_id": "workspace-1", "request_id": "request-1",
@@ -31,7 +32,15 @@ fn real_vertical_slice_resumes_without_reexecution_and_survives_registry_restart
     );
     let first: Value = serde_json::from_slice(&first.stdout).unwrap();
     let job_id = first["job_id"].as_str().unwrap();
-    let first_events = first["events"].as_array().unwrap();
+    let first_events = first["events"].as_array().unwrap_or_else(|| {
+        panic!(
+            "run did not return events: {first}; agent_status={:?}; workspace_written={}",
+            agent_process.try_wait(),
+            agent_workspaces
+                .join("mac-1/workspace-1/src/main.rs")
+                .is_file()
+        )
+    });
     assert_eq!(first_events[0]["sequence"], 1);
     assert_eq!(first_events.last().unwrap()["kind"], "exit");
     assert_eq!(first_events.last().unwrap()["payload"], "0");
@@ -82,6 +91,17 @@ fn real_vertical_slice_resumes_without_reexecution_and_survives_registry_restart
     assert_eq!(audit[0]["workspace_id"], "workspace-1");
     assert_eq!(audit[0]["job_id"], job_id);
     assert_eq!(audit[0]["result"], "succeeded");
+}
+
+fn wait_for_host(address: &str, identity: &std::path::Path) {
+    for _ in 0..500 {
+        let listed = cli(address, identity, "list", None);
+        if listed.status.success() && String::from_utf8_lossy(&listed.stdout).contains("mac-1") {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("agent did not publish its first heartbeat");
 }
 
 fn pair_process(

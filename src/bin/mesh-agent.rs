@@ -14,7 +14,7 @@ use std::{
     process::Command,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 const NAME: &str = "mesh-agent";
 fn main() {
@@ -507,12 +507,6 @@ fn complete(
     artifact: String,
     output: std::process::Output,
 ) {
-    let Ok(stream) = TcpStream::connect(registry) else {
-        return;
-    };
-    let Ok(mut stream) = transport.connect_tls(stream, "registry") else {
-        return;
-    };
     let events = vec![
         device_development_mesh::network_processes::NetworkEvent {
             sequence: 1,
@@ -530,16 +524,35 @@ fn complete(
             payload: output.status.code().unwrap_or(-1).to_string(),
         },
     ];
-    serde_json::to_writer(
-        &mut stream,
-        &Request::Complete {
-            job_id,
-            artifact,
-            events,
-        },
-    )
+    let mut payload = serde_json::to_vec(&Request::Complete {
+        job_id,
+        artifact,
+        events,
+    })
     .unwrap();
-    stream.write_all(b"\n").unwrap();
+    payload.push(b'\n');
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(stream) = TcpStream::connect(registry) {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            if let Ok(mut stream) = transport.connect_tls(stream, "registry")
+                && stream.write_all(&payload).is_ok()
+            {
+                let mut response = String::new();
+                if BufReader::new(stream).read_line(&mut response).is_ok()
+                    && serde_json::from_str::<Response>(&response)
+                        .is_ok_and(|response| response.accepted)
+                {
+                    return;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 fn value(a: &[String], n: &str) -> String {
     optional_value(a, n).unwrap()
