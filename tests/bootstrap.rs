@@ -32,6 +32,9 @@ fn doctor_rejects_an_additional_windows_acl_principal() {
     for target in ["", "private-key.der"] {
         let workspace = tempfile::tempdir().unwrap();
         let identity = workspace.path().join("identity");
+        let _ = doctor(&identity);
+        restrict_to_current_user(&identity);
+        restrict_to_current_user(&identity.join("private-key.der"));
         assert_eq!(permission_status(&doctor(&identity)), "ok");
         let path = identity.join(target);
         assert!(
@@ -44,6 +47,29 @@ fn doctor_rejects_an_additional_windows_acl_principal() {
         );
         assert_eq!(permission_status(&doctor(&identity)), "repair");
     }
+}
+
+#[cfg(windows)]
+fn restrict_to_current_user(path: &std::path::Path) {
+    let account = String::from_utf8(
+        Command::new("whoami")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        Command::new("icacls")
+            .arg(path)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                &format!("{}:F", account.trim()),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 #[cfg(windows)]
