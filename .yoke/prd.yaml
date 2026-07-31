@@ -240,9 +240,9 @@
       Remote-Aktion mit validierten Parametern wie Container, Scheme,
       Destination, App-Pfad und Bundle-ID; eine grobe Kategorie, die nur list
       oder build ausführt, erfüllt den Vertikalschnitt nicht
-    - Ein zweiter gepairter Client kann denselben Agent entdecken und zulässige
-      Beobachtung ausführen; exklusive Geräteoperationen folgen deterministisch
-      Lease, Queue, Revoke und Disconnect
+    - Ein zweiter separat gepairter Client kann denselben Agent entdecken und
+      eine zulässige nicht mutierende Projektbeobachtung über denselben
+      öffentlichen CLI-/Socketpfad ausführen
     - Prozessmarker beweisen, dass Apple-Tools nur auf dem Agent-Host laufen;
       Registry-Neustart und Client-Reconnect verlieren keine bestätigten Events
       oder terminalen Resultate
