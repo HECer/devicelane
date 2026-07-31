@@ -5138,6 +5138,393 @@ pub mod apple_discovery {
     }
 }
 
+pub mod remote_apple_protocol {
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::path::{Component, Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+    pub struct RemoteProtocolVersion {
+        pub major: u32,
+        pub minor: u32,
+    }
+
+    #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum AppleOperation {
+        Discovery,
+        Project,
+        Build,
+        Simulator,
+        PhysicalDevice,
+        XcTest,
+        Diagnostics,
+    }
+
+    impl AppleOperation {
+        pub fn capability(self) -> &'static str {
+            match self {
+                Self::Discovery => "apple.discovery@1",
+                Self::Project => "apple.project@1",
+                Self::Build => "apple.build@1",
+                Self::Simulator => "apple.simulator@1",
+                Self::PhysicalDevice => "apple.device@1",
+                Self::XcTest => "apple.xctest@1",
+                Self::Diagnostics => "apple.diagnostics@1",
+            }
+        }
+
+        pub fn requires_device(self) -> bool {
+            matches!(
+                self,
+                Self::Simulator | Self::PhysicalDevice | Self::Diagnostics
+            )
+        }
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct AppleRequest {
+        pub version: RemoteProtocolVersion,
+        pub request_id: String,
+        pub idempotency_key: String,
+        pub capability: String,
+        pub workspace_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub device_id: Option<String>,
+        pub operation: AppleOperation,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ProtocolError {
+        code: &'static str,
+        message: &'static str,
+    }
+
+    impl ProtocolError {
+        pub fn new(code: &'static str, message: &'static str) -> Self {
+            Self { code, message }
+        }
+
+        pub fn code(&self) -> &str {
+            self.code
+        }
+
+        pub fn message(&self) -> &str {
+            self.message
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct AcceptedJob {
+        job_id: String,
+    }
+
+    impl AcceptedJob {
+        pub fn job_id(&self) -> &str {
+            &self.job_id
+        }
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+    pub struct ProgressEvent {
+        pub sequence: u64,
+        pub kind: String,
+        pub payload: String,
+        pub terminal: bool,
+    }
+
+    struct AgentState {
+        next_job: u64,
+        request_jobs: HashMap<String, String>,
+        idempotency_jobs: HashMap<String, String>,
+        job_requests: HashMap<String, AppleRequest>,
+        events: HashMap<String, Vec<ProgressEvent>>,
+    }
+
+    pub struct AppleAgent {
+        workspace_root: PathBuf,
+        capabilities: HashSet<String>,
+        devices: HashSet<String>,
+        state: Arc<Mutex<AgentState>>,
+    }
+
+    pub struct AppleRegistry {
+        agent: AppleAgent,
+    }
+
+    impl AppleRegistry {
+        pub fn new(agent: AppleAgent) -> Self {
+            Self { agent }
+        }
+
+        pub fn submit<F>(
+            &self,
+            request: AppleRequest,
+            operation: F,
+        ) -> Result<AcceptedJob, ProtocolError>
+        where
+            F: FnOnce(&dyn Fn(&str)) -> Result<String, String> + Send + 'static,
+        {
+            self.agent.submit(request, operation)
+        }
+
+        pub fn events(
+            &self,
+            job_id: &str,
+            after: u64,
+        ) -> Result<Vec<ProgressEvent>, ProtocolError> {
+            self.agent.events(job_id, after)
+        }
+    }
+
+    impl AppleAgent {
+        pub fn new(
+            workspace_root: impl AsRef<Path>,
+            capabilities: impl IntoIterator<Item = impl Into<String>>,
+            devices: impl IntoIterator<Item = impl Into<String>>,
+        ) -> Result<Self, ProtocolError> {
+            let workspace_root = fs::canonicalize(workspace_root).map_err(|_| {
+                ProtocolError::new("workspace_path_denied", "workspace is unavailable")
+            })?;
+            Ok(Self {
+                workspace_root,
+                capabilities: capabilities.into_iter().map(Into::into).collect(),
+                devices: devices.into_iter().map(Into::into).collect(),
+                state: Arc::new(Mutex::new(AgentState {
+                    next_job: 1,
+                    request_jobs: HashMap::new(),
+                    idempotency_jobs: HashMap::new(),
+                    job_requests: HashMap::new(),
+                    events: HashMap::new(),
+                })),
+            })
+        }
+
+        pub fn parse_and_validate(&self, json: &str) -> Result<AppleRequest, ProtocolError> {
+            let value: Value = serde_json::from_str(json)
+                .map_err(|_| ProtocolError::new("invalid_request", "request is not valid JSON"))?;
+            if value.pointer("/version/major").and_then(Value::as_u64) != Some(1)
+                || value.pointer("/version/minor").and_then(Value::as_u64) != Some(0)
+            {
+                return Err(ProtocolError::new(
+                    "unsupported_version",
+                    "unsupported protocol version",
+                ));
+            }
+            let request: AppleRequest = serde_json::from_value(value).map_err(|error| {
+                if error.to_string().contains("unknown variant") {
+                    ProtocolError::new("unsupported_operation", "unsupported Apple operation")
+                } else {
+                    ProtocolError::new("invalid_request", "request fields are invalid")
+                }
+            })?;
+            self.validate(&request)?;
+            Ok(request)
+        }
+
+        pub fn validate(&self, request: &AppleRequest) -> Result<(), ProtocolError> {
+            if request.version != (RemoteProtocolVersion { major: 1, minor: 0 }) {
+                return Err(ProtocolError::new(
+                    "unsupported_version",
+                    "unsupported protocol version",
+                ));
+            }
+            if request.request_id.is_empty() || request.idempotency_key.is_empty() {
+                return Err(ProtocolError::new(
+                    "invalid_request",
+                    "request identifiers must not be empty",
+                ));
+            }
+            if request.capability != request.operation.capability()
+                || !self.capabilities.contains(&request.capability)
+            {
+                return Err(ProtocolError::new(
+                    "unsupported_capability",
+                    "capability is not available",
+                ));
+            }
+            let path = Path::new(&request.workspace_path);
+            if path.as_os_str().is_empty()
+                || path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+                || fs::canonicalize(self.workspace_root.join(path)).is_err_and(|_| true)
+                || !fs::canonicalize(self.workspace_root.join(path))
+                    .is_ok_and(|resolved| resolved.starts_with(&self.workspace_root))
+            {
+                return Err(ProtocolError::new(
+                    "workspace_path_denied",
+                    "workspace path is outside the workspace",
+                ));
+            }
+            if request
+                .device_id
+                .as_ref()
+                .is_some_and(|device| !self.devices.contains(device))
+                || request.operation.requires_device() && request.device_id.is_none()
+            {
+                return Err(ProtocolError::new(
+                    "unknown_device",
+                    "device is not available",
+                ));
+            }
+            Ok(())
+        }
+
+        pub fn submit<F>(
+            &self,
+            request: AppleRequest,
+            operation: F,
+        ) -> Result<AcceptedJob, ProtocolError>
+        where
+            F: FnOnce(&dyn Fn(&str)) -> Result<String, String> + Send + 'static,
+        {
+            self.validate(&request)?;
+            let mut state = self.state.lock().unwrap();
+            let request_job = state.request_jobs.get(&request.request_id).cloned();
+            let idempotency_job = state
+                .idempotency_jobs
+                .get(&request.idempotency_key)
+                .cloned();
+            if request_job.is_some() && idempotency_job.is_some() && request_job != idempotency_job
+            {
+                return Err(ProtocolError::new(
+                    "idempotency_conflict",
+                    "request identifiers refer to different jobs",
+                ));
+            }
+            if let Some(job_id) = request_job.or(idempotency_job) {
+                if !state
+                    .job_requests
+                    .get(&job_id)
+                    .is_some_and(|original| same_operation(original, &request))
+                {
+                    return Err(ProtocolError::new(
+                        "idempotency_conflict",
+                        "request identifier was reused for a different operation",
+                    ));
+                }
+                state
+                    .request_jobs
+                    .insert(request.request_id, job_id.clone());
+                state
+                    .idempotency_jobs
+                    .insert(request.idempotency_key, job_id.clone());
+                return Ok(AcceptedJob { job_id });
+            }
+            let job_id = format!("apple-job-{}", state.next_job);
+            state.next_job += 1;
+            state.job_requests.insert(job_id.clone(), request.clone());
+            state
+                .request_jobs
+                .insert(request.request_id, job_id.clone());
+            state
+                .idempotency_jobs
+                .insert(request.idempotency_key, job_id.clone());
+            state.events.insert(
+                job_id.clone(),
+                vec![ProgressEvent {
+                    sequence: 1,
+                    kind: "accepted".into(),
+                    payload: String::new(),
+                    terminal: false,
+                }],
+            );
+            drop(state);
+
+            let thread_state = Arc::clone(&self.state);
+            let thread_job_id = job_id.clone();
+            std::thread::spawn(move || {
+                let progress_state = Arc::clone(&thread_state);
+                let progress_job_id = thread_job_id.clone();
+                let progress = move |payload: &str| {
+                    append_event(
+                        &progress_state,
+                        &progress_job_id,
+                        "progress",
+                        payload,
+                        false,
+                    );
+                };
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(&progress)));
+                match result {
+                    Ok(Ok(payload)) => {
+                        append_event(&thread_state, &thread_job_id, "succeeded", &payload, true)
+                    }
+                    Ok(Err(payload)) => {
+                        append_event(&thread_state, &thread_job_id, "failed", &payload, true)
+                    }
+                    Err(_) => append_event(
+                        &thread_state,
+                        &thread_job_id,
+                        "failed",
+                        "operation panicked",
+                        true,
+                    ),
+                }
+            });
+            Ok(AcceptedJob { job_id })
+        }
+
+        pub fn events(
+            &self,
+            job_id: &str,
+            after: u64,
+        ) -> Result<Vec<ProgressEvent>, ProtocolError> {
+            let state = self.state.lock().unwrap();
+            let events = state
+                .events
+                .get(job_id)
+                .ok_or_else(|| ProtocolError::new("unknown_job", "job is not available"))?;
+            if after > events.len() as u64 {
+                return Err(ProtocolError::new(
+                    "invalid_event_cursor",
+                    "event cursor is beyond the job",
+                ));
+            }
+            Ok(events
+                .iter()
+                .filter(|event| event.sequence > after)
+                .cloned()
+                .collect())
+        }
+    }
+
+    fn same_operation(left: &AppleRequest, right: &AppleRequest) -> bool {
+        left.version == right.version
+            && left.capability == right.capability
+            && left.workspace_path == right.workspace_path
+            && left.device_id == right.device_id
+            && left.operation == right.operation
+    }
+
+    fn append_event(
+        state: &Arc<Mutex<AgentState>>,
+        job_id: &str,
+        kind: &str,
+        payload: &str,
+        terminal: bool,
+    ) {
+        let mut state = state.lock().unwrap();
+        let events = state.events.get_mut(job_id).unwrap();
+        if events.iter().any(|event| event.terminal) {
+            return;
+        }
+        events.push(ProgressEvent {
+            sequence: events.len() as u64 + 1,
+            kind: kind.into(),
+            payload: payload.into(),
+            terminal,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

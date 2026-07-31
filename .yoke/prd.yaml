@@ -181,7 +181,7 @@
       blockieren weder Registry noch Client-Deadline und veröffentlichen
       sequenzierte Progress-Events bis genau zu einem terminalen Status
     - Bestehende Phase-1-Protokollnachrichten bleiben rückwärtskompatibel
-  passes: false
+  passes: true
   needs:
     - STORY-29
   area: remote-apple-protocol
@@ -226,7 +226,8 @@
   priority: 13
   acceptance:
     - tests/remote_apple_e2e.rs startet Registry, Mac-Agent und mindestens zwei
-      Clients als getrennte Prozesse mit Fake-Apple-Tools und realem mTLS-Pairing
+      Clients als getrennte Prozesse mit Fake-Apple-Tools und realem
+      mTLS-Pairing
     - Ein Client synchronisiert einen Manifest-Workspace, entdeckt Projekt und
       Simulator, baut, installiert, startet, liest Logs, führt XCTest aus und
       lädt die Artefakte mit geprüften Hashes zurück
