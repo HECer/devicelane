@@ -306,7 +306,11 @@ impl Setup {
                     workspace_path: "workspace".into(),
                     device_id: None,
                     lease_id: None,
-                    operation: AppleOperation::Build,
+                    operation: AppleOperation::BuildApp {
+                        container: "MeshApp.xcodeproj".into(),
+                        scheme: "MeshApp".into(),
+                        destination: "platform=iOS Simulator,id=sim-1".into(),
+                    },
                 },
             },
         );

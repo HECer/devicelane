@@ -57,6 +57,12 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
             "--heartbeat-ms",
             "25",
             "--capability",
+            "apple.project@1",
+            "--capability",
+            "apple.build@1",
+            "--capability",
+            "apple.xctest@1",
+            "--capability",
             "apple.simulator@1",
             "--capability",
             "apple.device@1",
@@ -98,10 +104,30 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         project.join("MeshApp.xcodeproj/project.pbxproj").is_file()
     });
 
-    for (index, operation) in [
-        AppleOperation::Project,
-        AppleOperation::Build,
-        AppleOperation::XcTest,
+    for (index, operation) in vec![
+        AppleOperation::DiscoverProject {
+            container: "MeshApp.xcodeproj".into(),
+        },
+        AppleOperation::DiscoverSimulator,
+        AppleOperation::BuildApp {
+            container: "MeshApp.xcodeproj".into(),
+            scheme: "MeshApp".into(),
+            destination: "platform=iOS Simulator,id=sim-1".into(),
+        },
+        AppleOperation::InstallApp {
+            app_path: "build/MeshApp.app".into(),
+        },
+        AppleOperation::LaunchApp {
+            bundle_id: "dev.mesh.app".into(),
+        },
+        AppleOperation::ReadAppLogs {
+            bundle_id: "dev.mesh.app".into(),
+        },
+        AppleOperation::RunXcTest {
+            container: "MeshApp.xcodeproj".into(),
+            scheme: "MeshAppTests".into(),
+            destination: "platform=iOS Simulator,id=sim-1".into(),
+        },
     ]
     .into_iter()
     .enumerate()
@@ -109,11 +135,7 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         let requires_device = operation.requires_device();
         let lease_id = requires_device.then(|| format!("lease-{index}"));
         if let Some(lease_id) = &lease_id {
-            let device_id = if operation == AppleOperation::Simulator {
-                "sim-1"
-            } else {
-                "00008110-001C2D123456801E"
-            };
+            let device_id = "sim-1";
             let lease = workspace_root
                 .join("mac-1/.leases")
                 .join(device_id)
@@ -121,11 +143,16 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
             std::fs::create_dir_all(lease.parent().unwrap()).unwrap();
             std::fs::write(lease, "client-1").unwrap();
         }
-        let request = apple_request(index, operation, lease_id);
+        let request = apple_request(index, operation.clone(), lease_id);
         let accepted = cli_json(&address, &first_identity, "apple-run", &request);
         let job_id = accepted["job_id"].as_str().unwrap().to_owned();
         let terminal = wait_for_terminal(&address, &first_identity, &job_id);
-        assert_eq!(terminal["kind"], "completed", "{terminal}");
+        assert_eq!(
+            terminal["kind"],
+            "completed",
+            "{operation:?}: {terminal}; markers={}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
 
         let artifact = terminal["payload"].as_str().unwrap();
         let downloaded = cli_value(
@@ -139,18 +166,20 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
             downloaded["sha256"],
             format!("{:x}", Sha256::digest(&bytes))
         );
-        assert!(
-            String::from_utf8(bytes)
-                .unwrap()
-                .contains("agent-tool-output")
-        );
+        assert!(!bytes.is_empty());
     }
 
     let observed = cli_json(
         &address,
         &second_identity,
         "apple-run",
-        &apple_request(20, AppleOperation::Project, None),
+        &apple_request(
+            20,
+            AppleOperation::DiscoverProject {
+                container: "MeshApp.xcodeproj".into(),
+            },
+            None,
+        ),
     );
     assert!(
         wait_for_terminal(
@@ -160,12 +189,19 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         )["kind"]
             == "completed"
     );
-
     let durable = cli_json(
         &address,
         &first_identity,
         "apple-run",
-        &apple_request(40, AppleOperation::Build, None),
+        &apple_request(
+            40,
+            AppleOperation::BuildApp {
+                container: "MeshApp.xcodeproj".into(),
+                scheme: "MeshApp".into(),
+                destination: "platform=iOS Simulator,id=sim-1".into(),
+            },
+            None,
+        ),
     );
     let durable_job = durable["job_id"].as_str().unwrap().to_owned();
     let before = wait_for_terminal(&address, &first_identity, &durable_job);
@@ -180,6 +216,16 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
     registry_process.kill().unwrap();
     let markers = std::fs::read_to_string(marker).unwrap();
     assert!(markers.lines().all(|line| line.contains("agent-tool")));
+    for expected in [
+        "-project MeshApp.xcodeproj -list",
+        "-scheme MeshApp -destination \"platform=iOS Simulator,id=sim-1\" build",
+        "install sim-1 build/MeshApp.app",
+        "launch sim-1 dev.mesh.app",
+        "spawn sim-1 log show",
+        "-scheme MeshAppTests -destination \"platform=iOS Simulator,id=sim-1\" test",
+    ] {
+        assert!(markers.contains(expected), "missing {expected}: {markers}");
+    }
 }
 
 fn apple_request(
@@ -193,13 +239,7 @@ fn apple_request(
         idempotency_key: format!("idempotency-{index}"),
         capability: operation.capability().into(),
         workspace_path: "project".into(),
-        device_id: operation.requires_device().then(|| {
-            if operation == AppleOperation::Simulator {
-                "sim-1".into()
-            } else {
-                "00008110-001C2D123456801E".into()
-            }
-        }),
+        device_id: operation.requires_device().then(|| "sim-1".into()),
         lease_id,
         operation,
     }
@@ -226,7 +266,7 @@ fn fake_tool(root: &Path, name: &str, marker: &Path) -> PathBuf {
         std::fs::write(
             &path,
             format!(
-                "@echo off\r\necho agent-tool {name} %*>>\"{}\"\r\nif \"%1\"==\"-version\" echo Xcode 16& exit /b 0\r\nif \"{name}\"==\"devicectl\" echo {{\"result\":{{\"devices\":[]}}}}& exit /b 0\r\nif \"{name}\"==\"simctl\" echo {{\"devices\":{{}}}}& exit /b 0\r\necho agent-tool-output {name} %*\r\n",
+                "@echo off\r\necho agent-tool {name} %*>>\"{}\"\r\nif \"%1\"==\"-version\" goto version\r\nif \"{name}\"==\"devicectl\" if \"%1\"==\"list\" goto devices\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"list\" goto simulators\r\necho agent-tool-output {name} %*\r\nexit /b 0\r\n:version\r\necho Xcode 16\r\nexit /b 0\r\n:devices\r\necho {{\"result\":{{\"devices\":[]}}}}\r\nexit /b 0\r\n:simulators\r\necho {{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}\r\nexit /b 0\r\n",
                 marker.display()
             ),
         )
@@ -240,7 +280,7 @@ fn fake_tool(root: &Path, name: &str, marker: &Path) -> PathBuf {
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\necho 'agent-tool {name} $*' >> '{}'\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && echo '{{\"devices\":{{}}}}' && exit 0\necho 'agent-tool-output {name} $*'\n",
+                "#!/bin/sh\necho \"agent-tool {name} $*\" >> '{}'\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && [ \"$1\" = list ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && [ \"$1\" = list ] && echo '{{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}' && exit 0\necho \"agent-tool-output {name} $*\"\n",
                 marker.display()
             ),
         )
@@ -251,7 +291,7 @@ fn fake_tool(root: &Path, name: &str, marker: &Path) -> PathBuf {
 }
 
 fn cli<T: serde::Serialize>(address: &str, identity: &Path, command: &str, body: &T) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
         .args([
             "--registry",
             address,
@@ -261,8 +301,20 @@ fn cli<T: serde::Serialize>(address: &str, identity: &Path, command: &str, body:
             "--json-request",
             &serde_json::to_string(body).unwrap(),
         ])
-        .output()
-        .unwrap()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("mesh-cli timed out");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
 }
 
 fn cli_json<T: serde::Serialize>(

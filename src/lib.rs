@@ -5237,35 +5237,62 @@ pub mod remote_apple_protocol {
         pub minor: u32,
     }
 
-    #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
     #[serde(tag = "kind", rename_all = "snake_case")]
     pub enum AppleOperation {
         Discovery,
-        Project,
-        Build,
-        Simulator,
         PhysicalDevice,
-        XcTest,
         Diagnostics,
+        DiscoverProject {
+            container: String,
+        },
+        DiscoverSimulator,
+        BuildApp {
+            container: String,
+            scheme: String,
+            destination: String,
+        },
+        InstallApp {
+            app_path: String,
+        },
+        LaunchApp {
+            bundle_id: String,
+        },
+        ReadAppLogs {
+            bundle_id: String,
+        },
+        RunXcTest {
+            container: String,
+            scheme: String,
+            destination: String,
+        },
     }
 
     impl AppleOperation {
-        pub fn capability(self) -> &'static str {
+        pub fn capability(&self) -> &'static str {
             match self {
                 Self::Discovery => "apple.discovery@1",
-                Self::Project => "apple.project@1",
-                Self::Build => "apple.build@1",
-                Self::Simulator => "apple.simulator@1",
                 Self::PhysicalDevice => "apple.device@1",
-                Self::XcTest => "apple.xctest@1",
                 Self::Diagnostics => "apple.diagnostics@1",
+                Self::DiscoverProject { .. } => "apple.project@1",
+                Self::DiscoverSimulator => "apple.simulator@1",
+                Self::BuildApp { .. } => "apple.build@1",
+                Self::InstallApp { .. } | Self::LaunchApp { .. } | Self::ReadAppLogs { .. } => {
+                    "apple.simulator@1"
+                }
+                Self::RunXcTest { .. } => "apple.xctest@1",
             }
         }
 
-        pub fn requires_device(self) -> bool {
+        pub fn requires_device(&self) -> bool {
             matches!(
                 self,
-                Self::Simulator | Self::PhysicalDevice | Self::Diagnostics
+                Self::PhysicalDevice
+                    | Self::Diagnostics
+                    | Self::InstallApp { .. }
+                    | Self::LaunchApp { .. }
+                    | Self::ReadAppLogs { .. }
+                    | Self::RunXcTest { .. }
             )
         }
     }
@@ -5600,6 +5627,45 @@ pub mod remote_apple_protocol {
             return Err(ProtocolError::new(
                 "unknown_device",
                 "device is not available",
+            ));
+        }
+        let valid_relative = |value: &str| {
+            let path = Path::new(value);
+            !value.is_empty()
+                && !path.is_absolute()
+                && path
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+        };
+        let valid_text = |value: &str| !value.trim().is_empty();
+        let valid_bundle = |value: &str| {
+            value.contains('.')
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '-')
+                })
+        };
+        let valid_parameters = match &request.operation {
+            AppleOperation::DiscoverProject { container } => valid_relative(container),
+            AppleOperation::BuildApp {
+                container,
+                scheme,
+                destination,
+            }
+            | AppleOperation::RunXcTest {
+                container,
+                scheme,
+                destination,
+            } => valid_relative(container) && valid_text(scheme) && valid_text(destination),
+            AppleOperation::InstallApp { app_path } => valid_relative(app_path),
+            AppleOperation::LaunchApp { bundle_id } | AppleOperation::ReadAppLogs { bundle_id } => {
+                valid_bundle(bundle_id)
+            }
+            _ => true,
+        };
+        if !valid_parameters {
+            return Err(ProtocolError::new(
+                "invalid_apple_parameter",
+                "apple operation parameter is invalid",
             ));
         }
         for identifier in [request.device_id.as_deref(), request.lease_id.as_deref()]

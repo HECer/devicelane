@@ -62,7 +62,11 @@ fn public_processes_dispatch_apple_job_once_with_progress_cancel_and_reconnect()
         workspace_path: "project".into(),
         device_id: None,
         lease_id: None,
-        operation: AppleOperation::Build,
+        operation: AppleOperation::BuildApp {
+            container: "MeshApp.xcodeproj".into(),
+            scheme: "MeshApp".into(),
+            destination: "platform=iOS Simulator,id=sim-1".into(),
+        },
     };
     wait_for_host(&address, &cli_identity);
 

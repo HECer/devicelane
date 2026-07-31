@@ -18,16 +18,43 @@ fn request(operation: AppleOperation) -> AppleRequest {
     }
 }
 
+fn build_operation() -> AppleOperation {
+    AppleOperation::BuildApp {
+        container: "MeshApp.xcodeproj".into(),
+        scheme: "MeshApp".into(),
+        destination: "platform=iOS Simulator,id=sim-1".into(),
+    }
+}
+
 #[test]
 fn typed_versioned_requests_round_trip_without_a_raw_shell_field() {
-    let operations = [
+    let operations = vec![
         AppleOperation::Discovery,
-        AppleOperation::Project,
-        AppleOperation::Build,
-        AppleOperation::Simulator,
         AppleOperation::PhysicalDevice,
-        AppleOperation::XcTest,
         AppleOperation::Diagnostics,
+        AppleOperation::DiscoverProject {
+            container: "MeshApp.xcodeproj".into(),
+        },
+        AppleOperation::DiscoverSimulator,
+        AppleOperation::BuildApp {
+            container: "MeshApp.xcodeproj".into(),
+            scheme: "MeshApp".into(),
+            destination: "platform=iOS Simulator,id=sim-1".into(),
+        },
+        AppleOperation::InstallApp {
+            app_path: "build/MeshApp.app".into(),
+        },
+        AppleOperation::LaunchApp {
+            bundle_id: "dev.mesh.app".into(),
+        },
+        AppleOperation::ReadAppLogs {
+            bundle_id: "dev.mesh.app".into(),
+        },
+        AppleOperation::RunXcTest {
+            container: "MeshApp.xcodeproj".into(),
+            scheme: "MeshAppTests".into(),
+            destination: "platform=iOS Simulator,id=sim-1".into(),
+        },
     ];
 
     for operation in operations {
@@ -39,6 +66,45 @@ fn typed_versioned_requests_round_trip_without_a_raw_shell_field() {
             original
         );
     }
+}
+
+#[test]
+fn typed_vertical_slice_parameters_are_validated() {
+    let mut invalid = request(AppleOperation::BuildApp {
+        container: "../outside.xcodeproj".into(),
+        scheme: "MeshApp".into(),
+        destination: "platform=iOS Simulator,id=sim-1".into(),
+    });
+    assert_eq!(
+        device_development_mesh::remote_apple_protocol::validate_request_envelope(&invalid)
+            .unwrap_err()
+            .code(),
+        "invalid_apple_parameter"
+    );
+
+    invalid.operation = AppleOperation::InstallApp {
+        app_path: "/tmp/MeshApp.app".into(),
+    };
+    invalid.capability = invalid.operation.capability().into();
+    invalid.device_id = Some("sim-1".into());
+    invalid.lease_id = Some("lease-1".into());
+    assert_eq!(
+        device_development_mesh::remote_apple_protocol::validate_request_envelope(&invalid)
+            .unwrap_err()
+            .code(),
+        "invalid_apple_parameter"
+    );
+
+    invalid.operation = AppleOperation::LaunchApp {
+        bundle_id: "not a bundle id".into(),
+    };
+    invalid.capability = invalid.operation.capability().into();
+    assert_eq!(
+        device_development_mesh::remote_apple_protocol::validate_request_envelope(&invalid)
+            .unwrap_err()
+            .code(),
+        "invalid_apple_parameter"
+    );
 }
 
 #[test]
@@ -65,12 +131,16 @@ fn validation_normalizes_unknown_and_unscoped_input() {
             r#"{"version":{"major":1,"minor":0},"request_id":"r","idempotency_key":"i","capability":"apple.discovery@1","workspace_path":"project","operation":{"kind":"shell"}}"#,
             "unsupported_operation",
         ),
+        (
+            r#"{"version":{"major":1,"minor":0},"request_id":"r","idempotency_key":"i","capability":"apple.build@1","workspace_path":"project","operation":{"kind":"build"}}"#,
+            "unsupported_operation",
+        ),
     ];
     for (json, code) in cases {
         assert_eq!(agent.parse_and_validate(json).unwrap_err().code(), code);
     }
 
-    let mut invalid = request(AppleOperation::Build);
+    let mut invalid = request(build_operation());
     assert_eq!(
         agent.validate(&invalid).unwrap_err().code(),
         "unsupported_capability"
@@ -119,7 +189,7 @@ fn accepted_jobs_are_immediate_idempotent_and_end_once() {
     let worker_gate = gate.clone();
 
     let accepted = registry
-        .submit(request(AppleOperation::Build), move |progress| {
+        .submit(request(build_operation()), move |progress| {
             progress("compiling");
             worker_gate.wait();
             Ok("built".into())
@@ -127,12 +197,12 @@ fn accepted_jobs_are_immediate_idempotent_and_end_once() {
         .unwrap();
     assert!(!accepted.job_id().is_empty());
     let duplicate = registry
-        .submit(request(AppleOperation::Build), |_| {
+        .submit(request(build_operation()), |_| {
             panic!("duplicate request executed")
         })
         .unwrap();
     assert_eq!(duplicate.job_id(), accepted.job_id());
-    let mut request_alias = request(AppleOperation::Build);
+    let mut request_alias = request(build_operation());
     request_alias.idempotency_key = "retry-2".into();
     assert_eq!(
         registry
@@ -141,7 +211,7 @@ fn accepted_jobs_are_immediate_idempotent_and_end_once() {
             .job_id(),
         accepted.job_id()
     );
-    let mut idempotency_alias = request(AppleOperation::Build);
+    let mut idempotency_alias = request(build_operation());
     idempotency_alias.request_id = "request-2".into();
     idempotency_alias.idempotency_key = "retry-2".into();
     assert_eq!(

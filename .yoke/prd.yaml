@@ -246,7 +246,7 @@
     - Prozessmarker beweisen, dass Apple-Tools nur auf dem Agent-Host laufen;
       Registry-Neustart und Client-Reconnect verlieren keine bestätigten Events
       oder terminalen Resultate
-  passes: false
+  passes: true
   needs:
     - STORY-32
   area: remote-apple-e2e
@@ -273,9 +273,9 @@
   title: Produktionsbootstrap und Neustartpersistenz schließen
   priority: 15
   acceptance:
-    - tests/mac_bootstrap.rs beweist, dass setup-mac.sh alle Apple-Toolpfade über
-      xcrun auflöst, an den LaunchAgent übergibt und keine statische Dummy-Device-
-      oder reine process.start-Konfiguration installiert
+    - tests/mac_bootstrap.rs beweist, dass setup-mac.sh alle Apple-Toolpfade
+      über xcrun auflöst, an den LaunchAgent übergibt und keine statische
+      Dummy-Device- oder reine process.start-Konfiguration installiert
     - Registry persistiert Artefaktmetadaten, bestätigte Offsets, Teilnehmer,
       Lease-Queue und Apple-Jobs atomar; ein Neustart setzt Upload, Download,
       Events und Queue ohne erneute Toolausführung fort

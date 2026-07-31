@@ -157,6 +157,8 @@ fn main() {
                             tool,
                             devicectl.clone(),
                             simctl.clone(),
+                            host.capabilities.clone(),
+                            host.devices.clone(),
                             Arc::clone(&running),
                         );
                     }
@@ -261,6 +263,8 @@ fn start_apple_job(
     tool: String,
     devicectl: Option<String>,
     simctl: Option<String>,
+    capabilities: Vec<String>,
+    devices: Vec<DeviceSnapshot>,
     running: Arc<Mutex<HashMap<String, CancellationToken>>>,
 ) {
     let cancellation = CancellationToken::new();
@@ -276,8 +280,6 @@ fn start_apple_job(
         false,
     );
     thread::spawn(move || {
-        let (capabilities, devices) =
-            discover(&host_workspace, &Some(tool.clone()), &devicectl, &simctl);
         let capabilities: HashSet<_> = capabilities.into_iter().collect();
         let devices: HashSet<_> = devices
             .into_iter()
@@ -296,28 +298,90 @@ fn start_apple_job(
             && std::fs::canonicalize(&workspace)
                 .ok()
                 .is_some_and(|path| path.starts_with(&host_workspace));
-        let (selected_tool, arguments) = match operation.operation {
+        let (selected_tool, arguments) = match &operation.operation {
             device_development_mesh::remote_apple_protocol::AppleOperation::Discovery => {
                 (AppleTool::Devicectl, vec!["list".into(), "devices".into()])
-            }
-            device_development_mesh::remote_apple_protocol::AppleOperation::Project => {
-                (AppleTool::Xcodebuild, vec!["-list".into()])
-            }
-            device_development_mesh::remote_apple_protocol::AppleOperation::Build => {
-                (AppleTool::Xcodebuild, vec!["build".into()])
-            }
-            device_development_mesh::remote_apple_protocol::AppleOperation::Simulator => {
-                (AppleTool::Simctl, vec!["list".into(), "devices".into()])
             }
             device_development_mesh::remote_apple_protocol::AppleOperation::PhysicalDevice => {
                 (AppleTool::Devicectl, vec!["list".into(), "devices".into()])
             }
-            device_development_mesh::remote_apple_protocol::AppleOperation::XcTest => {
-                (AppleTool::Xcodebuild, vec!["test".into()])
-            }
             device_development_mesh::remote_apple_protocol::AppleOperation::Diagnostics => {
                 (AppleTool::Xcodebuild, vec!["-version".into()])
             }
+            device_development_mesh::remote_apple_protocol::AppleOperation::DiscoverProject {
+                container,
+            } => (
+                AppleTool::Xcodebuild,
+                vec!["-project".into(), container.clone(), "-list".into()],
+            ),
+            device_development_mesh::remote_apple_protocol::AppleOperation::DiscoverSimulator => {
+                (AppleTool::Simctl, vec!["list".into(), "devices".into()])
+            }
+            device_development_mesh::remote_apple_protocol::AppleOperation::BuildApp {
+                container,
+                scheme,
+                destination,
+            } => (
+                AppleTool::Xcodebuild,
+                vec![
+                    "-project".into(),
+                    container.clone(),
+                    "-scheme".into(),
+                    scheme.clone(),
+                    "-destination".into(),
+                    destination.clone(),
+                    "build".into(),
+                ],
+            ),
+            device_development_mesh::remote_apple_protocol::AppleOperation::InstallApp {
+                app_path,
+            } => (
+                AppleTool::Simctl,
+                vec![
+                    "install".into(),
+                    operation.device_id.clone().unwrap(),
+                    app_path.clone(),
+                ],
+            ),
+            device_development_mesh::remote_apple_protocol::AppleOperation::LaunchApp {
+                bundle_id,
+            } => (
+                AppleTool::Simctl,
+                vec![
+                    "launch".into(),
+                    operation.device_id.clone().unwrap(),
+                    bundle_id.clone(),
+                ],
+            ),
+            device_development_mesh::remote_apple_protocol::AppleOperation::ReadAppLogs {
+                bundle_id,
+            } => (
+                AppleTool::Simctl,
+                vec![
+                    "spawn".into(),
+                    operation.device_id.clone().unwrap(),
+                    "log".into(),
+                    "show".into(),
+                    "--predicate".into(),
+                    format!("subsystem == '{bundle_id}'"),
+                ],
+            ),
+            device_development_mesh::remote_apple_protocol::AppleOperation::RunXcTest {
+                container,
+                scheme,
+                destination,
+            } => (
+                AppleTool::Xcodebuild,
+                vec![
+                    "-project".into(),
+                    container.clone(),
+                    "-scheme".into(),
+                    scheme.clone(),
+                    "-destination".into(),
+                    destination.clone(),
+                    "test".into(),
+                ],
+            ),
         };
         let mut configured_tools = vec![(AppleTool::Xcodebuild, tool.into())];
         if let Some(path) = devicectl {
