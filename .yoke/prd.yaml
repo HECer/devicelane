@@ -157,6 +157,9 @@
     - setup-mac.sh besitzt einen nebenwirkungsfreien --dry-run und gibt bei
       Erfolg genau den nächsten Controller-Befehl sowie den Pfad eines
       redigierten Diagnosebundles aus
+    - --controller setzt Pairing- und Registry-Ziel für einen entfernten
+      Windows- oder Linux-Controller; bestehendes Trust-Material wird bei
+      Upgrade nicht ersetzt
     - Deinstallation entfernt nur die explizit installierte LaunchAgent-Datei
       und Programmdateien; Identität und Auditdaten bleiben standardmäßig
       erhalten
@@ -165,8 +168,81 @@
     - STORY-28
   area: mac-bootstrap
 - id: STORY-30
-  title: Reales Mac-und-iPhone-Hardware-Gate bestehen
+  title: Versionierten Remote-Apple-Jobvertrag liefern
   priority: 10
+  acceptance:
+    - tests/remote_apple_protocol.rs serialisiert und validiert einen
+      versionierten, typisierten Apple-Request für Discovery, Project, Build,
+      Simulator, physisches Gerät, XCTest und Diagnostics ohne Raw-Shell-Feld
+    - Registry und Agent behandeln Request-ID und Idempotency-Key stabil und
+      lehnen unbekannte Versionen, Operationen, Capabilities, Workspace-Pfade
+      und Geräte-IDs mit normalisierten Fehlern ab
+    - Ein angenommener Job erhält sofort eine Job-ID; lange Apple-Prozesse
+      blockieren weder Registry noch Client-Deadline und veröffentlichen
+      sequenzierte Progress-Events bis genau zu einem terminalen Status
+    - Bestehende Phase-1-Protokollnachrichten bleiben rückwärtskompatibel
+  passes: false
+  needs:
+    - STORY-29
+  area: remote-apple-protocol
+- id: STORY-31
+  title: Apple-Operationen im entfernten Mac-Agent dispatchen
+  priority: 11
+  acceptance:
+    - tests/remote_apple_agent.rs beweist, dass der Registry-Prozess einen
+      typisierten Apple-Job unverändert an den gepairten ausgehenden Mac-Agent
+      zustellt und ausschließlich der Agent AppleToolRunner ausführt
+    - Der Agent veröffentlicht Preflight-, Tool-, Simulator- und physische
+      Geräte-Capabilities aus echter Discovery statt statischer Dummy-Argumente
+      und aktualisiert sie bei Lock, Detach oder Developer-Mode-Änderung
+    - Workspace-, Lease-, Capability-, Pfad- und Geräteprüfung geschieht erneut
+      im Agent direkt vor der Toolausführung; Raw-Shell und beliebige Toolpfade
+      sind über das Netzwerk nicht darstellbar
+    - Progress, Cancel und Reconnect funktionieren während eines laufenden
+      Fake-xcodebuild-Prozesses ohne doppelte Ausführung
+  passes: false
+  needs:
+    - STORY-30
+  area: remote-apple-agent
+- id: STORY-32
+  title: Apple-Artefakte chunked über das Mesh übertragen
+  priority: 12
+  acceptance:
+    - tests/network_artifacts.rs lädt .app-, .dSYM-, .xcresult-, Screenshot-,
+      Log- und Trace-Fixtures als Metadaten plus begrenzte Chunks über Registry
+      und mTLS-Client statt als lokales Pfad- oder String-Surrogat
+    - Offset, Länge, Gesamtgröße und SHA-256 werden bei jedem Resume geprüft;
+      Abbruch und Reconnect setzen am bestätigten Offset ohne Duplikate fort
+    - Registry puffert keine unbeschränkten Artefakte im Arbeitsspeicher und
+      gibt Artefakte nur an autorisierte Teilnehmer des Jobs aus
+    - Manipulierte Chunks, unbekannte Artefakte und ungültige Offsets liefern
+      stabile Fehler ohne Teildatei als erfolgreich zu markieren
+  passes: false
+  needs:
+    - STORY-31
+  area: remote-artifacts
+- id: STORY-33
+  title: Remote-Apple-Vertikalschnitt in getrennten Prozessen bestehen
+  priority: 13
+  acceptance:
+    - tests/remote_apple_e2e.rs startet Registry, Mac-Agent und mindestens zwei
+      Clients als getrennte Prozesse mit Fake-Apple-Tools und realem mTLS-Pairing
+    - Ein Client synchronisiert einen Manifest-Workspace, entdeckt Projekt und
+      Simulator, baut, installiert, startet, liest Logs, führt XCTest aus und
+      lädt die Artefakte mit geprüften Hashes zurück
+    - Ein zweiter gepairter Client kann denselben Agent entdecken und zulässige
+      Beobachtung ausführen; exklusive Geräteoperationen folgen deterministisch
+      Lease, Queue, Revoke und Disconnect
+    - Prozessmarker beweisen, dass Apple-Tools nur auf dem Agent-Host laufen;
+      Registry-Neustart und Client-Reconnect verlieren keine bestätigten Events
+      oder terminalen Resultate
+  passes: false
+  needs:
+    - STORY-32
+  area: remote-apple-e2e
+- id: STORY-34
+  title: Reales Mac-und-iPhone-Hardware-Gate bestehen
+  priority: 14
   acceptance:
     - scripts/mac-hardware-gate.sh läuft auf einem echten Mac ohne
       Mock-Toolpfade und erfasst Xcode-, SDK-, Tool- und Geräteversionen in
@@ -182,5 +258,5 @@
       Reparaturschritt
   passes: false
   needs:
-    - STORY-29
+    - STORY-33
   area: apple-hardware-gate

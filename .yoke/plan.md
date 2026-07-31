@@ -359,4 +359,26 @@ Die Ausführung erfolgt in dieser Reihenfolge:
 9. Idempotenter Ein-Befehl-Mac-Bootstrap als Benutzer-LaunchAgent einschließlich Diagnosebundle.
 10. Reales Hardware-Gate mit einem angeschlossenen iPhone. Erst dieses Gate darf Phase 2 als Hardware-unterstützt ausweisen.
 
+### Phase-2-Integrationsaudit
+
+Die erste Apple-Implementierungsfolge hat Parser, Befehlsplanung, Adapter und
+Bootstrap isoliert geliefert, aber noch nicht durch den echten
+Registry-Agent-Transport verbunden. Ein lokaler Bibliothekstest ist keine
+Evidenz dafür, dass ein Windows-Client tatsächlich Xcode oder ein iPhone am Mac
+steuern kann. Vor dem Hardware-Gate sind deshalb vier verbindliche
+Vertikalschnitt-Stories eingefügt:
+
+1. Ein versionierter Remote-Apple-Jobvertrag ohne Raw-Shell-Fluchtweg und mit
+   sofortiger Jobannahme für lange Builds.
+2. Agentseitiger Dispatch samt dynamischer Apple-Capabilities und erneuter
+   Policy-, Lease-, Workspace- und Geräteprüfung.
+3. Begrenzter, hash-geprüfter und fortsetzbarer Binärartefakttransport über den
+   authentisierten Mesh-Kanal.
+4. Ein echter Mehrprozess-E2E-Test mit Registry, Mac-Agent, zwei Clients,
+   Fake-Apple-Tools, Reconnect und Konkurrenz um Geräte-Leases.
+
+Erst danach folgt das reale Mac-/iPhone-Gate. Der Mac-Bootstrap nimmt eine
+explizite Controller-Adresse an, paart bei der Erstinstallation automatisch und
+verbindet den LaunchAgent anschließend mit dem entfernten Registry-Port.
+
 Nicht-Ziele dieses Loops bleiben allgemeine iOS-Systemfernsteuerung, Steuerung fremder Apps, Umgehung von Signing/Trust/Developer Mode sowie eine Desktop-GUI. Private Signing-Schlüssel verlassen niemals den macOS-Keychain. Der Nutzer wird erst eingebunden, wenn Bootstrap und Hardware-Gate als ein konkreter Mac-Befehl bereitstehen.
