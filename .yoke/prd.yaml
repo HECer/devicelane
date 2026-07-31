@@ -265,7 +265,7 @@
     - Der Agent akzeptiert mutierende Apple-Aktionen nur mit einem von der
       Registry signierten, jobgebundenen Lease-Grant und prüft ihn direkt vor
       jeder Toolausführung erneut
-  passes: false
+  passes: true
   needs:
     - STORY-33
   area: distributed-device-leases
