@@ -71,6 +71,22 @@ The registry is the control plane. Agents advertise host and device capabilities
 
 ## Quick start
 
+### Install prebuilt commands
+
+With Node.js 20 or newer, install the npm launcher. On first use it downloads the
+matching GitHub Release binary and verifies its SHA-256 checksum:
+
+```sh
+npm install --global devicelane
+devicelane --version
+```
+
+This provides `devicelane` (the client), `devicelane-agent`, and
+`devicelane-registry`. Native archives and checksums are also available directly
+from [GitHub Releases](https://github.com/HECer/devicelane/releases).
+
+### Build from source
+
 The examples use port `7443` for normal mutual-TLS traffic and temporary ports `7444`/`7445` for initial pairing. Replace `CONTROLLER_HOST` with a private DNS name or LAN/VPN address reachable from the other host.
 
 ### 1. Build the controller on Windows

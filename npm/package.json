@@ -1,0 +1,20 @@
+{
+  "name": "devicelane",
+  "version": "0.1.0",
+  "description": "Secure cross-platform development mesh for remote iOS, Android, macOS, Windows, and Linux device workflows.",
+  "license": "MIT",
+  "author": "HECer",
+  "type": "module",
+  "repository": { "type": "git", "url": "git+https://github.com/HECer/devicelane.git" },
+  "homepage": "https://github.com/HECer/devicelane#readme",
+  "bugs": "https://github.com/HECer/devicelane/issues",
+  "keywords": ["ios", "android", "adb", "xcode", "remote-development", "device", "debugging"],
+  "engines": { "node": ">=20" },
+  "bin": {
+    "devicelane": "bin/devicelane.mjs",
+    "devicelane-agent": "bin/devicelane-agent.mjs",
+    "devicelane-registry": "bin/devicelane-registry.mjs"
+  },
+  "files": ["bin", "lib", "README.md", "LICENSE"],
+  "scripts": { "test": "node --test test/*.test.mjs" }
+}
