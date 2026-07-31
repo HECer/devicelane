@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "test_summaries": {"_values": [{"name":{"_value":"AppTests"},"tests":{"_values":[{
+    "identifier":{"_value":"LoginTests/testLogin"},"testStatus":{"_value":"failed"},"duration":{"_value":0.42},
+    "failureSummaries":{"_values":[{"message":{"_value":"expected true"},"fileName":{"_value":"Tests/LoginTests.swift"},"lineNumber":{"_value":42}}]}
+  }]}}]},
+  "attachments": {"_values": [{"name":{"_value":"failure.png"},"path":{"_value":"attachments/failure.png"},"kind":{"_value":"screenshot"}}]},
+  "coverage": {"_values": [{"target":{"_value":"MeshApp"},"linePercent":{"_value":87.5},"file":{"_value":"Sources/Login.swift"},"line":{"_value":1}}]}
+}

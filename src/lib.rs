@@ -4128,6 +4128,392 @@ pub mod apple_build {
     }
 }
 
+pub mod apple_xctest {
+    use crate::artifacts::{ArtifactError, ArtifactMetadata, ArtifactStore};
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum XCTestOperation {
+        BuildForTesting {
+            test_plan: Option<String>,
+        },
+        TestWithoutBuilding {
+            test_plan: Option<String>,
+            only_testing: Vec<String>,
+            ui_tests: Vec<String>,
+        },
+    }
+
+    impl XCTestOperation {
+        pub fn arguments(&self) -> Vec<String> {
+            let (action, test_plan, selections) = match self {
+                Self::BuildForTesting { test_plan } => ("build-for-testing", test_plan, Vec::new()),
+                Self::TestWithoutBuilding {
+                    test_plan,
+                    only_testing,
+                    ui_tests,
+                } => (
+                    "test-without-building",
+                    test_plan,
+                    only_testing.iter().chain(ui_tests).collect(),
+                ),
+            };
+            let mut arguments = vec![action.into()];
+            if let Some(test_plan) = test_plan {
+                arguments.extend(["-testPlan".into(), test_plan.clone()]);
+            }
+            arguments.extend(
+                selections
+                    .into_iter()
+                    .map(|selection| format!("-only-testing:{selection}")),
+            );
+            arguments
+        }
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+    pub struct SourceReference {
+        pub file: String,
+        pub line: u64,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+    pub struct TestFailure {
+        pub message: String,
+        pub source: SourceReference,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+    pub struct TestCase {
+        pub identifier: String,
+        pub status: String,
+        pub duration: f64,
+        pub failure: Option<TestFailure>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+    pub struct TestSuite {
+        pub name: String,
+        pub tests: Vec<TestCase>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+    pub struct XCTestAttachment {
+        pub name: String,
+        pub path: String,
+        pub kind: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+    pub struct CoverageResult {
+        pub target: String,
+        pub line_percent: f64,
+        pub source: Option<SourceReference>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+    pub struct NormalizedXCResult {
+        schema_version: u64,
+        pub suites: Vec<TestSuite>,
+        pub attachments: Vec<XCTestAttachment>,
+        pub coverage: Vec<CoverageResult>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum XCTestError {
+        IncompatibleResultSchema,
+        InvalidResult,
+        Io,
+        Artifact(ArtifactError),
+    }
+
+    pub fn normalize_xcresult(value: &str) -> Result<NormalizedXCResult, XCTestError> {
+        let result = parse_xcresult(value)?;
+        if result.schema_version != 1 {
+            return Err(XCTestError::IncompatibleResultSchema);
+        }
+        Ok(result)
+    }
+
+    fn parse_xcresult(value: &str) -> Result<NormalizedXCResult, XCTestError> {
+        let raw: serde_json::Value =
+            serde_json::from_str(value).map_err(|_| XCTestError::InvalidResult)?;
+        let schema_version = raw["schema_version"]
+            .as_u64()
+            .ok_or(XCTestError::InvalidResult)?;
+        let suites = values(&raw["test_summaries"])?
+            .iter()
+            .map(|suite| {
+                let tests = values(&suite["tests"])?
+                    .iter()
+                    .map(|test| {
+                        let failures = values(&test["failureSummaries"])?;
+                        let failure = failures.first().map(|failure| TestFailure {
+                            message: string_value(&failure["message"]).unwrap_or_default(),
+                            source: SourceReference {
+                                file: string_value(&failure["fileName"]).unwrap_or_default(),
+                                line: number_value(&failure["lineNumber"]).unwrap_or_default(),
+                            },
+                        });
+                        Ok(TestCase {
+                            identifier: string_value(&test["identifier"])
+                                .ok_or(XCTestError::InvalidResult)?,
+                            status: string_value(&test["testStatus"])
+                                .ok_or(XCTestError::InvalidResult)?,
+                            duration: float_value(&test["duration"])
+                                .ok_or(XCTestError::InvalidResult)?,
+                            failure,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, XCTestError>>()?;
+                Ok(TestSuite {
+                    name: string_value(&suite["name"]).ok_or(XCTestError::InvalidResult)?,
+                    tests,
+                })
+            })
+            .collect::<Result<Vec<_>, XCTestError>>()?;
+        let attachments = optional_values(&raw["attachments"])
+            .iter()
+            .map(|attachment| {
+                Ok(XCTestAttachment {
+                    name: string_value(&attachment["name"]).ok_or(XCTestError::InvalidResult)?,
+                    path: string_value(&attachment["path"]).ok_or(XCTestError::InvalidResult)?,
+                    kind: string_value(&attachment["kind"]).ok_or(XCTestError::InvalidResult)?,
+                })
+            })
+            .collect::<Result<Vec<_>, XCTestError>>()?;
+        let coverage = optional_values(&raw["coverage"])
+            .iter()
+            .map(|entry| {
+                Ok(CoverageResult {
+                    target: string_value(&entry["target"]).ok_or(XCTestError::InvalidResult)?,
+                    line_percent: float_value(&entry["linePercent"])
+                        .ok_or(XCTestError::InvalidResult)?,
+                    source: string_value(&entry["file"]).map(|file| SourceReference {
+                        file,
+                        line: number_value(&entry["line"]).unwrap_or_default(),
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>, XCTestError>>()?;
+        Ok(NormalizedXCResult {
+            schema_version,
+            suites,
+            attachments,
+            coverage,
+        })
+    }
+
+    fn values(value: &serde_json::Value) -> Result<&Vec<serde_json::Value>, XCTestError> {
+        value["_values"]
+            .as_array()
+            .ok_or(XCTestError::InvalidResult)
+    }
+
+    fn optional_values(value: &serde_json::Value) -> &[serde_json::Value] {
+        value["_values"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn string_value(value: &serde_json::Value) -> Option<String> {
+        value["_value"].as_str().map(str::to_owned)
+    }
+
+    fn number_value(value: &serde_json::Value) -> Option<u64> {
+        value["_value"].as_u64()
+    }
+
+    fn float_value(value: &serde_json::Value) -> Option<f64> {
+        value["_value"].as_f64()
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct XCTestArtifact {
+        pub sha256: String,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_xctest_artifacts(
+        bundle: &Path,
+        job_id: &str,
+        session: &str,
+        store: &mut ArtifactStore,
+        now: u64,
+        expires_at: u64,
+        protected_environment: &HashMap<String, String>,
+    ) -> Result<Vec<XCTestArtifact>, XCTestError> {
+        let mut paths = files(bundle)?;
+        paths.retain(|path| {
+            matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("png" | "jpg" | "jpeg" | "mp4" | "mov" | "log")
+            )
+        });
+        let secrets = protected_environment.values().collect::<Vec<_>>();
+        let mut payloads = paths
+            .iter()
+            .map(|path| fs::read(path).map_err(|_| XCTestError::Io))
+            .collect::<Result<Vec<_>, _>>()?;
+        payloads.push(pack(bundle, &secrets)?);
+
+        payloads
+            .into_iter()
+            .map(|payload| {
+                register(
+                    redact(payload, &secrets),
+                    job_id,
+                    session,
+                    store,
+                    now,
+                    expires_at,
+                )
+            })
+            .collect()
+    }
+
+    fn register(
+        payload: Vec<u8>,
+        job_id: &str,
+        session: &str,
+        store: &mut ArtifactStore,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<XCTestArtifact, XCTestError> {
+        let sha256 = format!("{:x}", Sha256::digest(&payload));
+        let registration = store
+            .register(
+                session,
+                ArtifactMetadata {
+                    sha256: sha256.clone(),
+                    size: payload.len() as u64,
+                    mime_type: "application/octet-stream".into(),
+                    job_id: job_id.into(),
+                    expires_at,
+                },
+                vec![sha256.clone()],
+                now,
+            )
+            .map_err(XCTestError::Artifact)?;
+        store
+            .write_chunk(session, &registration.id(), 0, &payload, now)
+            .map_err(XCTestError::Artifact)?;
+        Ok(XCTestArtifact { sha256 })
+    }
+
+    fn redact(mut payload: Vec<u8>, secrets: &[&String]) -> Vec<u8> {
+        for secret in secrets {
+            if !secret.is_empty() {
+                payload = replace_bytes(&payload, secret.as_bytes(), b"[REDACTED]");
+            }
+        }
+        payload
+    }
+
+    fn replace_bytes(value: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut remaining = value;
+        while let Some(index) = remaining
+            .windows(needle.len())
+            .position(|part| part == needle)
+        {
+            output.extend_from_slice(&remaining[..index]);
+            output.extend_from_slice(replacement);
+            remaining = &remaining[index + needle.len()..];
+        }
+        output.extend_from_slice(remaining);
+        output
+    }
+
+    fn files(root: &Path) -> Result<Vec<PathBuf>, XCTestError> {
+        fn visit(path: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
+            for entry in fs::read_dir(path)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    visit(&path, found)?;
+                } else {
+                    found.push(path);
+                }
+            }
+            Ok(())
+        }
+        let mut found = Vec::new();
+        visit(root, &mut found).map_err(|_| XCTestError::Io)?;
+        found.sort();
+        Ok(found)
+    }
+
+    fn pack(root: &Path, secrets: &[&String]) -> Result<Vec<u8>, XCTestError> {
+        let mut output = Vec::new();
+        for path in files(root)? {
+            let relative = path.strip_prefix(root).map_err(|_| XCTestError::Io)?;
+            let contents = redact(fs::read(&path).map_err(|_| XCTestError::Io)?, secrets);
+            output.extend_from_slice(relative.to_string_lossy().as_bytes());
+            output.push(0);
+            output.extend_from_slice(&(contents.len() as u64).to_le_bytes());
+            output.extend_from_slice(&contents);
+        }
+        Ok(output)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum XCTestTerminal {
+        Succeeded,
+        Cancelled,
+        TestsFailed,
+        RunnerCrashed,
+        DeviceLost,
+        IncompatibleResultSchema,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum XCTestRunEnd {
+        Cancelled,
+        Exited(i32),
+        DeviceDisconnected,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct XCTestOutcome {
+        pub result: NormalizedXCResult,
+        terminal: XCTestTerminal,
+    }
+
+    impl XCTestOutcome {
+        pub fn finish(result: NormalizedXCResult, terminal: XCTestTerminal) -> Self {
+            Self { result, terminal }
+        }
+
+        pub fn terminals(&self) -> impl Iterator<Item = &XCTestTerminal> {
+            std::iter::once(&self.terminal)
+        }
+    }
+
+    pub fn finish_xctest(
+        raw_result: &str,
+        end: XCTestRunEnd,
+    ) -> Result<XCTestOutcome, XCTestError> {
+        let result = parse_xcresult(raw_result)?;
+        let terminal = if result.schema_version != 1 {
+            XCTestTerminal::IncompatibleResultSchema
+        } else {
+            match end {
+                XCTestRunEnd::Cancelled => XCTestTerminal::Cancelled,
+                XCTestRunEnd::DeviceDisconnected => XCTestTerminal::DeviceLost,
+                XCTestRunEnd::Exited(0) => XCTestTerminal::Succeeded,
+                XCTestRunEnd::Exited(65) => XCTestTerminal::TestsFailed,
+                XCTestRunEnd::Exited(_) => XCTestTerminal::RunnerCrashed,
+            }
+        };
+        Ok(XCTestOutcome::finish(result, terminal))
+    }
+}
+
 pub mod apple_discovery {
     use crate::preflight::{AppleTool, AppleToolRunner};
     use crate::process_execution::{CancellationToken, EventKind, ProcessEvent, TerminalStatus};

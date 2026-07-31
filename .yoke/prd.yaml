@@ -121,7 +121,7 @@
     - Abbruch, Testfehler, Runner-Crash, Geräteverlust und inkompatibles
       Result-Schema erzeugen genau einen terminalen Status und behalten
       auswertbare Teilresultate
-  passes: false
+  passes: true
   needs:
     - STORY-26
   area: apple-testing

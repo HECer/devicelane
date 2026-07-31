@@ -1,0 +1,1 @@
+{"schema_version":2,"test_summaries":{"_values":[{"name":{"_value":"AppTests"},"tests":{"_values":[{"identifier":{"_value":"LoginTests/testLogin"},"testStatus":{"_value":"passed"},"duration":{"_value":0.2},"failureSummaries":{"_values":[]}}]}}]},"attachments":{"_values":[]},"coverage":{"_values":[]}}
