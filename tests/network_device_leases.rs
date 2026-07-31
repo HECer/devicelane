@@ -412,6 +412,7 @@ fn registry_restart_preserves_the_authenticated_host_and_device_owner() {
     harness._registry.kill().unwrap();
     harness._registry.wait().unwrap();
     harness._registry = start_registry(&harness.address, &harness._root.path().join("registry"));
+    wait_for_listener(&harness.address);
 
     let takeover = rpc(
         &harness.address,
@@ -644,7 +645,7 @@ fn expired_writer_finishes_before_the_promoted_writer_starts() {
     });
 
     thread::sleep(Duration::from_millis(850));
-    let promoted = current_grant(&harness, &harness.client_b);
+    let promoted = wait_for_current_grant(&harness, &harness.client_b);
     let second_job = cli_json(
         &harness.address,
         &harness.client_b,
@@ -852,6 +853,22 @@ fn current_grant(harness: &Harness, identity: &Path) -> serde_json::Value {
     response
 }
 
+fn wait_for_current_grant(harness: &Harness, identity: &Path) -> serde_json::Value {
+    let mut response = serde_json::Value::Null;
+    wait_until("lease promotion", || {
+        response = lease(
+            &harness.address,
+            identity,
+            &LeaseRequest::Queue {
+                device_id: DEVICE.into(),
+                lifetime_ms: 30_000,
+            },
+        );
+        response["lease_status"] == "acquired"
+    });
+    response
+}
+
 fn grant_id(response: &serde_json::Value) -> String {
     response["lease_grant"]["lease_id"]
         .as_str()
@@ -1041,6 +1058,10 @@ fn wait_for_host(address: &str, identity: &Path) {
                 output.status.success() && String::from_utf8_lossy(&output.stdout).contains("mac-1")
             })
     });
+}
+
+fn wait_for_listener(address: &str) {
+    wait_until("registry listener", || TcpStream::connect(address).is_ok());
 }
 
 fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
