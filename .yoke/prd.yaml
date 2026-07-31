@@ -140,7 +140,7 @@
     - Trace-, Symbol-, Crash- und Diagnoseausgaben werden als Artefakte
       registriert; fehlende Templates oder Symbole liefern stabile
       Repair-Hinweise
-  passes: false
+  passes: true
   needs:
     - STORY-27
   area: apple-diagnostics

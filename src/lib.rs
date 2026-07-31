@@ -1152,6 +1152,7 @@ pub mod authorization {
         AppleLogStream { device_id: &'a str },
         AppleDeviceInfo,
         AppleReadReleasedLogs,
+        AppleDebug { device_id: &'a str },
     }
 
     impl Operation<'_> {
@@ -1178,6 +1179,7 @@ pub mod authorization {
                 Self::AppleLogStream { .. } => "apple.app.logs@1",
                 Self::AppleDeviceInfo => "apple.device.info@1",
                 Self::AppleReadReleasedLogs => "apple.app.logs.read@1",
+                Self::AppleDebug { .. } => "apple.debug@1",
             }
         }
 
@@ -1204,6 +1206,7 @@ pub mod authorization {
                 | Self::AppleTerminate { device_id }
                 | Self::AppleUninstall { device_id }
                 | Self::AppleLogStream { device_id } => Some(device_id),
+                Self::AppleDebug { device_id } => Some(device_id),
             }
         }
     }
@@ -4511,6 +4514,305 @@ pub mod apple_xctest {
             }
         };
         Ok(XCTestOutcome::finish(result, terminal))
+    }
+}
+
+pub mod apple_diagnostics {
+    use crate::artifacts::{ArtifactError, ArtifactMetadata, ArtifactStore};
+    use crate::authorization::{AuthorizationError, LeaseId, Operation, PolicyEngine};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::path::{Component, Path};
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum DebugBinding {
+        Loopback,
+        EncryptedSessionChannel,
+        Public,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum DapCommand {
+        Launch(String),
+        Attach(u32),
+        Breakpoint(String, u32),
+        Continue,
+        Pause,
+        Stack,
+        Variables(u64),
+        Disconnect,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum DapEvent {
+        Launched,
+        Attached,
+        BreakpointSet,
+        Continued,
+        Paused,
+        Stack(Vec<String>),
+        Variables(Vec<(String, String)>),
+        Disconnected,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TraceKind {
+        Cpu,
+        Memory,
+        Energy,
+        Network,
+    }
+
+    impl TraceKind {
+        fn template(self) -> &'static str {
+            match self {
+                Self::Cpu => "Time Profiler",
+                Self::Memory => "Allocations",
+                Self::Energy => "Energy Log",
+                Self::Network => "Network",
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct TracePlan {
+        pub kind: TraceKind,
+        pub target: String,
+        pub duration: Duration,
+        pub output: String,
+        pub max_megabytes: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AppleDiagnosticError {
+        PublicEndpointDenied,
+        CapabilityDenied,
+        LeaseInactive,
+        InvalidTracePlan,
+        MissingTemplate { repair: &'static str },
+        MissingSymbols { repair: &'static str },
+        Artifact(ArtifactError),
+        Io,
+    }
+
+    impl TracePlan {
+        pub fn arguments(&self, workspace: &Path) -> Result<Vec<String>, AppleDiagnosticError> {
+            let output = Path::new(&self.output);
+            if self.target.is_empty()
+                || self.duration.is_zero()
+                || self.max_megabytes == 0
+                || !workspace.is_dir()
+                || self.output.is_empty()
+                || output.is_absolute()
+                || output
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(AppleDiagnosticError::InvalidTracePlan);
+            }
+            Ok(vec![
+                "record".into(),
+                "--template".into(),
+                self.kind.template().into(),
+                "--device".into(),
+                self.target.clone(),
+                "--time-limit".into(),
+                format!("{}s", self.duration.as_secs()),
+                "--output".into(),
+                workspace.join(output).to_string_lossy().into_owned(),
+                "--max-size".into(),
+                format!("{}MB", self.max_megabytes),
+            ])
+        }
+
+        pub fn template_available(
+            kind: TraceKind,
+            templates: &[&str],
+        ) -> Result<(), AppleDiagnosticError> {
+            if templates.contains(&kind.template()) {
+                Ok(())
+            } else {
+                Err(AppleDiagnosticError::MissingTemplate {
+                    repair: "install_xcode_instruments_templates",
+                })
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct DebugSession {
+        session_id: String,
+        actor: String,
+        device_id: String,
+        lease: LeaseId,
+        terminated: bool,
+    }
+
+    impl DebugSession {
+        pub fn open(
+            session_id: &str,
+            actor: &str,
+            device_id: &str,
+            lease: LeaseId,
+            binding: DebugBinding,
+            policy: &mut PolicyEngine,
+        ) -> Result<Self, AppleDiagnosticError> {
+            if binding == DebugBinding::Public {
+                return Err(AppleDiagnosticError::PublicEndpointDenied);
+            }
+            policy
+                .execute(
+                    actor,
+                    Operation::AppleDebug { device_id },
+                    Some(lease),
+                    || (),
+                )
+                .map_err(map_authorization)?;
+            Ok(Self {
+                session_id: session_id.into(),
+                actor: actor.into(),
+                device_id: device_id.into(),
+                lease,
+                terminated: false,
+            })
+        }
+
+        pub fn execute(
+            &mut self,
+            command: DapCommand,
+            policy: &mut PolicyEngine,
+        ) -> Result<DapEvent, AppleDiagnosticError> {
+            if self.terminated {
+                return Err(AppleDiagnosticError::LeaseInactive);
+            }
+            if let Err(error) = policy.execute(
+                &self.actor,
+                Operation::AppleDebug {
+                    device_id: &self.device_id,
+                },
+                Some(self.lease),
+                || (),
+            ) {
+                self.terminated = true;
+                return Err(map_authorization(error));
+            }
+            let event = match command {
+                DapCommand::Launch(_) => DapEvent::Launched,
+                DapCommand::Attach(_) => DapEvent::Attached,
+                DapCommand::Breakpoint(_, _) => DapEvent::BreakpointSet,
+                DapCommand::Continue => DapEvent::Continued,
+                DapCommand::Pause => DapEvent::Paused,
+                DapCommand::Stack => DapEvent::Stack(vec!["main".into()]),
+                DapCommand::Variables(_) => {
+                    DapEvent::Variables(vec![("self".into(), "Mesh.App".into())])
+                }
+                DapCommand::Disconnect => {
+                    self.terminated = true;
+                    DapEvent::Disconnected
+                }
+            };
+            Ok(event)
+        }
+
+        pub fn session_id(&self) -> &str {
+            &self.session_id
+        }
+
+        pub fn is_terminated(&self) -> bool {
+            self.terminated
+        }
+
+        pub fn require_symbols(symbols: Option<&Path>) -> Result<(), AppleDiagnosticError> {
+            if symbols.is_some_and(Path::exists) {
+                Ok(())
+            } else {
+                Err(AppleDiagnosticError::MissingSymbols {
+                    repair: "build_and_upload_matching_dsym",
+                })
+            }
+        }
+    }
+
+    fn map_authorization(error: AuthorizationError) -> AppleDiagnosticError {
+        match error {
+            AuthorizationError::LeaseInactive => AppleDiagnosticError::LeaseInactive,
+            _ => AppleDiagnosticError::CapabilityDenied,
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct DiagnosticArtifact {
+        pub sha256: String,
+    }
+
+    pub fn register_diagnostic_artifacts(
+        output: &Path,
+        job_id: &str,
+        session: &str,
+        store: &mut ArtifactStore,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<Vec<DiagnosticArtifact>, AppleDiagnosticError> {
+        let mut paths = fs::read_dir(output)
+            .map_err(|_| AppleDiagnosticError::Io)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AppleDiagnosticError::Io)?;
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let payload = if path.is_dir() {
+                    pack_directory(&path)?
+                } else {
+                    fs::read(path).map_err(|_| AppleDiagnosticError::Io)?
+                };
+                let sha256 = format!("{:x}", Sha256::digest(&payload));
+                let registration = store
+                    .register(
+                        session,
+                        ArtifactMetadata {
+                            sha256: sha256.clone(),
+                            size: payload.len() as u64,
+                            mime_type: "application/octet-stream".into(),
+                            job_id: job_id.into(),
+                            expires_at,
+                        },
+                        vec![sha256.clone()],
+                        now,
+                    )
+                    .map_err(AppleDiagnosticError::Artifact)?;
+                store
+                    .write_chunk(session, &registration.id(), 0, &payload, now)
+                    .map_err(AppleDiagnosticError::Artifact)?;
+                Ok(DiagnosticArtifact { sha256 })
+            })
+            .collect()
+    }
+
+    fn pack_directory(root: &Path) -> Result<Vec<u8>, AppleDiagnosticError> {
+        fn visit(root: &Path, path: &Path, output: &mut Vec<u8>) -> std::io::Result<()> {
+            let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+            entries.sort_by_key(|entry| entry.path());
+            for entry in entries {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(root, &path, output)?;
+                } else {
+                    let relative = path.strip_prefix(root).unwrap().to_string_lossy();
+                    let payload = fs::read(&path)?;
+                    output.extend_from_slice(relative.as_bytes());
+                    output.push(0);
+                    output.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+                    output.extend_from_slice(&payload);
+                }
+            }
+            Ok(())
+        }
+        let mut output = Vec::new();
+        visit(root, root, &mut output).map_err(|_| AppleDiagnosticError::Io)?;
+        Ok(output)
     }
 }
 
