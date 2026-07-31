@@ -3143,6 +3143,9 @@ pub mod network_processes {
             total_size: u64,
             sha256: String,
         },
+        ArtifactInfo {
+            artifact_id: String,
+        },
     }
 
     #[derive(Deserialize, Serialize)]

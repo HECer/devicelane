@@ -492,6 +492,22 @@ fn handle(
             total_size,
             &sha256,
         ),
+        Request::ArtifactInfo { artifact_id } => {
+            let artifacts = artifacts.lock().unwrap();
+            let Some(entry) = artifacts.entries.get(&artifact_id) else {
+                return write_response(&mut stream, error_response("unknown_artifact"));
+            };
+            if !entry.participants.contains(&peer_id) {
+                error_response("artifact_access_denied")
+            } else if !entry.published {
+                error_response("artifact_not_published")
+            } else {
+                Response {
+                    artifact_metadata: Some(entry.metadata.clone()),
+                    ..response()
+                }
+            }
+        }
     };
     let _ = serde_json::to_writer(&mut stream, &response);
     let _ = stream.write_all(b"\n");

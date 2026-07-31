@@ -6,6 +6,7 @@ use device_development_mesh::{
     remote_apple_protocol::AppleAgent,
     secure_transport::SecureTransport,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Write},
@@ -326,6 +327,7 @@ fn start_apple_job(
             configured_tools.push((AppleTool::Simctl, path.into()));
         }
         let mut events = Vec::new();
+        let mut artifact_bytes = Vec::new();
         let mut succeeded = false;
         if valid
             && let Ok(runner) = AppleToolRunner::new(&host_workspace, configured_tools)
@@ -348,6 +350,7 @@ fn start_apple_job(
             });
             for event in process_events {
                 if event.kind == EventKind::Stdout {
+                    artifact_bytes.extend_from_slice(&event.payload);
                     events.push(network_event(
                         events.len() as u64 + 2,
                         "stdout",
@@ -356,6 +359,10 @@ fn start_apple_job(
                 }
             }
         }
+        let artifact_id = succeeded
+            .then(|| publish_artifact(&registry, &transport, &job_id, &artifact_bytes))
+            .flatten()
+            .unwrap_or_default();
         events.push(network_event(
             events.len() as u64 + 2,
             if cancellation.is_cancelled() {
@@ -365,13 +372,62 @@ fn start_apple_job(
             } else {
                 "rejected"
             },
-            "",
+            &artifact_id,
         ));
         while !send_apple_progress(&registry, &transport, &job_id, events.clone(), true) {
             thread::sleep(Duration::from_millis(100));
         }
         running.lock().unwrap().remove(&job_id);
     });
+}
+
+fn publish_artifact(
+    registry: &str,
+    transport: &SecureTransport,
+    job_id: &str,
+    bytes: &[u8],
+) -> Option<String> {
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
+    let metadata = rpc(
+        registry,
+        transport,
+        &Request::ArtifactRegister {
+            job_id: job_id.into(),
+            name: "apple-tool-output.log".into(),
+            media_type: "text/plain".into(),
+            total_size: bytes.len() as u64,
+            sha256: sha256.clone(),
+        },
+    )?
+    .artifact_metadata?;
+    for (index, chunk) in bytes.chunks(64 * 1024).enumerate() {
+        let response = rpc(
+            registry,
+            transport,
+            &Request::ArtifactWrite {
+                artifact_id: metadata.id.clone(),
+                offset: (index * 64 * 1024) as u64,
+                total_size: bytes.len() as u64,
+                sha256: sha256.clone(),
+                chunk_sha256: format!("{:x}", Sha256::digest(chunk)),
+                bytes: chunk.to_vec(),
+            },
+        )?;
+        if response.error.is_some() {
+            return None;
+        }
+    }
+    Some(metadata.id)
+}
+
+fn rpc(registry: &str, transport: &SecureTransport, request: &Request) -> Option<Response> {
+    let stream = TcpStream::connect(registry).ok()?;
+    let mut stream = transport.connect_tls(stream, "registry").ok()?;
+    serde_json::to_writer(&mut stream, request).ok()?;
+    stream.write_all(b"\n").ok()?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).ok()?;
+    serde_json::from_str(&line).ok()
 }
 
 fn lease_is_active(

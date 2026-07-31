@@ -4,6 +4,7 @@ use device_development_mesh::{
     preflight::{AppleTool, AppleToolRunner},
     secure_transport::SecureTransport,
 };
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
@@ -58,6 +59,40 @@ fn main() {
     }
     let transport = SecureTransport::load_or_create(value(&a, "--identity"), "cli").unwrap();
     let address = value(&a, "--registry");
+    if a.iter().any(|item| item == "artifact-download") {
+        let body: serde_json::Value = serde_json::from_str(&value(&a, "--json-request")).unwrap();
+        let artifact_id = body["artifact_id"].as_str().unwrap();
+        let metadata = registry_rpc(
+            &address,
+            &transport,
+            Request::ArtifactInfo {
+                artifact_id: artifact_id.into(),
+            },
+        )
+        .artifact_metadata
+        .unwrap();
+        let mut bytes = Vec::new();
+        while bytes.len() < metadata.total_size as usize {
+            let response = registry_rpc(
+                &address,
+                &transport,
+                Request::ArtifactRead {
+                    artifact_id: metadata.id.clone(),
+                    offset: bytes.len() as u64,
+                    length: 64 * 1024,
+                    total_size: metadata.total_size,
+                    sha256: metadata.sha256.clone(),
+                },
+            );
+            bytes.extend(response.artifact_chunk.unwrap().bytes);
+        }
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), metadata.sha256);
+        println!(
+            "{}",
+            serde_json::json!({"bytes": bytes, "sha256": metadata.sha256})
+        );
+        return;
+    }
     let stream = connect(&address);
     stream
         // A Run RPC may legitimately wait up to two seconds for an agent.
@@ -125,6 +160,15 @@ fn main() {
             }
         }
     }
+}
+
+fn registry_rpc(address: &str, transport: &SecureTransport, request: Request) -> Response {
+    let mut stream = transport.connect_tls(connect(address), "registry").unwrap();
+    serde_json::to_writer(&mut stream, &request).unwrap();
+    stream.write_all(b"\n").unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
 }
 fn connect(address: &str) -> TcpStream {
     for _ in 0..100 {

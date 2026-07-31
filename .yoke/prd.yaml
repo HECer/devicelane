@@ -242,7 +242,7 @@
     - Prozessmarker beweisen, dass Apple-Tools nur auf dem Agent-Host laufen;
       Registry-Neustart und Client-Reconnect verlieren keine bestätigten Events
       oder terminalen Resultate
-  passes: false
+  passes: true
   needs:
     - STORY-32
   area: remote-apple-e2e
