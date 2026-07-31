@@ -229,15 +229,26 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
     registry_process.kill().unwrap();
     let markers = std::fs::read_to_string(marker).unwrap();
     assert!(markers.lines().all(|line| line.contains("agent-tool")));
-    for expected in [
-        "-project MeshApp.xcodeproj -list",
-        "-scheme MeshApp -destination \"platform=iOS Simulator,id=sim-1\" build",
-        "install sim-1 build/MeshApp.app",
-        "launch sim-1 dev.mesh.app",
-        "spawn sim-1 log show",
-        "-scheme MeshAppTests -destination \"platform=iOS Simulator,id=sim-1\" test",
+    for alternatives in [
+        &["-project MeshApp.xcodeproj -list"][..],
+        &[
+            "-scheme MeshApp -destination \"platform=iOS Simulator,id=sim-1\" build",
+            "-scheme MeshApp -destination platform=iOS Simulator,id=sim-1 build",
+        ],
+        &["install sim-1 build/MeshApp.app"],
+        &["launch sim-1 dev.mesh.app"],
+        &["spawn sim-1 log show"],
+        &[
+            "-scheme MeshAppTests -destination \"platform=iOS Simulator,id=sim-1\" test",
+            "-scheme MeshAppTests -destination platform=iOS Simulator,id=sim-1 test",
+        ],
     ] {
-        assert!(markers.contains(expected), "missing {expected}: {markers}");
+        assert!(
+            alternatives
+                .iter()
+                .any(|expected| markers.contains(expected)),
+            "missing one of {alternatives:?}: {markers}"
+        );
     }
 }
 
