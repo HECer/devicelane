@@ -327,6 +327,21 @@ pub mod process_execution {
                 return Err(ProcessError::WorkspaceEscape);
             }
 
+            #[cfg(windows)]
+            let mut command = if matches!(
+                program.extension().and_then(|extension| extension.to_str()),
+                Some("cmd" | "bat")
+            ) {
+                let mut command = Command::new("cmd.exe");
+                let script = program.to_string_lossy();
+                command
+                    .args(["/D", "/C"])
+                    .arg(script.strip_prefix(r"\\?\").unwrap_or(&script));
+                command
+            } else {
+                Command::new(&program)
+            };
+            #[cfg(not(windows))]
             let mut command = Command::new(program);
             command
                 .args(request.args)
@@ -3000,6 +3015,7 @@ pub mod sessions {
 }
 
 pub mod network_processes {
+    use crate::remote_apple_protocol::AppleRequest;
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3071,6 +3087,17 @@ pub mod network_processes {
             job_id: String,
             after: u64,
         },
+        AppleRun {
+            operation: AppleRequest,
+        },
+        AppleProgress {
+            job_id: String,
+            events: Vec<NetworkEvent>,
+            terminal: bool,
+        },
+        AppleCancel {
+            job_id: String,
+        },
     }
 
     #[derive(Deserialize, Serialize)]
@@ -3089,6 +3116,10 @@ pub mod network_processes {
         pub error: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub operation: Option<RunRequest>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub apple_operation: Option<AppleRequest>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub cancel_jobs: Vec<String>,
     }
 }
 
@@ -5195,6 +5226,8 @@ pub mod remote_apple_protocol {
         pub workspace_path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub device_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lease_id: Option<String>,
         pub operation: AppleOperation,
     }
 
@@ -5327,33 +5360,15 @@ pub mod remote_apple_protocol {
         }
 
         pub fn validate(&self, request: &AppleRequest) -> Result<(), ProtocolError> {
-            if request.version != (RemoteProtocolVersion { major: 1, minor: 0 }) {
-                return Err(ProtocolError::new(
-                    "unsupported_version",
-                    "unsupported protocol version",
-                ));
-            }
-            if request.request_id.is_empty() || request.idempotency_key.is_empty() {
-                return Err(ProtocolError::new(
-                    "invalid_request",
-                    "request identifiers must not be empty",
-                ));
-            }
-            if request.capability != request.operation.capability()
-                || !self.capabilities.contains(&request.capability)
-            {
+            validate_request_envelope(request)?;
+            if !self.capabilities.contains(&request.capability) {
                 return Err(ProtocolError::new(
                     "unsupported_capability",
                     "capability is not available",
                 ));
             }
             let path = Path::new(&request.workspace_path);
-            if path.as_os_str().is_empty()
-                || path.is_absolute()
-                || path
-                    .components()
-                    .any(|component| !matches!(component, Component::Normal(_)))
-                || fs::canonicalize(self.workspace_root.join(path)).is_err_and(|_| true)
+            if fs::canonicalize(self.workspace_root.join(path)).is_err_and(|_| true)
                 || !fs::canonicalize(self.workspace_root.join(path))
                     .is_ok_and(|resolved| resolved.starts_with(&self.workspace_root))
             {
@@ -5496,11 +5511,67 @@ pub mod remote_apple_protocol {
         }
     }
 
+    pub fn validate_request_envelope(request: &AppleRequest) -> Result<(), ProtocolError> {
+        if request.version != (RemoteProtocolVersion { major: 1, minor: 0 }) {
+            return Err(ProtocolError::new(
+                "unsupported_version",
+                "unsupported protocol version",
+            ));
+        }
+        if request.request_id.is_empty() || request.idempotency_key.is_empty() {
+            return Err(ProtocolError::new(
+                "invalid_request",
+                "request identifiers must not be empty",
+            ));
+        }
+        if request.capability != request.operation.capability() {
+            return Err(ProtocolError::new(
+                "unsupported_capability",
+                "capability does not match the operation",
+            ));
+        }
+        let path = Path::new(&request.workspace_path);
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(ProtocolError::new(
+                "workspace_path_denied",
+                "workspace path is outside the workspace",
+            ));
+        }
+        if request.operation.requires_device() && request.device_id.is_none() {
+            return Err(ProtocolError::new(
+                "unknown_device",
+                "device is not available",
+            ));
+        }
+        for identifier in [request.device_id.as_deref(), request.lease_id.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if identifier.is_empty()
+                || !identifier.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+                })
+            {
+                return Err(ProtocolError::new(
+                    "invalid_request",
+                    "device or lease identifier is invalid",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn same_operation(left: &AppleRequest, right: &AppleRequest) -> bool {
         left.version == right.version
             && left.capability == right.capability
             && left.workspace_path == right.workspace_path
             && left.device_id == right.device_id
+            && left.lease_id == right.lease_id
             && left.operation == right.operation
     }
 
@@ -5738,6 +5809,7 @@ pub mod remote_apple_agent {
             && left.capability == right.capability
             && left.workspace_path == right.workspace_path
             && left.device_id == right.device_id
+            && left.lease_id == right.lease_id
             && left.operation == right.operation
     }
 

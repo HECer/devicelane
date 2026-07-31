@@ -63,7 +63,7 @@ fn main() {
         // A Run RPC may legitimately wait up to two seconds for an agent.
         // Keep the client deadline comfortably beyond the server deadline so
         // the registry can return its structured `agent_timeout` response.
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(8)))
         .unwrap();
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))
@@ -71,7 +71,12 @@ fn main() {
     let mut stream = transport.connect_tls(stream, "registry").unwrap();
     let command = a
         .iter()
-        .find(|item| matches!(item.as_str(), "list" | "run" | "events"))
+        .find(|item| {
+            matches!(
+                item.as_str(),
+                "list" | "run" | "events" | "apple-run" | "apple-cancel"
+            )
+        })
         .map(String::as_str)
         .unwrap();
     let request = match command {
@@ -85,6 +90,16 @@ fn main() {
             Request::Events {
                 job_id: body["job_id"].as_str().unwrap().into(),
                 after: body["after"].as_u64().unwrap(),
+            }
+        }
+        "apple-run" => Request::AppleRun {
+            operation: serde_json::from_str(&value(&a, "--json-request")).unwrap(),
+        },
+        "apple-cancel" => {
+            let body: serde_json::Value =
+                serde_json::from_str(&value(&a, "--json-request")).unwrap();
+            Request::AppleCancel {
+                job_id: body["job_id"].as_str().unwrap().into(),
             }
         }
         _ => unreachable!(),
@@ -130,7 +145,7 @@ fn value(a: &[String], n: &str) -> String {
 fn metadata(a: &[String]) -> bool {
     if a == ["--help"] {
         println!(
-            "{NAME} doctor --identity DIRECTORY | apple-discover --workspace DIRECTORY --devicectl PATH --simctl PATH --json | pair --address ADDRESS --identity DIRECTORY | --registry ADDRESS --identity DIRECTORY list [--json] | run|events --json-request JSON"
+            "{NAME} doctor --identity DIRECTORY | apple-discover --workspace DIRECTORY --devicectl PATH --simctl PATH --json | pair --address ADDRESS --identity DIRECTORY | --registry ADDRESS --identity DIRECTORY list [--json] | run|events|apple-run|apple-cancel --json-request JSON"
         );
         true
     } else if a == ["--version"] {

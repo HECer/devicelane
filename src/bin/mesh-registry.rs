@@ -1,6 +1,7 @@
 use device_development_mesh::network_processes::{
     AuditRecord, HostSnapshot, NetworkEvent, Request, Response, RunRequest,
 };
+use device_development_mesh::remote_apple_protocol::{AppleRequest, validate_request_envelope};
 use device_development_mesh::secure_transport::SecureTransport;
 use sha2::{Digest, Sha256};
 use std::{
@@ -28,8 +29,14 @@ struct DurableState {
     artifacts: HashMap<String, String>,
     audit: Vec<AuditRecord>,
     pending: HashMap<String, RunRequest>,
+    apple_pending: HashMap<String, AppleRequest>,
+    apple_requests: HashMap<String, String>,
+    apple_operations: HashMap<String, AppleRequest>,
+    apple_hosts: HashMap<String, String>,
     #[serde(skip)]
     dispatched: HashSet<String>,
+    #[serde(skip)]
+    cancelled: HashSet<String>,
     #[serde(skip)]
     recovery_error: Option<String>,
 }
@@ -119,6 +126,20 @@ fn handle(
                 response.operation = Some(operation);
                 response.job_id = Some(job_id);
             }
+            if let Some((job_id, operation)) = state
+                .apple_pending
+                .iter()
+                .find(|(job_id, _)| {
+                    state.apple_hosts.get(*job_id) == Some(&host_id)
+                        && !state.dispatched.contains(*job_id)
+                })
+                .map(|(job_id, operation)| (job_id.clone(), operation.clone()))
+            {
+                state.dispatched.insert(job_id.clone());
+                response.apple_operation = Some(operation);
+                response.job_id = Some(job_id);
+            }
+            response.cancel_jobs = state.cancelled.iter().cloned().collect();
             response
         }
         Request::Complete {
@@ -211,6 +232,115 @@ fn handle(
                 ..response()
             }
         }
+        Request::AppleRun { operation } => {
+            if let Err(error) = validate_request_envelope(&operation) {
+                return write_response(
+                    &mut stream,
+                    Response {
+                        accepted: false,
+                        error: Some(error.code().into()),
+                        ..response()
+                    },
+                );
+            }
+            let mut state = state.lock().unwrap();
+            let job_id = if let Some(job_id) = state.apple_requests.get(&operation.idempotency_key)
+            {
+                if state
+                    .apple_operations
+                    .get(&operation.idempotency_key)
+                    .is_some_and(|existing| existing != &operation)
+                {
+                    return write_response(
+                        &mut stream,
+                        Response {
+                            accepted: false,
+                            error: Some("idempotency_conflict".into()),
+                            ..response()
+                        },
+                    );
+                }
+                job_id.clone()
+            } else {
+                let target = entries
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .find(|entry| {
+                        entry.host.capabilities.contains(&operation.capability)
+                            && operation.device_id.as_ref().is_none_or(|device_id| {
+                                entry.host.devices.iter().any(|device| {
+                                    &device.id == device_id && device.state == "connected"
+                                })
+                            })
+                    })
+                    .map(|entry| entry.host.id.clone());
+                let Some(target) = target else {
+                    return write_response(
+                        &mut stream,
+                        Response {
+                            accepted: false,
+                            error: Some("no_eligible_host".into()),
+                            ..response()
+                        },
+                    );
+                };
+                let job_id = format!(
+                    "apple-{:x}",
+                    Sha256::digest(operation.idempotency_key.as_bytes())
+                );
+                state
+                    .apple_requests
+                    .insert(operation.idempotency_key.clone(), job_id.clone());
+                state
+                    .apple_operations
+                    .insert(operation.idempotency_key.clone(), operation.clone());
+                state.apple_pending.insert(job_id.clone(), operation);
+                state.apple_hosts.insert(job_id.clone(), target);
+                state.jobs.insert(job_id.clone(), Vec::new());
+                fs::write(state_path, serde_json::to_vec(&*state).unwrap()).unwrap();
+                job_id
+            };
+            Response {
+                job_id: Some(job_id),
+                ..response()
+            }
+        }
+        Request::AppleProgress {
+            job_id,
+            events,
+            terminal,
+        } => {
+            let mut state = state.lock().unwrap();
+            let existing = state.jobs.entry(job_id.clone()).or_default();
+            for event in events {
+                if !existing
+                    .iter()
+                    .any(|current| current.sequence == event.sequence)
+                {
+                    existing.push(event);
+                }
+            }
+            if terminal {
+                state.apple_pending.remove(&job_id);
+                state.cancelled.remove(&job_id);
+            }
+            fs::write(state_path, serde_json::to_vec(&*state).unwrap()).unwrap();
+            response()
+        }
+        Request::AppleCancel { job_id } => {
+            let mut state = state.lock().unwrap();
+            if state.apple_pending.contains_key(&job_id) {
+                state.cancelled.insert(job_id);
+                response()
+            } else {
+                Response {
+                    accepted: false,
+                    error: Some("unknown_job".into()),
+                    ..response()
+                }
+            }
+        }
     };
     let _ = serde_json::to_writer(&mut stream, &response);
     let _ = stream.write_all(b"\n");
@@ -243,7 +373,7 @@ fn run(operation: RunRequest, shared: &Mutex<DurableState>, state_path: &Path) -
     state.pending.insert(job_id.clone(), operation);
     fs::write(state_path, serde_json::to_vec(&*state).unwrap()).unwrap();
     drop(state);
-    for _ in 0..200 {
+    for _ in 0..500 {
         if let Some(response) = {
             let state = shared.lock().unwrap();
             state
@@ -289,6 +419,8 @@ fn response() -> Response {
         artifact: None,
         error: None,
         operation: None,
+        apple_operation: None,
+        cancel_jobs: vec![],
     }
 }
 fn write_response(stream: &mut impl Write, response: Response) {

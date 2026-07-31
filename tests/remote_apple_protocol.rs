@@ -13,6 +13,7 @@ fn request(operation: AppleOperation) -> AppleRequest {
         capability: operation.capability().into(),
         workspace_path: "project".into(),
         device_id: operation.requires_device().then(|| "iphone-1".into()),
+        lease_id: operation.requires_device().then(|| "lease-1".into()),
         operation,
     }
 }
