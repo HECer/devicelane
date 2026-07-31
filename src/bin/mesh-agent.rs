@@ -2,7 +2,7 @@ use device_development_mesh::{
     apple_discovery::{AppleDiscovery, Availability},
     network_processes::{DeviceSnapshot, HostSnapshot, Request, Response},
     preflight::{AppleTool, AppleToolRunner},
-    process_execution::{CancellationToken, EventKind},
+    process_execution::{CancellationToken, EventKind, ProcessExecutor, ProcessRequest},
     remote_apple_protocol::AppleAgent,
     secure_transport::SecureTransport,
 };
@@ -86,6 +86,11 @@ fn main() {
     let xcresulttool = optional_value(&args, "--xcresulttool");
     let xctrace = optional_value(&args, "--xctrace");
     let lldb_dap = optional_value(&args, "--lldb-dap");
+    let hardware_gate = optional_value(&args, "--hardware-gate");
+    let controlled_home = std::env::var("HOME").ok().filter(|home| {
+        let path = std::path::Path::new(home);
+        path.is_absolute() && path.is_dir()
+    });
     let legacy_capabilities = values(&args, "--capability");
     let legacy_devices: Vec<_> = values(&args, "--device")
         .into_iter()
@@ -104,6 +109,13 @@ fn main() {
     loop {
         let (mut capabilities, mut devices) =
             discover(&workspace_root, &xcodebuild, &devicectl, &simctl);
+        if hardware_gate
+            .as_ref()
+            .is_some_and(|path| std::path::Path::new(path).is_file())
+            && capabilities.iter().any(|value| value == "apple.device@1")
+        {
+            capabilities.push("apple.hardware-gate@1".into());
+        }
         capabilities.extend(legacy_capabilities.iter().cloned());
         capabilities.sort();
         capabilities.dedup();
@@ -173,6 +185,9 @@ fn main() {
                             xcresulttool.clone(),
                             xctrace.clone(),
                             lldb_dap.clone(),
+                            hardware_gate.clone(),
+                            peer_id.clone(),
+                            controlled_home.clone(),
                             host.capabilities.clone(),
                             host.devices.clone(),
                             Arc::clone(&running),
@@ -284,6 +299,9 @@ fn start_apple_job(
     xcresulttool: Option<String>,
     xctrace: Option<String>,
     lldb_dap: Option<String>,
+    hardware_gate: Option<String>,
+    peer_id: String,
+    controlled_home: Option<String>,
     capabilities: Vec<String>,
     devices: Vec<DeviceSnapshot>,
     running: Arc<Mutex<HashMap<String, CancellationToken>>>,
@@ -313,6 +331,12 @@ fn start_apple_job(
             .map(|device| device.id)
             .collect();
         let workspace = host_workspace.join(&operation.workspace_path);
+        if matches!(
+            operation.operation,
+            device_development_mesh::remote_apple_protocol::AppleOperation::HardwareGate { .. }
+        ) {
+            let _ = std::fs::create_dir_all(&workspace);
+        }
         let grant_authentic = if operation.operation.mutates_device() {
             lease_grant.as_ref().is_some_and(|grant| {
                 grant.job_id == job_id
@@ -424,6 +448,9 @@ fn start_apple_job(
                     "test".into(),
                 ],
             ),
+            device_development_mesh::remote_apple_protocol::AppleOperation::HardwareGate {
+                ..
+            } => (AppleTool::Xcodebuild, Vec::new()),
         };
         let mut configured_tools = vec![(AppleTool::Xcodebuild, tool.into())];
         if let Some(path) = devicectl {
@@ -471,32 +498,96 @@ fn start_apple_job(
                     )
                     .is_some_and(|response| response.lease_status.as_deref() == Some("active"))
                 });
-            if lease_active
-                && let Ok(process_events) = runner.execute(
-                    selected_tool,
-                    arguments,
-                    &operation.workspace_path,
-                    HashMap::new(),
-                    Duration::from_secs(60),
-                    cancellation.clone(),
-                )
-            {
-                succeeded = process_events.last().is_some_and(|event| {
-                    matches!(
+            if lease_active {
+                let execution = if matches!(
+                    operation.operation,
+                    device_development_mesh::remote_apple_protocol::AppleOperation::HardwareGate { .. }
+                ) {
+                    let team_id = match &operation.operation {
+                        device_development_mesh::remote_apple_protocol::AppleOperation::HardwareGate { team_id } => team_id.clone(),
+                        _ => unreachable!(),
+                    };
+                    let gate = hardware_gate.as_ref().ok_or(
+                        device_development_mesh::process_execution::ProcessError::ProgramDenied,
+                    );
+                    gate.and_then(|gate| {
+                        let home = controlled_home.clone().ok_or(
+                            device_development_mesh::process_execution::ProcessError::EnvironmentDenied,
+                        )?;
+                        ProcessExecutor::new(
+                            &host_workspace,
+                            [gate.into()],
+                            ["HOME", "PATH"],
+                        )?
+                        .execute(
+                            ProcessRequest {
+                                program: gate.into(),
+                                args: vec![
+                                    "--device".into(),
+                                    operation.device_id.clone().unwrap(),
+                                    "--team".into(),
+                                    team_id,
+                                    "--output".into(),
+                                    workspace
+                                        .join("hardware-gates")
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                    "--job-id".into(),
+                                    job_id.clone(),
+                                    "--agent-peer".into(),
+                                    peer_id.clone(),
+                                    "--archive-stdout".into(),
+                                ],
+                                working_directory: operation.workspace_path.clone().into(),
+                                environment: HashMap::from([
+                                    ("HOME".into(), home),
+                                    ("PATH".into(), "/usr/bin:/bin".into()),
+                                ]),
+                            },
+                            Duration::from_secs(30 * 60),
+                            cancellation.clone(),
+                        )
+                    })
+                } else {
+                    runner.execute(
+                        selected_tool,
+                        arguments,
+                        &operation.workspace_path,
+                        HashMap::new(),
+                        Duration::from_secs(60),
+                        cancellation.clone(),
+                    )
+                };
+                if let Ok(process_events) = execution {
+                    succeeded =
+                        process_events.last().is_some_and(|event| {
+                            matches!(
                         event.kind,
                         EventKind::Terminal(
                             device_development_mesh::process_execution::TerminalStatus::Exited(0)
                         )
                     )
-                });
-                for event in process_events {
-                    if event.kind == EventKind::Stdout {
-                        artifact_bytes.extend_from_slice(&event.payload);
-                        events.push(network_event(
-                            events.len() as u64 + 2,
-                            "stdout",
-                            &String::from_utf8_lossy(&event.payload),
-                        ));
+                        });
+                    for event in process_events {
+                        if event.kind == EventKind::Stdout {
+                            artifact_bytes.extend_from_slice(&event.payload);
+                            if !matches!(
+                            operation.operation,
+                            device_development_mesh::remote_apple_protocol::AppleOperation::HardwareGate { .. }
+                        ) {
+                            events.push(network_event(
+                                events.len() as u64 + 2,
+                                "stdout",
+                                &String::from_utf8_lossy(&event.payload),
+                            ));
+                        } else if event.kind == EventKind::Stderr {
+                            events.push(network_event(
+                                events.len() as u64 + 2,
+                                "stderr",
+                                &String::from_utf8_lossy(&event.payload),
+                            ));
+                        }
+                        }
                     }
                 }
             }
@@ -506,8 +597,25 @@ fn start_apple_job(
                 available.notify_all();
             }
         }
+        let (artifact_name, artifact_media_type) = if matches!(
+            operation.operation,
+            device_development_mesh::remote_apple_protocol::AppleOperation::HardwareGate { .. }
+        ) {
+            ("mac-hardware-gate.tar.gz", "application/gzip")
+        } else {
+            ("apple-tool-output.log", "text/plain")
+        };
         let artifact_id = succeeded
-            .then(|| publish_artifact(&registry, &transport, &job_id, &artifact_bytes))
+            .then(|| {
+                publish_artifact(
+                    &registry,
+                    &transport,
+                    &job_id,
+                    artifact_name,
+                    artifact_media_type,
+                    &artifact_bytes,
+                )
+            })
             .flatten()
             .unwrap_or_default();
         events.push(network_event(
@@ -532,6 +640,8 @@ fn publish_artifact(
     registry: &str,
     transport: &SecureTransport,
     job_id: &str,
+    name: &str,
+    media_type: &str,
     bytes: &[u8],
 ) -> Option<String> {
     let sha256 = format!("{:x}", Sha256::digest(bytes));
@@ -540,8 +650,8 @@ fn publish_artifact(
         transport,
         &Request::ArtifactRegister {
             job_id: job_id.into(),
-            name: "apple-tool-output.log".into(),
-            media_type: "text/plain".into(),
+            name: name.into(),
+            media_type: media_type.into(),
             total_size: bytes.len() as u64,
             sha256: sha256.clone(),
         },

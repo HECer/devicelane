@@ -163,6 +163,10 @@ fn rendered_production_plist_rejects_fake_loopback_and_unresolved_configuration(
         .replace("$PLIST_XCRESULTTOOL", &tools[3])
         .replace("$PLIST_XCTRACE", &tools[4])
         .replace("$PLIST_LLDB_DAP", &tools[5])
+        .replace(
+            "$PLIST_HARDWARE_GATE_PATH",
+            "/Users/dev/.local/lib/device-development-mesh/hardware-gate/mac-hardware-gate.sh",
+        )
         .replace("$(uname -m)", "arm64");
     let tool_refs: Vec<_> = tools.iter().map(String::as_str).collect();
 

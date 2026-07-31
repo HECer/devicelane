@@ -68,6 +68,8 @@ esac
 PROGRAM_DIR="$HOME_DIR/.local/lib/device-development-mesh"
 PROGRAM_PATH="$PROGRAM_DIR/bin/mesh-agent"
 CLI_PATH="$PROGRAM_DIR/bin/mesh-cli"
+HARDWARE_GATE_DIR="$PROGRAM_DIR/hardware-gate"
+HARDWARE_GATE_PATH="$HARDWARE_GATE_DIR/mac-hardware-gate.sh"
 IDENTITY_DIR="$HOME_DIR/Library/Application Support/DeviceDevelopmentMesh/identity"
 PEER_ID_PATH="$IDENTITY_DIR/peer-id"
 AUDIT_DIR="$HOME_DIR/Library/Application Support/DeviceDevelopmentMesh/audit"
@@ -102,6 +104,7 @@ if [ "$MODE" = uninstall ]; then
     launchctl bootout "$SERVICE" >/dev/null 2>&1 || true
     rm -f "$PLIST_PATH"
     rm -f "$PROGRAM_PATH" "$CLI_PATH"
+    rm -rf "$HARDWARE_GATE_DIR"
     rmdir "$PROGRAM_DIR/bin" "$PROGRAM_DIR" >/dev/null 2>&1 || true
     exit
 fi
@@ -166,6 +169,14 @@ cd "$ROOT"
 cargo build --workspace --release >/dev/null
 install -m 700 target/release/mesh-agent "$PROGRAM_PATH"
 install -m 700 target/release/mesh-cli "$CLI_PATH"
+rm -rf "$HARDWARE_GATE_DIR.next"
+mkdir "$HARDWARE_GATE_DIR.next"
+cp scripts/mac-hardware-gate.sh "$HARDWARE_GATE_DIR.next/mac-hardware-gate.sh"
+cp -R hardware/DeviceMeshGate "$HARDWARE_GATE_DIR.next/DeviceMeshGate"
+chmod 700 "$HARDWARE_GATE_DIR.next" "$HARDWARE_GATE_DIR.next/mac-hardware-gate.sh"
+chmod -R go-rwx "$HARDWARE_GATE_DIR.next/DeviceMeshGate"
+rm -rf "$HARDWARE_GATE_DIR"
+mv "$HARDWARE_GATE_DIR.next" "$HARDWARE_GATE_DIR"
 
 if [ "${MESH_BOOTSTRAP_TEST_MODE:-0}" = 1 ]; then
     REQUESTED_PEER_ID=${MESH_PEER_ID:-mac-agent-smoke}
@@ -237,6 +248,7 @@ PLIST_SIMCTL=$(printf '%s' "$SIMCTL" | xml_escape)
 PLIST_XCRESULTTOOL=$(printf '%s' "$XCRESULTTOOL" | xml_escape)
 PLIST_XCTRACE=$(printf '%s' "$XCTRACE" | xml_escape)
 PLIST_LLDB_DAP=$(printf '%s' "$LLDB_DAP" | xml_escape)
+PLIST_HARDWARE_GATE_PATH=$(printf '%s' "$HARDWARE_GATE_PATH" | xml_escape)
 PLIST_PEER_ID=$(printf '%s' "$PEER_ID" | xml_escape)
 trap 'rm -f "$PLIST_STAGE"' EXIT HUP INT TERM
 cat >"$PLIST_STAGE" <<EOF
@@ -273,6 +285,8 @@ cat >"$PLIST_STAGE" <<EOF
     <string>$PLIST_XCTRACE</string>
     <string>--lldb-dap</string>
     <string>$PLIST_LLDB_DAP</string>
+    <string>--hardware-gate</string>
+    <string>$PLIST_HARDWARE_GATE_PATH</string>
     <string>--heartbeat-ms</string>
     <string>1000</string>
     <string>--workspace-root</string>

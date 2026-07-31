@@ -55,6 +55,9 @@ fn typed_versioned_requests_round_trip_without_a_raw_shell_field() {
             scheme: "MeshAppTests".into(),
             destination: "platform=iOS Simulator,id=sim-1".into(),
         },
+        AppleOperation::HardwareGate {
+            team_id: "ABCDE12345".into(),
+        },
     ];
 
     for operation in operations {
@@ -97,6 +100,17 @@ fn typed_vertical_slice_parameters_are_validated() {
 
     invalid.operation = AppleOperation::LaunchApp {
         bundle_id: "not a bundle id".into(),
+    };
+    invalid.capability = invalid.operation.capability().into();
+    assert_eq!(
+        device_development_mesh::remote_apple_protocol::validate_request_envelope(&invalid)
+            .unwrap_err()
+            .code(),
+        "invalid_apple_parameter"
+    );
+
+    invalid.operation = AppleOperation::HardwareGate {
+        team_id: "not-a-team".into(),
     };
     invalid.capability = invalid.operation.capability().into();
     assert_eq!(

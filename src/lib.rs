@@ -5346,6 +5346,9 @@ pub mod remote_apple_protocol {
             scheme: String,
             destination: String,
         },
+        HardwareGate {
+            team_id: String,
+        },
     }
 
     impl AppleOperation {
@@ -5361,6 +5364,7 @@ pub mod remote_apple_protocol {
                     "apple.simulator@1"
                 }
                 Self::RunXcTest { .. } => "apple.xctest@1",
+                Self::HardwareGate { .. } => "apple.hardware-gate@1",
             }
         }
 
@@ -5373,6 +5377,7 @@ pub mod remote_apple_protocol {
                     | Self::LaunchApp { .. }
                     | Self::ReadAppLogs { .. }
                     | Self::RunXcTest { .. }
+                    | Self::HardwareGate { .. }
             )
         }
 
@@ -5384,6 +5389,7 @@ pub mod remote_apple_protocol {
                     | Self::InstallApp { .. }
                     | Self::LaunchApp { .. }
                     | Self::RunXcTest { .. }
+                    | Self::HardwareGate { .. }
             )
         }
     }
@@ -5750,6 +5756,12 @@ pub mod remote_apple_protocol {
             AppleOperation::InstallApp { app_path } => valid_relative(app_path),
             AppleOperation::LaunchApp { bundle_id } | AppleOperation::ReadAppLogs { bundle_id } => {
                 valid_bundle(bundle_id)
+            }
+            AppleOperation::HardwareGate { team_id } => {
+                team_id.len() == 10
+                    && team_id.chars().all(|character| {
+                        character.is_ascii_uppercase() || character.is_ascii_digit()
+                    })
             }
             _ => true,
         };
