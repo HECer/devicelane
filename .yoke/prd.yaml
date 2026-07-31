@@ -236,19 +236,61 @@
     - Ein Client synchronisiert einen Manifest-Workspace, entdeckt Projekt und
       Simulator, baut, installiert, startet, liest Logs, führt XCTest aus und
       lädt die Artefakte mit geprüften Hashes zurück
+    - Jede dieser Stufen besitzt eine eigene serialisierbare typisierte
+      Remote-Aktion mit validierten Parametern wie Container, Scheme,
+      Destination, App-Pfad und Bundle-ID; eine grobe Kategorie, die nur list
+      oder build ausführt, erfüllt den Vertikalschnitt nicht
     - Ein zweiter gepairter Client kann denselben Agent entdecken und zulässige
       Beobachtung ausführen; exklusive Geräteoperationen folgen deterministisch
       Lease, Queue, Revoke und Disconnect
     - Prozessmarker beweisen, dass Apple-Tools nur auf dem Agent-Host laufen;
       Registry-Neustart und Client-Reconnect verlieren keine bestätigten Events
       oder terminalen Resultate
-  passes: true
+  passes: false
   needs:
     - STORY-32
   area: remote-apple-e2e
 - id: STORY-34
-  title: Reales Mac-und-iPhone-Hardware-Gate bestehen
+  title: Verteilte Geräte-Leases und Mehrclient-Steuerung liefern
   priority: 14
+  acceptance:
+    - tests/network_device_leases.rs startet zwei getrennt gepairte Clients und
+      verwaltet Acquire, Renew, Queue, Release und Revoke über mTLS-Nachrichten
+      der Registry statt über vorab erzeugte Dateien im Agent-Workspace
+    - Genau ein Client besitzt die exklusive mutierende Lease eines Geräts;
+      Beobachter dürfen freigegebene Events und Logs lesen, aber nicht
+      installieren, starten, stoppen, debuggen oder Lease-Dateien vortäuschen
+    - Disconnect, Ablauf und Agent-Detach geben die Lease deterministisch frei
+      und befördern den nächsten wartenden Client ohne zwei gleichzeitige Writer
+    - Der Agent akzeptiert mutierende Apple-Aktionen nur mit einem von der
+      Registry signierten, jobgebundenen Lease-Grant und prüft ihn direkt vor
+      jeder Toolausführung erneut
+  passes: false
+  needs:
+    - STORY-33
+  area: distributed-device-leases
+- id: STORY-35
+  title: Produktionsbootstrap und Neustartpersistenz schließen
+  priority: 15
+  acceptance:
+    - tests/mac_bootstrap.rs beweist, dass setup-mac.sh alle Apple-Toolpfade über
+      xcrun auflöst, an den LaunchAgent übergibt und keine statische Dummy-Device-
+      oder reine process.start-Konfiguration installiert
+    - Registry persistiert Artefaktmetadaten, bestätigte Offsets, Teilnehmer,
+      Lease-Queue und Apple-Jobs atomar; ein Neustart setzt Upload, Download,
+      Events und Queue ohne erneute Toolausführung fort
+    - scripts/mac-bootstrap-smoke simuliert Erstinstallation, Pairing, Neustart,
+      Upgrade und Diagnose mit entfernter Controller-Adresse in einem Befehl
+    - Ein plattformunabhängiger Produktionskonfigurationstest scheitert, wenn
+      Fake-Toolpfade, Loopback-Controller oder unaufgelöste Apple-Tools in der
+      installierten Plist verbleiben
+  passes: false
+  needs:
+    - STORY-34
+  area: production-bootstrap
+- id: STORY-36
+  title: Reales Mac-und-iPhone-Hardware-Gate bestehen
+  priority: 16
   acceptance:
     - scripts/mac-hardware-gate.sh läuft auf einem echten Mac ohne
       Mock-Toolpfade und erfasst Xcode-, SDK-, Tool- und Geräteversionen in
@@ -264,5 +306,5 @@
       Reparaturschritt
   passes: false
   needs:
-    - STORY-33
+    - STORY-35
   area: apple-hardware-gate

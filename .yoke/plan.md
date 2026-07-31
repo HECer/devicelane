@@ -387,4 +387,11 @@ nicht als Remote-Dispatch. Die Abnahme startet zwingend alle drei öffentlichen
 Binaries, nutzt den mTLS-Socketvertrag und weist den Ausführungsort mit einem
 Agent-Workspace-Marker nach.
 
+Zweiter Auditnachtrag: Die erste STORY-33-Fassung startete zwar getrennte
+Prozesse, bildete Apple-Aktionen aber nur als grobe Kategorien ab und erzeugte
+Leases direkt als Testdateien. Sie beweist weder Simulator-Install/Launch/Logs
+noch verteilte Mehrclient-Exklusivität. STORY-33 bleibt deshalb rot; die
+verteilte Lease-Steuerung und die produktive Bootstrap-/Neustartpersistenz sind
+als eigene Pflichtstories vor das Hardware-Gate gezogen.
+
 Nicht-Ziele dieses Loops bleiben allgemeine iOS-Systemfernsteuerung, Steuerung fremder Apps, Umgehung von Signing/Trust/Developer Mode sowie eine Desktop-GUI. Private Signing-Schlüssel verlassen niemals den macOS-Keychain. Der Nutzer wird erst eingebunden, wenn Bootstrap und Hardware-Gate als ein konkreter Mac-Befehl bereitstehen.

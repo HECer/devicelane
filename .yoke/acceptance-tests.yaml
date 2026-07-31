@@ -41,5 +41,10 @@ STORY-32:
 STORY-33:
   suite: tests/remote_apple_e2e.rs
 STORY-34:
+  suite: tests/network_device_leases.rs
+STORY-35:
+  suite: tests/mac_bootstrap.rs
+  bootstrap: scripts/mac-bootstrap-smoke
+STORY-36:
   hardware_gate: scripts/mac-hardware-gate.sh
   requires: macos-and-physical-iphone
