@@ -30,9 +30,10 @@ fn doctor_emits_machine_readable_checks_and_repairs() {
 #[test]
 fn doctor_rejects_an_additional_windows_acl_principal() {
     for target in ["", "private-key.der"] {
-        let identity = tempfile::tempdir().unwrap();
-        assert_eq!(permission_status(&doctor(identity.path())), "ok");
-        let path = identity.path().join(target);
+        let workspace = tempfile::tempdir().unwrap();
+        let identity = workspace.path().join("identity");
+        assert_eq!(permission_status(&doctor(&identity)), "ok");
+        let path = identity.join(target);
         assert!(
             Command::new("icacls")
                 .arg(path)
@@ -41,7 +42,7 @@ fn doctor_rejects_an_additional_windows_acl_principal() {
                 .unwrap()
                 .success()
         );
-        assert_eq!(permission_status(&doctor(identity.path())), "repair");
+        assert_eq!(permission_status(&doctor(&identity)), "repair");
     }
 }
 

@@ -59,11 +59,19 @@ fn allowed_helper_runs_in_workspace_with_clean_environment_and_sequenced_events(
         event.kind == EventKind::Stdout
             && String::from_utf8_lossy(&event.payload).contains("parent_secret=false")
     }));
-    assert!(events.iter().any(|event| {
-        event.kind == EventKind::Stdout
-            && String::from_utf8_lossy(&event.payload)
-                .contains(&format!("cwd={}", root.join("job").display()))
-    }));
+    let reported_cwd = events
+        .iter()
+        .filter(|event| event.kind == EventKind::Stdout)
+        .find_map(|event| {
+            String::from_utf8_lossy(&event.payload)
+                .lines()
+                .find_map(|line| line.strip_prefix("cwd=").map(PathBuf::from))
+        })
+        .expect("helper reports its working directory");
+    assert_eq!(
+        reported_cwd.canonicalize().unwrap(),
+        root.join("job").canonicalize().unwrap()
+    );
     assert!(events.iter().any(|event| {
         event.kind == EventKind::Stderr
             && String::from_utf8_lossy(&event.payload).contains("helper-stderr")
