@@ -10,7 +10,6 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
-use std::time::Instant;
 
 fn workspace() -> PathBuf {
     let root = env::temp_dir().join(format!("mesh-apple-build-{}", std::process::id()));
@@ -150,10 +149,11 @@ fn rejects_signing_reference_that_is_not_locally_available() {
 #[test]
 fn build_stream_preserves_live_output_while_redacting_only_secret_values() {
     let root = workspace();
+    let exit_marker = root.join("stream-helper-exited");
     let job = AppleBuildJob::with_prefix(
         &root,
         env::current_exe().unwrap(),
-        ["API_TOKEN"],
+        ["API_TOKEN", "MESH_EXIT_MARKER"],
         [
             "--ignored",
             "--exact",
@@ -166,8 +166,11 @@ fn build_stream_preserves_live_output_while_redacting_only_secret_values() {
     .with_local_signing_references([SigningReference::Identity(
         "Apple Development: Local".into(),
     )]);
-    let build = plan(BuildAction::Build);
-    let began = Instant::now();
+    let mut build = plan(BuildAction::Build);
+    build.protected_build_settings.insert(
+        "MESH_EXIT_MARKER".into(),
+        exit_marker.to_string_lossy().into_owned(),
+    );
     let mut stream = job
         .start(&build, Duration::from_secs(5), CancellationToken::new())
         .unwrap();
@@ -182,8 +185,8 @@ fn build_stream_preserves_live_output_while_redacting_only_secret_values() {
         }
     }
     assert!(
-        began.elapsed() < Duration::from_millis(700),
-        "stdout was buffered until the helper exited"
+        !exit_marker.exists(),
+        "stdout was buffered until helper exit"
     );
     let output = events
         .iter()
@@ -195,6 +198,7 @@ fn build_stream_preserves_live_output_while_redacting_only_secret_values() {
     assert!(!output.contains("very-secret"));
 
     events.extend(stream);
+    assert!(exit_marker.exists());
     assert_eq!(
         events
             .iter()
@@ -274,7 +278,8 @@ fn apple_build_helper() {
 fn apple_build_stream_helper() {
     println!("build-phase-visible {}", env::var("API_TOKEN").unwrap());
     std::io::stdout().flush().unwrap();
-    std::thread::sleep(Duration::from_millis(900));
+    std::thread::sleep(Duration::from_millis(300));
+    fs::write(env::var("MESH_EXIT_MARKER").unwrap(), b"exited").unwrap();
 }
 
 #[test]
