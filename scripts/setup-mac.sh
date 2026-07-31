@@ -6,6 +6,7 @@ HOME_DIR=${HOME:-}
 MODE=install
 DRY_RUN=false
 PAIR_ADDRESS=
+CONTROLLER_HOST=127.0.0.1
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -17,17 +18,36 @@ while [ "$#" -gt 0 ]; do
             shift
             PAIR_ADDRESS=$1
             ;;
+        --controller)
+            shift
+            CONTROLLER_HOST=$1
+            ;;
         --home)
             shift
             HOME_DIR=$1
             ;;
         *)
-            echo "usage: setup-mac.sh [--dry-run] [--upgrade|--status|--uninstall] [--pair-address HOST:PORT] [--home DIRECTORY]" >&2
+            echo "usage: setup-mac.sh [--dry-run] [--upgrade|--status|--uninstall] [--controller HOST] [--pair-address HOST:PORT] [--home DIRECTORY]" >&2
             exit 2
             ;;
     esac
     shift
 done
+
+case "$CONTROLLER_HOST" in
+    ''|*[!A-Za-z0-9._:-]*)
+        echo "controller must be a host name or IP address" >&2
+        exit 2
+        ;;
+esac
+case "$CONTROLLER_HOST" in
+    *:*) CONTROLLER_ENDPOINT="[$CONTROLLER_HOST]" ;;
+    *) CONTROLLER_ENDPOINT="$CONTROLLER_HOST" ;;
+esac
+REGISTRY_ADDRESS="$CONTROLLER_ENDPOINT:7443"
+if [ -z "$PAIR_ADDRESS" ]; then
+    PAIR_ADDRESS="$CONTROLLER_ENDPOINT:7445"
+fi
 
 if [ -z "$HOME_DIR" ]; then
     echo "home directory is required" >&2
@@ -48,7 +68,8 @@ LOG_DIR="$HOME_DIR/Library/Logs/DeviceDevelopmentMesh"
 DIAGNOSTIC_BUNDLE="$LOG_DIR/diagnostics"
 PLIST_PATH="$HOME_DIR/Library/LaunchAgents/dev.mesh.agent.plist"
 SERVICE="gui/$(id -u)/dev.mesh.agent"
-NEXT_COMMAND="mesh-registry pair --listen 0.0.0.0:7445 --identity .mesh/registry"
+PAIR_COMMAND="mesh-registry pair --listen 0.0.0.0:7445 --identity .mesh/registry"
+RUN_COMMAND="mesh-registry --listen 0.0.0.0:7443 --identity .mesh/registry --offline-after-ms 5000"
 
 redact() {
     sed -E 's/(pairing_code|private_key|signing_secret|token)([=:][^ ,}]*)/\1=[REDACTED]/g'
@@ -59,7 +80,7 @@ xml_escape() {
 }
 
 if [ "$DRY_RUN" = true ]; then
-    printf 'NEXT_CONTROLLER_COMMAND=%s\n' "$NEXT_COMMAND"
+    printf 'NEXT_CONTROLLER_COMMAND=%s\n' "$PAIR_COMMAND"
     printf 'DIAGNOSTIC_BUNDLE=%s\n' "$DIAGNOSTIC_BUNDLE"
     exit
 fi
@@ -87,7 +108,7 @@ install -m 700 target/release/mesh-cli "$CLI_PATH"
 "$CLI_PATH" doctor --identity "$IDENTITY_DIR" | redact >"$DIAGNOSTIC_BUNDLE/doctor.json"
 chmod 600 "$DIAGNOSTIC_BUNDLE/doctor.json"
 
-if [ -n "$PAIR_ADDRESS" ]; then
+if [ ! -f "$IDENTITY_DIR/trust/registry.der" ]; then
     "$PROGRAM_PATH" pair --address "$PAIR_ADDRESS" --identity "$IDENTITY_DIR" >/dev/null
 fi
 
@@ -95,6 +116,7 @@ PLIST_PROGRAM_PATH=$(printf '%s' "$PROGRAM_PATH" | xml_escape)
 PLIST_IDENTITY_DIR=$(printf '%s' "$IDENTITY_DIR" | xml_escape)
 PLIST_WORKSPACE_DIR=$(printf '%s' "$WORKSPACE_DIR" | xml_escape)
 PLIST_LOG_DIR=$(printf '%s' "$LOG_DIR" | xml_escape)
+PLIST_REGISTRY_ADDRESS=$(printf '%s' "$REGISTRY_ADDRESS" | xml_escape)
 cat >"$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -106,7 +128,7 @@ cat >"$PLIST_PATH" <<EOF
   <array>
     <string>$PLIST_PROGRAM_PATH</string>
     <string>--registry</string>
-    <string>127.0.0.1:7443</string>
+    <string>$PLIST_REGISTRY_ADDRESS</string>
     <string>--identity</string>
     <string>$PLIST_IDENTITY_DIR</string>
     <string>--id</string>
@@ -146,5 +168,5 @@ launchctl kickstart -k "$SERVICE"
 launchctl print "$SERVICE" | redact >"$DIAGNOSTIC_BUNDLE/status.txt"
 chmod 600 "$DIAGNOSTIC_BUNDLE/status.txt"
 
-printf 'NEXT_CONTROLLER_COMMAND=%s\n' "$NEXT_COMMAND"
+printf 'NEXT_CONTROLLER_COMMAND=%s\n' "$RUN_COMMAND"
 printf 'DIAGNOSTIC_BUNDLE=%s\n' "$DIAGNOSTIC_BUNDLE"

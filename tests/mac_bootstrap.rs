@@ -18,6 +18,8 @@ fn mac_bootstrap_defines_the_complete_user_launch_agent_lifecycle() {
         "--upgrade",
         "--status",
         "--uninstall",
+        "--controller",
+        "CONTROLLER_HOST",
     ] {
         assert!(
             setup.contains(required),
@@ -48,6 +50,8 @@ fn launch_agent_is_restricted_absolute_and_contains_no_secrets() {
         );
     }
     assert!(setup.contains("PROGRAM_PATH"));
+    assert!(setup.contains("PLIST_REGISTRY_ADDRESS"));
+    assert!(!setup.contains("<string>127.0.0.1:7443</string>"));
     assert!(setup.contains("HOME_DIR=\"$(pwd)/$HOME_DIR\""));
     assert!(!setup.contains("<key>PairingCode</key>"));
     assert!(!setup.contains("<key>PrivateKey</key>"));
