@@ -751,14 +751,32 @@ fn restrictive(identity: &Path) -> bool {
     let account = String::from_utf8_lossy(&account.stdout)
         .trim()
         .to_ascii_lowercase();
+    let sid = current_windows_sid();
     fs::metadata(&key).is_ok()
         && [identity, key.as_path()]
             .iter()
-            .all(|path| windows_acl_restrictive(path, &account))
+            .all(|path| windows_acl_restrictive(path, &account, sid.as_deref()))
 }
 
 #[cfg(windows)]
-fn windows_acl_restrictive(path: &Path, account: &str) -> bool {
+fn current_windows_sid() -> Option<String> {
+    let output = Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .ok()?;
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout)
+            .split(',')
+            .nth(1)
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .to_ascii_lowercase()
+    })
+}
+
+#[cfg(windows)]
+fn windows_acl_restrictive(path: &Path, account: &str, sid: Option<&str>) -> bool {
     let Ok(output) = Command::new("icacls").arg(path).output() else {
         return false;
     };
@@ -768,6 +786,12 @@ fn windows_acl_restrictive(path: &Path, account: &str) -> bool {
             line.split_once(":(").is_some_and(|(principal, _)| {
                 let principal = principal.trim_end();
                 principal == account
+                    || sid.is_some_and(|sid| {
+                        principal == sid
+                            || principal
+                                .strip_suffix(sid)
+                                .is_some_and(|prefix| prefix.ends_with(char::is_whitespace))
+                    })
                     || principal
                         .strip_suffix(account)
                         .is_some_and(|prefix| prefix.ends_with(char::is_whitespace))

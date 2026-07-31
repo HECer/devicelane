@@ -265,7 +265,6 @@ fn transfer_fixture(path: impl AsRef<Path>) {
 }
 
 struct Setup {
-    _network_test_lock: MutexGuard<'static, ()>,
     _root: TempDir,
     _registry: ChildGuard,
     registry_path: PathBuf,
@@ -274,6 +273,7 @@ struct Setup {
     cli: SecureTransport,
     outsider: SecureTransport,
     job_id: String,
+    _network_test_lock: MutexGuard<'static, ()>,
 }
 
 impl Setup {
@@ -295,7 +295,6 @@ impl Setup {
         let cli = SecureTransport::load_or_create(cli_path, "cli").unwrap();
         let outsider = SecureTransport::load_or_create(outsider_path, "outsider").unwrap();
         let setup = Self {
-            _network_test_lock: network_test_lock,
             _root: root,
             _registry: registry,
             registry_path,
@@ -304,6 +303,7 @@ impl Setup {
             cli,
             outsider,
             job_id: String::new(),
+            _network_test_lock: network_test_lock,
         };
         setup.rpc(
             &setup.agent,

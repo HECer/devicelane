@@ -10,11 +10,13 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
+    sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
 
 const DEVICE: &str = "sim-1";
+static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn lease_rpc_covers_acquire_renew_queue_release_revoke_and_one_writer() {
@@ -727,6 +729,7 @@ struct Harness {
     marker: PathBuf,
     _registry: ChildGuard,
     _agent: ChildGuard,
+    _network_test_lock: MutexGuard<'static, ()>,
 }
 
 impl Harness {
@@ -735,6 +738,9 @@ impl Harness {
     }
 
     fn start_with_heartbeat(mutation_delay: Duration, heartbeat_ms: u64) -> Self {
+        let network_test_lock = NETWORK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = tempfile::tempdir().unwrap();
         let address = free_address();
         let registry = root.path().join("registry");
@@ -823,6 +829,7 @@ impl Harness {
             marker,
             _registry: registry_process,
             _agent: agent_process,
+            _network_test_lock: network_test_lock,
         }
     }
 }

@@ -51,13 +51,7 @@ fn doctor_rejects_an_additional_windows_acl_principal() {
 
 #[cfg(windows)]
 fn restrict_to_current_user(path: &std::path::Path) {
-    let account = String::from_utf8(
-        Command::new("whoami")
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let account = String::from_utf8(Command::new("whoami").output().unwrap().stdout).unwrap();
     assert!(
         Command::new("icacls")
             .arg(path)
