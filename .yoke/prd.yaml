@@ -103,7 +103,7 @@
       und detached werden normalisiert und enthalten konkrete Reparaturhinweise
     - Bundle-ID, App-Pfad und Geräte-ID werden validiert und ausschließlich als
       getrennte Argumente an devicectl übergeben
-  passes: false
+  passes: true
   needs:
     - STORY-25
   area: apple-physical

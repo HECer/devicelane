@@ -1,0 +1,8 @@
+{
+  "install": ["device", "install", "app", "--device", "iphone-1", "Build/Mesh.app"],
+  "launch": ["device", "process", "launch", "--device", "iphone-1", "dev.mesh.App"],
+  "terminate": ["device", "process", "terminate", "--device", "iphone-1", "dev.mesh.App"],
+  "uninstall": ["device", "uninstall", "app", "--device", "iphone-1", "dev.mesh.App"],
+  "info": ["device", "info", "details", "--device", "iphone-1"],
+  "logs": ["device", "process", "launch", "--device", "iphone-1", "--console", "dev.mesh.App"]
+}

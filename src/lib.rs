@@ -1145,6 +1145,13 @@ pub mod authorization {
         SimulatorLocation { device_id: &'a str },
         SimulatorPrivacy { device_id: &'a str },
         SimulatorMedia { device_id: &'a str },
+        AppleInstall { device_id: &'a str },
+        AppleLaunch { device_id: &'a str },
+        AppleTerminate { device_id: &'a str },
+        AppleUninstall { device_id: &'a str },
+        AppleLogStream { device_id: &'a str },
+        AppleDeviceInfo,
+        AppleReadReleasedLogs,
     }
 
     impl Operation<'_> {
@@ -1164,12 +1171,23 @@ pub mod authorization {
                 Self::SimulatorLocation { .. } => "simulator.location",
                 Self::SimulatorPrivacy { .. } => "simulator.privacy",
                 Self::SimulatorMedia { .. } => "simulator.media",
+                Self::AppleInstall { .. } => "apple.app.install@1",
+                Self::AppleLaunch { .. } => "apple.app.launch@1",
+                Self::AppleTerminate { .. } => "apple.app.terminate@1",
+                Self::AppleUninstall { .. } => "apple.app.uninstall@1",
+                Self::AppleLogStream { .. } => "apple.app.logs@1",
+                Self::AppleDeviceInfo => "apple.device.info@1",
+                Self::AppleReadReleasedLogs => "apple.app.logs.read@1",
             }
         }
 
         fn device_id(&self) -> Option<&str> {
             match self {
-                Self::DiscoverDevices | Self::LeaseDevice | Self::ReadLogs => None,
+                Self::DiscoverDevices
+                | Self::LeaseDevice
+                | Self::ReadLogs
+                | Self::AppleDeviceInfo
+                | Self::AppleReadReleasedLogs => None,
                 Self::StartProcess { device_id }
                 | Self::StopProcess { device_id }
                 | Self::InstallDevice { device_id }
@@ -1181,6 +1199,11 @@ pub mod authorization {
                 | Self::SimulatorLocation { device_id }
                 | Self::SimulatorPrivacy { device_id }
                 | Self::SimulatorMedia { device_id } => Some(device_id),
+                Self::AppleInstall { device_id }
+                | Self::AppleLaunch { device_id }
+                | Self::AppleTerminate { device_id }
+                | Self::AppleUninstall { device_id }
+                | Self::AppleLogStream { device_id } => Some(device_id),
             }
         }
     }
@@ -1293,7 +1316,12 @@ pub mod authorization {
                 return Err(AuthorizationError::CapabilityDenied);
             }
             let device_id = operation.device_id();
-            if principal.role == Role::Observer && device_id.is_some() {
+            if principal.role == Role::Observer
+                && !matches!(
+                    operation,
+                    Operation::ReadLogs | Operation::AppleReadReleasedLogs
+                )
+            {
                 return Err(AuthorizationError::ObserverReadOnly);
             }
             if let Some(device_id) = device_id {
@@ -1393,6 +1421,15 @@ pub mod device_adapter {
             action: impl FnOnce() -> T,
         ) -> Result<T, AdapterError> {
             self.authorize(operation, action)
+        }
+
+        pub(crate) fn authorize_apple<T>(
+            &mut self,
+            operation: Operation<'_>,
+            action: impl FnOnce() -> T,
+        ) -> Result<T, AuthorizationError> {
+            self.policy
+                .execute(self.actor, operation, self.lease, action)
         }
 
         pub(crate) fn acquire_lease(
@@ -1640,6 +1677,331 @@ pub mod device_adapter {
 
         fn attach_debugger(&mut self, _device_id: &str) -> Result<(), AdapterError> {
             Err(AdapterError::UnsupportedCapability)
+        }
+    }
+}
+
+pub mod apple_physical_device {
+    use crate::authorization::{AuthorizationError, Operation};
+    use crate::device_adapter::AdapterContext;
+    use crate::preflight::{AppleTool, AppleToolRunner};
+    use crate::process_execution::{CancellationToken, EventKind, TerminalStatus};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PhysicalDeviceError {
+        CapabilityDenied,
+        LeaseInactive,
+        ObserverReadOnly,
+        InvalidDeviceId,
+        InvalidBundleId,
+        InvalidAppPath,
+        Locked,
+        Untrusted,
+        DeveloperModeDisabled,
+        SigningFailed,
+        DeviceBusy,
+        Detached,
+    }
+
+    impl PhysicalDeviceError {
+        pub fn repair(self) -> &'static str {
+            match self {
+                Self::Locked => "Unlock the iPhone and keep it connected to this Mac.",
+                Self::Untrusted => "Unlock the iPhone, trust this Mac, and pair it again.",
+                Self::DeveloperModeDisabled => {
+                    "Enable Developer Mode in Settings > Privacy & Security, then restart the iPhone."
+                }
+                Self::SigningFailed => {
+                    "Select a valid development team and provisioning profile, then rebuild the app."
+                }
+                Self::DeviceBusy => "Wait for the current device operation to finish, then retry.",
+                Self::Detached => {
+                    "Reconnect the iPhone by USB or restore its paired network connection."
+                }
+                Self::CapabilityDenied => "Grant the required versioned Apple capability.",
+                Self::LeaseInactive => "Acquire a valid exclusive lease for this device.",
+                Self::ObserverReadOnly => "Use an operator identity for device operations.",
+                Self::InvalidDeviceId => "Use the exact device identifier reported by discovery.",
+                Self::InvalidBundleId => "Use a valid reverse-DNS bundle identifier.",
+                Self::InvalidAppPath => "Use an existing .app directory inside the workspace.",
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum PhysicalDeviceOperation {
+        Install { app_path: PathBuf },
+        Launch { bundle_id: String },
+        Terminate { bundle_id: String },
+        Uninstall { bundle_id: String },
+        DeviceInfo,
+        LogStream { bundle_id: String },
+    }
+
+    impl PhysicalDeviceOperation {
+        pub fn arguments(&self, device_id: &str) -> Result<Vec<String>, PhysicalDeviceError> {
+            validate_device_id(device_id)?;
+            Ok(match self {
+                Self::Install { app_path } => vec![
+                    "device".into(),
+                    "install".into(),
+                    "app".into(),
+                    "--device".into(),
+                    device_id.into(),
+                    app_path.to_string_lossy().into_owned(),
+                ],
+                Self::Launch { bundle_id } => {
+                    validate_bundle_id(bundle_id)?;
+                    vec![
+                        "device".into(),
+                        "process".into(),
+                        "launch".into(),
+                        "--device".into(),
+                        device_id.into(),
+                        bundle_id.clone(),
+                    ]
+                }
+                Self::Terminate { bundle_id } => {
+                    validate_bundle_id(bundle_id)?;
+                    vec![
+                        "device".into(),
+                        "process".into(),
+                        "terminate".into(),
+                        "--device".into(),
+                        device_id.into(),
+                        bundle_id.clone(),
+                    ]
+                }
+                Self::Uninstall { bundle_id } => {
+                    validate_bundle_id(bundle_id)?;
+                    vec![
+                        "device".into(),
+                        "uninstall".into(),
+                        "app".into(),
+                        "--device".into(),
+                        device_id.into(),
+                        bundle_id.clone(),
+                    ]
+                }
+                Self::DeviceInfo => vec![
+                    "device".into(),
+                    "info".into(),
+                    "details".into(),
+                    "--device".into(),
+                    device_id.into(),
+                ],
+                Self::LogStream { bundle_id } => {
+                    validate_bundle_id(bundle_id)?;
+                    vec![
+                        "device".into(),
+                        "process".into(),
+                        "launch".into(),
+                        "--device".into(),
+                        device_id.into(),
+                        "--console".into(),
+                        bundle_id.clone(),
+                    ]
+                }
+            })
+        }
+    }
+
+    pub struct ApplePhysicalDevice {
+        runner: AppleToolRunner,
+        timeout: Duration,
+        workspace: PathBuf,
+        leases: HashMap<String, Instant>,
+        released_logs: HashMap<String, Vec<u8>>,
+    }
+
+    impl ApplePhysicalDevice {
+        pub fn new(runner: AppleToolRunner, timeout: Duration) -> Self {
+            Self {
+                workspace: runner.workspace().to_owned(),
+                runner,
+                timeout,
+                leases: HashMap::new(),
+                released_logs: HashMap::new(),
+            }
+        }
+
+        pub fn lease(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            lifetime: Duration,
+        ) -> Result<(), PhysicalDeviceError> {
+            validate_device_id(device_id)?;
+            if self
+                .leases
+                .get(device_id)
+                .is_some_and(|expires| Instant::now() < *expires)
+            {
+                return Err(PhysicalDeviceError::DeviceBusy);
+            }
+            context
+                .acquire_lease(device_id, lifetime)
+                .map_err(map_adapter_error)?;
+            self.leases
+                .insert(device_id.into(), Instant::now() + lifetime);
+            Ok(())
+        }
+
+        pub fn execute(
+            &mut self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+            operation: PhysicalDeviceOperation,
+        ) -> Result<Vec<u8>, PhysicalDeviceError> {
+            let mut args = operation.arguments(device_id)?;
+            if let PhysicalDeviceOperation::Install { app_path } = &operation {
+                let app_path = validate_app_path(&self.workspace, app_path)?;
+                *args.last_mut().expect("install always has an app path") =
+                    app_path.to_string_lossy().into_owned();
+            }
+            let authorization = match operation {
+                PhysicalDeviceOperation::Install { .. } => Operation::AppleInstall { device_id },
+                PhysicalDeviceOperation::Launch { .. } => Operation::AppleLaunch { device_id },
+                PhysicalDeviceOperation::Terminate { .. } => {
+                    Operation::AppleTerminate { device_id }
+                }
+                PhysicalDeviceOperation::Uninstall { .. } => {
+                    Operation::AppleUninstall { device_id }
+                }
+                PhysicalDeviceOperation::LogStream { .. } => {
+                    Operation::AppleLogStream { device_id }
+                }
+                PhysicalDeviceOperation::DeviceInfo => Operation::AppleDeviceInfo,
+            };
+            context
+                .authorize_apple(authorization, || ())
+                .map_err(PhysicalDeviceError::from)?;
+            let events = self
+                .runner
+                .execute(
+                    AppleTool::Devicectl,
+                    args,
+                    ".",
+                    HashMap::new(),
+                    self.timeout,
+                    CancellationToken::new(),
+                )
+                .map_err(|_| PhysicalDeviceError::DeviceBusy)?;
+            let output = events
+                .iter()
+                .filter(|event| matches!(event.kind, EventKind::Stdout))
+                .flat_map(|event| event.payload.iter().copied())
+                .collect::<Vec<_>>();
+            if !matches!(
+                events.last().map(|event| &event.kind),
+                Some(EventKind::Terminal(TerminalStatus::Exited(0)))
+            ) {
+                let error = events
+                    .iter()
+                    .filter(|event| matches!(event.kind, EventKind::Stderr))
+                    .flat_map(|event| event.payload.iter().copied())
+                    .collect::<Vec<_>>();
+                return Err(Self::normalize_failure(&String::from_utf8_lossy(&error)));
+            }
+            if matches!(operation, PhysicalDeviceOperation::LogStream { .. }) {
+                self.release_logs(device_id, output.clone());
+            }
+            Ok(output)
+        }
+
+        pub fn release_logs(&mut self, device_id: &str, logs: Vec<u8>) {
+            self.released_logs.insert(device_id.into(), logs);
+        }
+
+        pub fn read_released_logs(
+            &self,
+            context: &mut AdapterContext<'_>,
+            device_id: &str,
+        ) -> Result<Vec<u8>, PhysicalDeviceError> {
+            validate_device_id(device_id)?;
+            context
+                .authorize_apple(Operation::AppleReadReleasedLogs, || ())
+                .map_err(PhysicalDeviceError::from)?;
+            Ok(self
+                .released_logs
+                .get(device_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        pub fn normalize_failure(stderr: &str) -> PhysicalDeviceError {
+            let stderr = stderr.to_ascii_lowercase();
+            if stderr.contains("locked") {
+                Self::locked()
+            } else if stderr.contains("not trusted") || stderr.contains("trust this host") {
+                PhysicalDeviceError::Untrusted
+            } else if stderr.contains("developer mode") && stderr.contains("disabled") {
+                PhysicalDeviceError::DeveloperModeDisabled
+            } else if stderr.contains("signing") || stderr.contains("applicationverificationfailed")
+            {
+                PhysicalDeviceError::SigningFailed
+            } else if stderr.contains("disconnect") || stderr.contains("detached") {
+                PhysicalDeviceError::Detached
+            } else {
+                PhysicalDeviceError::DeviceBusy
+            }
+        }
+
+        fn locked() -> PhysicalDeviceError {
+            PhysicalDeviceError::Locked
+        }
+    }
+
+    fn map_adapter_error(error: crate::device_adapter::AdapterError) -> PhysicalDeviceError {
+        match error {
+            crate::device_adapter::AdapterError::LeaseInactive => {
+                PhysicalDeviceError::LeaseInactive
+            }
+            _ => PhysicalDeviceError::CapabilityDenied,
+        }
+    }
+
+    fn validate_device_id(value: &str) -> Result<(), PhysicalDeviceError> {
+        (!value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .then_some(())
+        .ok_or(PhysicalDeviceError::InvalidDeviceId)
+    }
+
+    fn validate_bundle_id(value: &str) -> Result<(), PhysicalDeviceError> {
+        let valid = value.len() <= 255
+            && value.split('.').count() >= 2
+            && value.split('.').all(|part| {
+                !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+        valid
+            .then_some(())
+            .ok_or(PhysicalDeviceError::InvalidBundleId)
+    }
+
+    fn validate_app_path(workspace: &Path, path: &Path) -> Result<PathBuf, PhysicalDeviceError> {
+        if path.extension().and_then(|value| value.to_str()) != Some("app") {
+            return Err(PhysicalDeviceError::InvalidAppPath);
+        }
+        fs::canonicalize(workspace.join(path))
+            .ok()
+            .filter(|resolved| resolved.starts_with(workspace) && resolved.is_dir())
+            .ok_or(PhysicalDeviceError::InvalidAppPath)
+    }
+
+    impl From<AuthorizationError> for PhysicalDeviceError {
+        fn from(error: AuthorizationError) -> Self {
+            match error {
+                AuthorizationError::LeaseInactive => Self::LeaseInactive,
+                AuthorizationError::ObserverReadOnly => Self::ObserverReadOnly,
+                _ => Self::CapabilityDenied,
+            }
         }
     }
 }

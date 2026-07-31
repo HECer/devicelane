@@ -1,0 +1,8 @@
+{
+  "locked": "The device is locked. Unlock the device.",
+  "untrusted": "The device has not trusted this host.",
+  "developer_mode_disabled": "Developer Mode is disabled.",
+  "signing_failed": "ApplicationVerificationFailed: signing certificate is invalid.",
+  "device_busy": "The device is busy preparing developer services.",
+  "detached": "The device disconnected while performing the operation."
+}
