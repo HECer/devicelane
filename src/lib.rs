@@ -6055,7 +6055,7 @@ pub mod remote_apple_agent {
 mod tests {
     #[test]
     fn workspace_package_is_available() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "device-development-mesh");
+        assert_eq!(env!("CARGO_PKG_NAME"), "devicelane");
     }
 }
 pub mod mac_bootstrap;

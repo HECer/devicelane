@@ -3,9 +3,24 @@ members = ["."]
 resolver = "2"
 
 [package]
-name = "device-development-mesh"
+name = "devicelane"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["HECer"]
+description = "Securely route development commands, device access, logs, and artifacts across Windows, macOS, Linux, iOS, and Android hosts."
+license = "MIT"
+repository = "https://github.com/HECer/devicelane"
+homepage = "https://github.com/HECer/devicelane"
+readme = "README.md"
+keywords = ["ios", "android", "remote-development", "device", "debugging"]
+categories = ["development-tools"]
+publish = false
+exclude = [".agents/**", ".codex/**", ".yoke/**", "AGENTS.md", "RTK.md"]
+
+[lib]
+name = "device_development_mesh"
+path = "src/lib.rs"
 
 [dependencies]
 cap-std = "3"
