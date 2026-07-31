@@ -381,4 +381,10 @@ Erst danach folgt das reale Mac-/iPhone-Gate. Der Mac-Bootstrap nimmt eine
 explizite Controller-Adresse an, paart bei der Erstinstallation automatisch und
 verbindet den LaunchAgent anschließend mit dem entfernten Registry-Port.
 
+Auditnachtrag: Eine erste STORY-31-Umsetzung bestand nur aus
+`RemoteAppleRegistry` und `RemoteAppleAgent` im selben Testprozess. Sie gilt
+nicht als Remote-Dispatch. Die Abnahme startet zwingend alle drei öffentlichen
+Binaries, nutzt den mTLS-Socketvertrag und weist den Ausführungsort mit einem
+Agent-Workspace-Marker nach.
+
 Nicht-Ziele dieses Loops bleiben allgemeine iOS-Systemfernsteuerung, Steuerung fremder Apps, Umgehung von Signing/Trust/Developer Mode sowie eine Desktop-GUI. Private Signing-Schlüssel verlassen niemals den macOS-Keychain. Der Nutzer wird erst eingebunden, wenn Bootstrap und Hardware-Gate als ein konkreter Mac-Befehl bereitstehen.

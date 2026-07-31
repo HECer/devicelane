@@ -189,9 +189,13 @@
   title: Apple-Operationen im entfernten Mac-Agent dispatchen
   priority: 11
   acceptance:
-    - tests/remote_apple_agent.rs beweist, dass der Registry-Prozess einen
-      typisierten Apple-Job unverändert an den gepairten ausgehenden Mac-Agent
-      zustellt und ausschließlich der Agent AppleToolRunner ausführt
+    - tests/remote_apple_agent.rs startet die gebauten mesh-registry-,
+      mesh-agent- und mesh-cli-Binaries als getrennte Betriebssystemprozesse,
+      paart sie über echtes mTLS und beweist mit einem Marker im Agent-Workspace,
+      dass ein typisierter Apple-Job ausschließlich dort AppleToolRunner ausführt
+    - Der Test muss den Apple-Request über die öffentliche network_processes-
+      Request-Nachricht und den CLI-Socket senden; ein direkter Aufruf von
+      RemoteAppleRegistry oder RemoteAppleAgent allein erfüllt die Story nicht
     - Der Agent veröffentlicht Preflight-, Tool-, Simulator- und physische
       Geräte-Capabilities aus echter Discovery statt statischer Dummy-Argumente
       und aktualisiert sie bei Lock, Detach oder Developer-Mode-Änderung
@@ -200,7 +204,7 @@
       sind über das Netzwerk nicht darstellbar
     - Progress, Cancel und Reconnect funktionieren während eines laufenden
       Fake-xcodebuild-Prozesses ohne doppelte Ausführung
-  passes: true
+  passes: false
   needs:
     - STORY-30
   area: remote-apple-agent
