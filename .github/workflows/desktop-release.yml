@@ -6,6 +6,11 @@ on:
       production: { description: Build signed production artifacts, required: true, type: boolean, default: false }
 permissions: { contents: read, id-token: write }
 
+env:
+  CARGO_INCREMENTAL: '0'
+  TZ: UTC
+  ZERO_AR_DATE: '1'
+
 jobs:
   unsigned-native:
     if: github.event_name == 'pull_request' || inputs.production != true
@@ -29,28 +34,51 @@ jobs:
       - name: Locked frontend
         working-directory: desktop
         run: npm ci
-      - name: Locked CLI and service
-        run: cargo build --release --locked --bin devicelane --bin devicelane-service
-      - name: Unsigned native installer
+      - name: Deterministic build epoch
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: Reproducible unsigned payload gate
         working-directory: desktop
-        run: npm exec tauri build -- --no-sign --bundles ${{ matrix.bundles }} -- --locked
+        shell: bash
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/repro-build-a"
+          cargo build --release --locked --bin devicelane --bin devicelane-service
+          npm exec tauri build -- --no-sign --bundles ${{ matrix.bundles }} -- --locked
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/repro-build-b"
+          cargo build --release --locked --bin devicelane --bin devicelane-service
+          npm exec tauri build -- --no-sign --bundles ${{ matrix.bundles }} -- --locked
+      - name: Compare normalized Windows payloads
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $first = @(Get-ChildItem "$env:RUNNER_TEMP\repro-build-a\release\bundle\msi\*.msi")
+          $second = @(Get-ChildItem "$env:RUNNER_TEMP\repro-build-b\release\bundle\msi\*.msi")
+          if ($first.Count -ne 1 -or $second.Count -ne 1) { throw "expected exactly one MSI per clean build" }
+          .\scripts\compare-msi-payloads.ps1 -First $first[0].FullName -Second $second[0].FullName
+      - name: Compare normalized Unix payloads
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh scripts/compare-native-payloads.sh "$RUNNER_TEMP/repro-build-a/release/bundle" "$RUNNER_TEMP/repro-build-b/release/bundle" "$(test "$RUNNER_OS" = macOS && echo dmg || echo linux)"
       - name: Native artifact first-run smoke
         if: runner.os == 'Windows'
         shell: pwsh
-        run: .\scripts\desktop-release-smoke.ps1 -ExerciseLifecycle -Artifact (Get-ChildItem target\release\bundle\msi\*.msi -ErrorAction Stop).FullName
+        run: |
+          $artifacts = @(Get-ChildItem "$env:RUNNER_TEMP\repro-build-b\release\bundle\msi\*.msi" -ErrorAction Stop)
+          if ($artifacts.Count -ne 1) { throw "expected exactly one MSI" }
+          .\scripts\desktop-release-smoke.ps1 -NativeInstallGate -Artifact $artifacts[0].FullName
       - name: Native artifact first-run smoke
         if: runner.os != 'Windows'
         shell: bash
-        run: DEVICELANE_DESKTOP_ARTIFACT="$PWD/target/release/bundle" sh scripts/desktop-release-smoke.sh --exercise-lifecycle
+        run: DEVICELANE_DESKTOP_ARTIFACT="$RUNNER_TEMP/repro-build-b/release/bundle" sh scripts/desktop-release-smoke.sh --exercise-lifecycle
       - name: Build evidence, SBOM, and checksums
         shell: bash
         run: |
           mkdir -p desktop-dist/SBOM
-          { rustc -vV; cargo -V; node -v; npm -v; printf 'runner=%s\nimage=%s\n' "$RUNNER_OS" "$ImageOS"; sha256sum Cargo.lock desktop/package-lock.json rust-toolchain.toml .github/workflows/desktop-release.yml; } > desktop-dist/BUILD-INPUTS.txt
+          { rustc -vV; cargo -V; node -v; npm -v; printf 'runner=%s\nImageOS=%s\nImageVersion=%s\nSOURCE_DATE_EPOCH=%s\n' "$RUNNER_OS" "$ImageOS" "$ImageVersion" "$SOURCE_DATE_EPOCH"; sha256sum Cargo.lock desktop/package-lock.json rust-toolchain.toml .github/workflows/desktop-release.yml; } > desktop-dist/BUILD-INPUTS.txt
           cargo install cargo-cyclonedx --version 0.5.7 --locked
           cargo cyclonedx --all --format json
           find . -name '*.cdx.json' -type f -exec cp {} desktop-dist/SBOM/ \;
-          find target/release/bundle -type f -exec cp {} desktop-dist/ \;
+          find "$RUNNER_TEMP/repro-build-b/release/bundle" -type f -exec cp {} desktop-dist/ \;
           cd desktop-dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: 'unsigned-ci-${{ runner.os }}', path: desktop-dist, if-no-files-found: error, retention-days: 7 }
@@ -67,6 +95,13 @@ jobs:
           - { os: ubuntu-24.04, bundles: 'appimage,deb' }
     runs-on: ${{ matrix.os }}
     env:
+      DEVICELANE_EXPECTED_IMAGE_OS: ${{ vars.DESKTOP_IMAGE_OS }}
+      DEVICELANE_EXPECTED_IMAGE_VERSION: ${{ vars.DESKTOP_IMAGE_VERSION }}
+      DEVICELANE_EXPECTED_XCODE: ${{ vars.DESKTOP_XCODE_VERSION }}
+      DEVICELANE_EXPECTED_APPLE_SDK: ${{ vars.DESKTOP_APPLE_SDK_VERSION }}
+      DEVICELANE_EXPECTED_MSVC: ${{ vars.DESKTOP_MSVC_VERSION }}
+      DEVICELANE_EXPECTED_WIX: ${{ vars.DESKTOP_WIX_VERSION }}
+      DEVICELANE_EXPECTED_APT_VERSIONS_SHA256: ${{ vars.DESKTOP_APT_VERSIONS_SHA256 }}
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
       APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
       APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -87,6 +122,42 @@ jobs:
       - name: Linux prerequisites
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Verify pinned production environment
+        shell: bash
+        run: |
+          test -n "$DEVICELANE_EXPECTED_IMAGE_OS" && test "$ImageOS" = "$DEVICELANE_EXPECTED_IMAGE_OS"
+          test -n "$DEVICELANE_EXPECTED_IMAGE_VERSION" && test "$ImageVersion" = "$DEVICELANE_EXPECTED_IMAGE_VERSION"
+          printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion" > "$RUNNER_TEMP/devicelane-native-inputs.txt"
+      - name: Verify pinned Xcode and Apple SDK
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          actual_xcode=$(xcodebuild -version | tr '\n' ' ' | sed 's/ $//')
+          actual_sdk=$(xcrun --sdk macosx --show-sdk-version)
+          test -n "$DEVICELANE_EXPECTED_XCODE" && test "$actual_xcode" = "$DEVICELANE_EXPECTED_XCODE"
+          test -n "$DEVICELANE_EXPECTED_APPLE_SDK" && test "$actual_sdk" = "$DEVICELANE_EXPECTED_APPLE_SDK"
+          printf 'Xcode=%s\nAppleSDK=%s\n' "$actual_xcode" "$actual_sdk" >> "$RUNNER_TEMP/devicelane-native-inputs.txt"
+      - name: Verify pinned MSVC
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $compiler = Get-ChildItem "$installation\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          $actual = $compiler.VersionInfo.ProductVersion
+          if (-not $env:DEVICELANE_EXPECTED_MSVC -or $actual -ne $env:DEVICELANE_EXPECTED_MSVC) { throw "MSVC drift: expected $env:DEVICELANE_EXPECTED_MSVC, got $actual" }
+          Add-Content -LiteralPath "$env:RUNNER_TEMP\devicelane-native-inputs.txt" -Value "MSVC=$actual"
+      - name: Verify pinned Linux packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          apt_versions=$(dpkg-query -W -f='${Package}=${Version}\n' libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf | LC_ALL=C sort)
+          actual_apt_hash=$(printf '%s\n' "$apt_versions" | sha256sum | cut -d' ' -f1)
+          test -n "$DEVICELANE_EXPECTED_APT_VERSIONS_SHA256" && test "$actual_apt_hash" = "$DEVICELANE_EXPECTED_APT_VERSIONS_SHA256"
+          { printf '%s\n' "$apt_versions"; printf 'APT_SHA256=%s\n' "$actual_apt_hash"; } >> "$RUNNER_TEMP/devicelane-native-inputs.txt"
+      - name: Deterministic build epoch
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
       - name: Locked frontend
         working-directory: desktop
         run: npm ci
@@ -121,6 +192,14 @@ jobs:
       - name: Signed native installer
         working-directory: desktop
         run: npm exec tauri build -- --bundles ${{ matrix.bundles }} -- --locked
+      - name: Verify pinned WiX version
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $wix = Get-ChildItem "$env:LOCALAPPDATA\tauri\WixTools" -Recurse -Filter candle.exe -ErrorAction Stop | Select-Object -First 1
+          $actual = $wix.VersionInfo.FileVersion
+          if (-not $env:DEVICELANE_EXPECTED_WIX -or $actual -ne $env:DEVICELANE_EXPECTED_WIX) { throw "WiX drift: expected $env:DEVICELANE_EXPECTED_WIX, got $actual" }
+          Add-Content -LiteralPath "$env:RUNNER_TEMP\devicelane-native-inputs.txt" -Value "WiX=$actual"
       - name: Sign MSI
         if: runner.os == 'Windows'
         shell: pwsh
@@ -128,7 +207,20 @@ jobs:
       - name: Validate notarization
         if: runner.os == 'macOS'
         shell: bash
-        run: find target/release/bundle/dmg -name '*.dmg' -exec xcrun stapler validate {} \;
+        run: |
+          mapfile -t dmgs < <(find target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print)
+          [ "${#dmgs[@]}" -eq 1 ] || { echo "expected exactly one production DMG" >&2; exit 1; }
+          dmg=${dmgs[0]}
+          mount="$RUNNER_TEMP/notary-verify"
+          mkdir -p "$mount"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount" >/dev/null
+          app=$(find "$mount" -maxdepth 1 -type d -name '*.app' -print)
+          codesign --verify --deep --strict "$app"
+          spctl --assess --type execute "$app"
+          hdiutil detach "$mount" >/dev/null
+          spctl --assess --type open "$dmg"
+          xcrun stapler validate "$dmg"
+          xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" > desktop-notary-history.txt
       - name: Verify staged binaries
         shell: bash
         run: |
@@ -139,7 +231,10 @@ jobs:
       - name: Native artifact first-run smoke
         if: runner.os == 'Windows'
         shell: pwsh
-        run: .\scripts\desktop-release-smoke.ps1 -ExerciseLifecycle -Artifact (Get-ChildItem target\release\bundle\msi\*.msi -ErrorAction Stop).FullName
+        run: |
+          $artifacts = @(Get-ChildItem target\release\bundle\msi\*.msi -ErrorAction Stop)
+          if ($artifacts.Count -ne 1) { throw "expected exactly one MSI" }
+          .\scripts\desktop-release-smoke.ps1 -NativeInstallGate -Artifact $artifacts[0].FullName
       - name: Native artifact first-run smoke
         if: runner.os != 'Windows'
         shell: bash
@@ -148,7 +243,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p desktop-dist/SBOM
-          { rustc -vV; cargo -V; node -v; npm -v; printf 'runner=%s\nimage=%s\n' "$RUNNER_OS" "$ImageOS"; sha256sum Cargo.lock desktop/package-lock.json rust-toolchain.toml .github/workflows/desktop-release.yml; } > desktop-dist/BUILD-INPUTS.txt
+          { rustc -vV; cargo -V; node -v; npm -v; printf 'runner=%s\nSOURCE_DATE_EPOCH=%s\n' "$RUNNER_OS" "$SOURCE_DATE_EPOCH"; cat "$RUNNER_TEMP/devicelane-native-inputs.txt"; sha256sum Cargo.lock desktop/package-lock.json rust-toolchain.toml .github/workflows/desktop-release.yml; } > desktop-dist/BUILD-INPUTS.txt
+          test ! -f desktop-notary-history.txt || cp desktop-notary-history.txt desktop-dist/
           cargo install cargo-cyclonedx --version 0.5.7 --locked
           cargo cyclonedx --all --format json
           find . -name '*.cdx.json' -type f -exec cp {} desktop-dist/SBOM/ \;

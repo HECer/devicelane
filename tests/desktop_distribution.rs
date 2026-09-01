@@ -198,6 +198,7 @@ fn workflow_pins_build_environment_and_records_inputs() {
         "ubuntu-24.04",
         "node-version: 22.20.0",
         "BUILD-INPUTS.txt",
+        "devicelane-native-inputs.txt",
     ] {
         assert!(
             workflow.contains(declaration),
@@ -223,4 +224,67 @@ fn tauri_build_embeds_the_native_application_manifest() {
     let manifest = read("desktop/src-tauri/Cargo.toml");
     assert!(build.contains("tauri_build::build()"));
     assert!(manifest.contains("tauri-build = { version = \"2\""));
+}
+
+#[test]
+fn mac_production_acceptance_requires_one_verified_notarized_dmg() {
+    let workflow = read(".github/workflows/desktop-release.yml");
+    assert!(workflow.contains("mapfile -t dmgs"));
+    assert!(workflow.contains(r#"[ "${#dmgs[@]}" -eq 1 ]"#));
+    assert!(workflow.contains("codesign --verify --deep --strict"));
+    assert!(workflow.contains("spctl --assess --type open"));
+    assert!(workflow.contains("xcrun stapler validate \"$dmg\""));
+    assert!(workflow.contains("notarytool history"));
+}
+
+#[test]
+fn production_environment_drift_and_unsigned_reproducibility_are_gated() {
+    let workflow = read(".github/workflows/desktop-release.yml");
+    let comparison = format!(
+        "{}\n{}",
+        read("scripts/compare-msi-payloads.ps1"),
+        read("scripts/compare-native-payloads.sh")
+    );
+    for declaration in [
+        "SOURCE_DATE_EPOCH",
+        "DEVICELANE_EXPECTED_IMAGE_OS",
+        "DEVICELANE_EXPECTED_IMAGE_VERSION",
+        "DEVICELANE_EXPECTED_XCODE",
+        "DEVICELANE_EXPECTED_APPLE_SDK",
+        "DEVICELANE_EXPECTED_MSVC",
+        "DEVICELANE_EXPECTED_WIX",
+        "DEVICELANE_EXPECTED_APT_VERSIONS_SHA256",
+        "Verify pinned production environment",
+        "Reproducible unsigned payload gate",
+        "repro-build-a",
+        "repro-build-b",
+    ] {
+        assert!(
+            workflow.contains(declaration),
+            "missing reproducibility gate: {}",
+            declaration
+        );
+    }
+    assert!(comparison.contains("Compare-Object"));
+    assert!(comparison.contains("diff -u"));
+    let readme = read("README.md");
+    assert!(readme.contains("unsigned payloads and configuration"));
+    assert!(readme.contains("signed envelope"));
+    assert!(readme.contains("timestamp and notarization"));
+}
+
+#[test]
+fn elevated_msi_gate_cannot_fall_back_to_administrative_extraction() {
+    let workflow = read(".github/workflows/desktop-release.yml");
+    let smoke = read("scripts/desktop-release-smoke.ps1");
+    assert!(workflow.contains("-NativeInstallGate"));
+    assert!(!workflow.contains("-PayloadOnly"));
+    assert!(workflow.contains("expected exactly one MSI"));
+    assert!(smoke.contains("[switch]$NativeInstallGate"));
+    assert!(smoke.contains("[switch]$PayloadOnly"));
+    assert!(smoke.contains("NativeInstallGate requires elevated MSI /i and /x"));
+    let native_gate = smoke.rsplit("if ($NativeInstallGate)").next().unwrap();
+    assert!(native_gate.contains("@('/i', $Artifact"));
+    assert!(native_gate.contains("@('/x', $Artifact"));
+    assert!(!native_gate.contains("@('/a', $Artifact"));
 }

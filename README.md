@@ -106,13 +106,21 @@ The native installer contains the desktop executable, `devicelane-service`, and 
 verified native installation root, rejects links/reparse points, and never substitutes a raw
 `target/release` binary for an installed artifact.
 
-Release builds pin the hosted runner image (`windows-2025`, `macos-15`, or `ubuntu-24.04`), Rust
-1.95.0, Node.js 22.20.0, every GitHub Action by commit, `Cargo.lock`, and
-`desktop/package-lock.json`. Each artifact set includes `BUILD-INPUTS.txt` with tool versions,
-runner-image identity, and hashes of the lockfiles, toolchain file, and workflow. This makes the
-declared source/dependency/toolchain inputs auditable; it does not promise bit-for-bit output
-across hosted-image refreshes, native linker/SDK changes, timestamps, code signing, notarization,
-or package-manager repository changes. SHA-256 and signatures authenticate the emitted outputs.
+Release builds pin the hosted runner image (`windows-2025`, `macos-15`, or `ubuntu-24.04`), its
+exact image version, Rust 1.95.0, Node.js 22.20.0, every GitHub Action by commit, the native
+Xcode/SDK or MSVC/WiX toolchain, Linux package versions, `Cargo.lock`, and
+`desktop/package-lock.json`. Production aborts when an observed input differs from the protected
+repository-variable pins. `SOURCE_DATE_EPOCH`, UTC, non-incremental compilation, and two clean
+unsigned builds provide a reproducibility gate for unsigned payloads and configuration; their
+normalized installed-file manifests must match before CI accepts an artifact. Native container
+hashes are recorded where the format is deterministic.
+
+Each artifact set includes `BUILD-INPUTS.txt` with the observed versions and input hashes. The
+signed envelope is intentionally outside the unsigned payload comparison: signing services add
+external timestamp and notarization evidence, so the signed MSI/DMG container need not be
+bit-for-bit identical to its unsigned envelope. Production acceptance is not weakened: native
+signature verification, the single-DMG notarization and stapling gates, checksums, SBOMs, and
+signed checksum evidence must all succeed.
 
 ### Build from source
 

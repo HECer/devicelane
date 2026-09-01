@@ -13,6 +13,9 @@
   protected release environment, while unsigned CI receives no release secrets.
 - Pinned release runners, Rust, Node.js, actions, and dependency locks and added a build-input
   evidence manifest documenting the remaining native-toolchain reproducibility boundary.
+- Added exact production image/native-tool drift gates, deterministic double-build payload
+  comparison, strict macOS signature/notarization acceptance, and an elevated-only MSI install
+  gate that cannot silently degrade to administrative extraction.
 
 ## 0.1.0 — 2026-07-31
 
