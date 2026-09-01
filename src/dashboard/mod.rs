@@ -1,4 +1,5 @@
 pub mod event_log;
 pub mod model;
+pub mod topology;
 
 pub use model::*;

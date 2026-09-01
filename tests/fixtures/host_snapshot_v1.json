@@ -1,0 +1,8 @@
+{
+  "id": "legacy-local",
+  "operating_system": "windows",
+  "architecture": "x86_64",
+  "status": "online",
+  "capabilities": ["cargo_test"],
+  "devices": []
+}
