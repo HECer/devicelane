@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc && vite build",
+    "stage:sidecar": "node scripts/stage-sidecar.mjs",
     "dev": "vite",
     "test": "vitest",
     "typecheck": "tsc --noEmit"

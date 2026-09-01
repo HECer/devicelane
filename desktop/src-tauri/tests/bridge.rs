@@ -1,7 +1,7 @@
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, LocalProtocolVersion, LocalRequest, LocalResponse,
 };
-use devicelane_desktop::{DaemonTransport, DesktopBridge, repair_spec};
+use devicelane_desktop::{DaemonTransport, DesktopBridge, RepairProcess, repair_spec};
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -9,6 +9,17 @@ use std::sync::{Arc, Mutex};
 struct FakeTransport {
     requests: Arc<Mutex<Vec<LocalRequest>>>,
     response: LocalResponse,
+}
+
+struct FakeRepairProcess {
+    calls: Mutex<usize>,
+}
+
+impl RepairProcess for FakeRepairProcess {
+    fn execute(&self, _spec: &devicelane_desktop::RepairSpec) -> Result<(), String> {
+        *self.calls.lock().unwrap() += 1;
+        Ok(())
+    }
 }
 
 impl DaemonTransport for FakeTransport {
@@ -103,17 +114,18 @@ fn daemon_errors_remain_errors_at_the_command_boundary() {
 #[test]
 fn repair_uses_only_fixed_platform_programs_and_arguments() {
     let root = Path::new("/trusted/resources");
-    let binaries = Path::new("/trusted/bin");
-    let linux = repair_spec("linux", root, binaries).unwrap();
+    let linux_binary = Path::new("/trusted/bin/devicelane-service");
+    let linux = repair_spec("linux", root, linux_binary).unwrap();
     assert_eq!(linux.program, Path::new("/bin/sh"));
     assert_eq!(
         linux.arguments,
         [root.join("scripts/setup-linux.sh"), "--repair".into()]
     );
 
-    assert_eq!(linux.service_binary, binaries.join("devicelane-service"));
+    assert_eq!(linux.service_binary, linux_binary);
 
-    let windows = repair_spec("windows", root, binaries).unwrap();
+    let windows_binary = Path::new(r"C:\trusted\bin\devicelane-service.exe");
+    let windows = repair_spec("windows", root, windows_binary).unwrap();
     assert_eq!(
         windows.program,
         Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
@@ -128,8 +140,21 @@ fn repair_uses_only_fixed_platform_programs_and_arguments() {
         "--service-repair".into(),
     ];
     assert_eq!(windows.arguments, expected);
-    assert_eq!(
-        windows.service_binary,
-        binaries.join("devicelane-service.exe")
-    );
+    assert_eq!(windows.service_binary, windows_binary);
+}
+
+#[test]
+fn fake_process_executes_a_validated_repair_spec_once() {
+    let process = FakeRepairProcess {
+        calls: Mutex::new(0),
+    };
+    let spec = devicelane_desktop::RepairSpec {
+        program: "/bin/sh".into(),
+        arguments: vec!["setup-linux.sh".into(), "--repair".into()],
+        service_binary: "/trusted/devicelane-service".into(),
+    };
+
+    process.execute(&spec).unwrap();
+
+    assert_eq!(*process.calls.lock().unwrap(), 1);
 }

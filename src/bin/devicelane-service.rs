@@ -101,6 +101,16 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--print-executable-path") {
+        match std::env::current_exe() {
+            Ok(path) => println!("{}", path.display()),
+            Err(error) => {
+                eprintln!("devicelane-service: cannot resolve executable path: {error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if let Err(error) = run() {
         eprintln!("devicelane-service: {error}");
         std::process::exit(2);

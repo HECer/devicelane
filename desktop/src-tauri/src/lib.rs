@@ -10,6 +10,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_shell::ShellExt;
 
 pub trait DaemonTransport: Send + Sync + 'static {
     fn send(&self, request: LocalRequest) -> Result<LocalResponse, String>;
@@ -141,10 +142,36 @@ pub struct RepairSpec {
     pub service_binary: PathBuf,
 }
 
+pub trait RepairProcess {
+    fn execute(&self, spec: &RepairSpec) -> Result<(), String>;
+}
+
+struct CommandRepairProcess;
+
+impl RepairProcess for CommandRepairProcess {
+    fn execute(&self, spec: &RepairSpec) -> Result<(), String> {
+        let output = Command::new(&spec.program)
+            .args(&spec.arguments)
+            .env("DEVICELANE_SERVICE_BINARY", &spec.service_binary)
+            .output()
+            .map_err(|error| format!("DeviceLane repair could not start: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            Err(if detail.is_empty() {
+                format!("DeviceLane repair exited with {}", output.status)
+            } else {
+                format!("DeviceLane repair failed: {detail}")
+            })
+        }
+    }
+}
+
 pub fn repair_spec(
     platform: &str,
     resource_dir: &Path,
-    executable_dir: &Path,
+    service_binary: &Path,
 ) -> Result<RepairSpec, String> {
     let (program, script, mode, prefix): (PathBuf, &str, &str, Vec<OsString>) = match platform {
         "windows" => (
@@ -180,26 +207,18 @@ pub fn repair_spec(
     let mut arguments = prefix;
     arguments.push(script.into_os_string());
     arguments.push(mode.into());
-    let service_name = if platform == "windows" {
-        "devicelane-service.exe"
-    } else {
-        "devicelane-service"
-    };
     Ok(RepairSpec {
         program,
         arguments,
-        service_binary: executable_dir.join(service_name),
+        service_binary: service_binary.to_owned(),
     })
 }
 
-fn run_repair(platform: &str, resource_dir: &Path, executable_dir: &Path) -> Result<(), String> {
+fn run_repair(platform: &str, resource_dir: &Path, service_binary: &Path) -> Result<(), String> {
     let trusted_root = resource_dir
         .canonicalize()
         .map_err(|error| format!("DeviceLane resource directory is unavailable: {error}"))?;
-    let trusted_executable_dir = executable_dir
-        .canonicalize()
-        .map_err(|error| format!("DeviceLane program directory is unavailable: {error}"))?;
-    let spec = repair_spec(platform, &trusted_root, &trusted_executable_dir)?;
+    let spec = repair_spec(platform, &trusted_root, service_binary)?;
     let script_index = spec.arguments.len().saturating_sub(2);
     let script = PathBuf::from(&spec.arguments[script_index]);
     let trusted_script = script
@@ -208,30 +227,41 @@ fn run_repair(platform: &str, resource_dir: &Path, executable_dir: &Path) -> Res
     if !trusted_script.starts_with(&trusted_root) || !trusted_script.is_file() {
         return Err("DeviceLane repair asset failed path validation".into());
     }
-    let trusted_service = spec
-        .service_binary
+    let trusted_service = service_binary
         .canonicalize()
         .map_err(|error| format!("Bundled DeviceLane service is unavailable: {error}"))?;
-    if !trusted_service.starts_with(&trusted_executable_dir) || !trusted_service.is_file() {
+    if !trusted_service.is_file() {
         return Err("Bundled DeviceLane service failed path validation".into());
     }
     let mut arguments = spec.arguments;
     arguments[script_index] = trusted_script.into_os_string();
-    let output = Command::new(&spec.program)
-        .args(arguments)
-        .env("DEVICELANE_SERVICE_BINARY", trusted_service)
+    let trusted_spec = RepairSpec {
+        arguments,
+        service_binary: trusted_service,
+        ..spec
+    };
+    CommandRepairProcess.execute(&trusted_spec)
+}
+
+async fn locate_service_sidecar(app: &AppHandle) -> Result<PathBuf, String> {
+    let output = app
+        .shell()
+        .sidecar("devicelane-service")
+        .map_err(|error| format!("DeviceLane sidecar cannot be resolved: {error}"))?
+        .arg("--print-executable-path")
         .output()
-        .map_err(|error| format!("DeviceLane repair could not start: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        Err(if detail.is_empty() {
-            format!("DeviceLane repair exited with {}", output.status)
-        } else {
-            format!("DeviceLane repair failed: {detail}")
-        })
+        .await
+        .map_err(|error| format!("DeviceLane sidecar cannot be queried: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "DeviceLane sidecar path query failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    path.is_absolute()
+        .then_some(path)
+        .ok_or_else(|| "DeviceLane sidecar returned a non-absolute path".into())
 }
 
 fn notify_error(app: &AppHandle, error: &str) {
@@ -283,21 +313,15 @@ fn create_diagnostics(
 }
 
 #[tauri::command]
-fn repair_daemon(app: AppHandle) -> Result<(), String> {
-    let executable_dir = std::env::current_exe()
-        .map_err(|error| format!("DeviceLane executable cannot be resolved: {error}"))
-        .and_then(|path| {
-            path.parent()
-                .map(Path::to_path_buf)
-                .ok_or_else(|| "DeviceLane executable directory is unavailable".into())
-        });
+async fn repair_daemon(app: AppHandle) -> Result<(), String> {
+    let service_binary = locate_service_sidecar(&app).await;
     let result = app
         .path()
         .resource_dir()
         .map_err(|error| format!("DeviceLane resources cannot be resolved: {error}"))
         .and_then(|resources| {
-            executable_dir
-                .and_then(|binaries| run_repair(std::env::consts::OS, &resources, &binaries))
+            service_binary
+                .and_then(|service| run_repair(std::env::consts::OS, &resources, &service))
         });
     report(&app, result)
 }
@@ -316,6 +340,7 @@ pub fn run() {
             show_main_window(app)
         }))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_shell::init())
         .manage(bridge)
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "DeviceLane anzeigen", true, None::<&str>)?;

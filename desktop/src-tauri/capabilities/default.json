@@ -3,5 +3,12 @@
   "identifier": "default",
   "description": "DeviceLane main window capability",
   "windows": ["main"],
-  "permissions": ["core:default", "notification:default"]
+  "permissions": [
+    "core:default",
+    "notification:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [{ "name": "devicelane-service", "sidecar": true, "args": ["--print-executable-path"] }]
+    }
+  ]
 }
