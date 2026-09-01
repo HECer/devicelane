@@ -8,6 +8,11 @@
   separate unsigned CI artifacts that cannot be presented as production releases.
 - Added runner-scoped first-run lifecycle smoke checks covering install, status, repair,
   autostart, logs, uninstall, and identity preservation.
+- Hardened distribution validation so the installed MSI, DMG, AppImage, and deb payloads supply
+  the desktop, service, and CLI used by the smoke; production signing runs only inside the
+  protected release environment, while unsigned CI receives no release secrets.
+- Pinned release runners, Rust, Node.js, actions, and dependency locks and added a build-input
+  evidence manifest documenting the remaining native-toolchain reproducibility boundary.
 
 ## 0.1.0 — 2026-07-31
 

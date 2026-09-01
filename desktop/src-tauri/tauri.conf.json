@@ -17,14 +17,14 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": [],
+    "icon": ["icons/icon.ico", "icons/icon.icns", "icons/icon.png"],
     "macOS": {
       "minimumSystemVersion": "13.0",
       "signingIdentity": null,
       "hardenedRuntime": true,
       "entitlements": null
     },
-    "externalBin": ["binaries/devicelane-service"],
+    "externalBin": ["binaries/devicelane-service", "binaries/devicelane"],
     "resources": {
       "../../scripts/setup-windows.ps1": "scripts/setup-windows.ps1",
       "../../scripts/setup-mac.sh": "scripts/setup-mac.sh",

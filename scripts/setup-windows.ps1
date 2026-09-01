@@ -90,6 +90,15 @@ function Invoke-ServiceActivation($ExistingTask, $Operations) {
     }
 }
 
+function Wait-ServiceTaskStopped {
+    for ($Attempt = 0; $Attempt -lt 100; $Attempt++) {
+        $Task = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
+        if ($null -eq $Task -or $Task.State -ne "Running") { return }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "DeviceLane service task did not stop before the deadline"
+}
+
 if ($Mode -eq "service-status") {
     $ServiceTask = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
     if ($null -eq $ServiceTask) { Write-Output "DeviceLane service is not installed."; exit 1 }
@@ -101,8 +110,16 @@ if ($Mode -eq "service-autostart-disable") { Stop-ScheduledTask -TaskName $Servi
 if ($Mode -eq "service-logs") { Write-Output $ServiceLogDir; exit 0 }
 if ($Mode -eq "service-uninstall") {
     Stop-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
+    Wait-ServiceTaskStopped
     Unregister-ScheduledTask -TaskName $ServiceTaskName -Confirm:$false -ErrorAction SilentlyContinue
-    Get-ChildItem -LiteralPath $ServiceDeployDir -Filter "devicelane-service-*.exe" -ErrorAction SilentlyContinue | Remove-Item -Force
+    foreach ($Version in @(Get-ChildItem -LiteralPath $ServiceDeployDir -Filter "devicelane-service-*.exe" -ErrorAction SilentlyContinue)) {
+        for ($Attempt = 0; $Attempt -lt 50; $Attempt++) {
+            try { Remove-Item -LiteralPath $Version.FullName -Force -ErrorAction Stop; break } catch {
+                if ($Attempt -eq 49) { throw }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
     Write-Output "DeviceLane service removed. Identity and logs were preserved."
     exit 0
 }
@@ -115,7 +132,7 @@ if ($Mode -eq "service-install") {
         $BuiltServiceExe = (Resolve-Path ".\target\release\devicelane-service.exe").Path
     } else {
         $BuiltServiceExe = [System.IO.Path]::GetFullPath($BuiltServiceExe)
-        if (-not [System.IO.Path]::IsPathFullyQualified($BuiltServiceExe) -or -not (Test-Path -LiteralPath $BuiltServiceExe -PathType Leaf)) {
+        if (-not [System.IO.Path]::IsPathRooted($BuiltServiceExe) -or -not (Test-Path -LiteralPath $BuiltServiceExe -PathType Leaf)) {
             throw "Bundled DeviceLane service is unavailable."
         }
         if ((Get-Item -LiteralPath $BuiltServiceExe -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {

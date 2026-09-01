@@ -37,4 +37,5 @@ fn main() {
         generated,
     )
     .unwrap();
+    tauri_build::build()
 }

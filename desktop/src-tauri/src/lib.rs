@@ -98,6 +98,15 @@ impl<T: DaemonTransport> DesktopBridge<T> {
     }
 }
 
+pub fn run_smoke_probe_with_transport<T: DaemonTransport>(transport: T) -> Result<String, String> {
+    serde_json::to_string(&DesktopBridge::new(transport).status()?)
+        .map_err(|error| error.to_string())
+}
+
+pub fn run_smoke_probe() -> Result<String, String> {
+    run_smoke_probe_with_transport(LocalDaemonTransport)
+}
+
 fn unexpected_response(response: LocalResponse) -> String {
     match response {
         LocalResponse::Error { code, message } => format!("daemon error ({code}): {message}"),
@@ -113,6 +122,9 @@ fn user_home() -> PathBuf {
 }
 
 fn runtime_dir() -> PathBuf {
+    if let Some(smoke_runtime) = std::env::var_os("DEVICELANE_RUNTIME_DIR") {
+        return PathBuf::from(smoke_runtime);
+    }
     #[cfg(target_os = "macos")]
     return user_home().join("Library/Application Support/DeviceLane/state/runtime");
     #[cfg(target_os = "linux")]

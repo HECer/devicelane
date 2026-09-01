@@ -101,6 +101,19 @@ installation root is the security boundary. The per-user lifecycle tools preserv
 logs during repair and normal uninstall; delete those directories separately only when rotating
 the device identity intentionally.
 
+The native installer contains the desktop executable, `devicelane-service`, and the equal
+`devicelane` CLI client. The lifecycle and smoke tooling resolves both command binaries below the
+verified native installation root, rejects links/reparse points, and never substitutes a raw
+`target/release` binary for an installed artifact.
+
+Release builds pin the hosted runner image (`windows-2025`, `macos-15`, or `ubuntu-24.04`), Rust
+1.95.0, Node.js 22.20.0, every GitHub Action by commit, `Cargo.lock`, and
+`desktop/package-lock.json`. Each artifact set includes `BUILD-INPUTS.txt` with tool versions,
+runner-image identity, and hashes of the lockfiles, toolchain file, and workflow. This makes the
+declared source/dependency/toolchain inputs auditable; it does not promise bit-for-bit output
+across hosted-image refreshes, native linker/SDK changes, timestamps, code signing, notarization,
+or package-manager repository changes. SHA-256 and signatures authenticate the emitted outputs.
+
 ### Build from source
 
 The examples use port `7443` for normal mutual-TLS traffic and temporary ports `7444`/`7445` for initial pairing. Replace `CONTROLLER_HOST` with a private DNS name or LAN/VPN address reachable from the other host.

@@ -2,7 +2,8 @@ use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, LocalProtocolVersion, LocalRequest, LocalResponse,
 };
 use devicelane_desktop::{
-    DaemonTransport, DesktopBridge, RepairProcess, repair_spec, sha256_file, validate_bundle_asset,
+    DaemonTransport, DesktopBridge, RepairProcess, repair_spec, run_smoke_probe_with_transport,
+    sha256_file, validate_bundle_asset,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -13,6 +14,17 @@ use std::time::{Duration, Instant};
 struct FakeTransport {
     requests: Arc<Mutex<Vec<LocalRequest>>>,
     response: LocalResponse,
+}
+
+#[test]
+fn installed_desktop_smoke_probe_uses_the_same_typed_bridge() {
+    let transport = FakeTransport {
+        requests: Arc::new(Mutex::new(vec![])),
+        response: LocalResponse::Snapshot(snapshot()),
+    };
+    let encoded = run_smoke_probe_with_transport(transport).unwrap();
+    let decoded: DaemonSnapshot = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, snapshot());
 }
 
 struct FakeRepairProcess {
