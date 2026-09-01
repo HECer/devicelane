@@ -77,6 +77,19 @@ describe("DeviceLane desktop foundation", () => {
 
     expect(status).toHaveBeenCalledTimes(2);
     expect(screen.getAllByText("Verbunden")).toHaveLength(2);
+    expect(screen.getByRole("alert")).toHaveTextContent("denied");
+  });
+
+  it("keeps a diagnostics rejection in the shared accessible error region", async () => {
+    const user = userEvent.setup();
+    const client = fakeClient({ diagnostics: vi.fn().mockRejectedValue(new Error("diagnostics unavailable")) });
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole("button", { name: "Diagnosepaket erstellen" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveAttribute("aria-live", "assertive");
+    expect(alert).toHaveTextContent("diagnostics unavailable");
   });
 
   it("offers repair when the daemon cannot be reached", async () => {

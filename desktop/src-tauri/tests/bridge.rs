@@ -1,10 +1,14 @@
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, LocalProtocolVersion, LocalRequest, LocalResponse,
 };
-use devicelane_desktop::{DaemonTransport, DesktopBridge, RepairProcess, repair_spec};
+use devicelane_desktop::{
+    DaemonTransport, DesktopBridge, RepairProcess, repair_spec, sha256_file, validate_bundle_asset,
+};
 use std::ffi::OsString;
+use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 struct FakeTransport {
     requests: Arc<Mutex<Vec<LocalRequest>>>,
@@ -157,4 +161,112 @@ fn fake_process_executes_a_validated_repair_spec_once() {
     process.execute(&spec).unwrap();
 
     assert_eq!(*process.calls.lock().unwrap(), 1);
+}
+
+#[test]
+fn bundle_assets_reject_outside_missing_and_non_file_paths() {
+    let root = std::env::temp_dir().join(format!("devicelane-assets-{}", std::process::id()));
+    let outside = std::env::temp_dir().join(format!("devicelane-outside-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("directory")).unwrap();
+    fs::write(&outside, b"outside").unwrap();
+    assert!(
+        validate_bundle_asset(&root, &outside, &sha256_file(&outside).unwrap())
+            .unwrap_err()
+            .contains("outside")
+    );
+    assert!(
+        validate_bundle_asset(&root, &root.join("missing"), "00")
+            .unwrap_err()
+            .contains("unavailable")
+    );
+    assert!(
+        validate_bundle_asset(&root, &root.join("directory"), "00")
+            .unwrap_err()
+            .contains("regular file")
+    );
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_file(outside).unwrap();
+}
+
+#[test]
+fn bundle_asset_integrity_accepts_exact_hash_and_rejects_changes() {
+    let root = std::env::temp_dir().join(format!("devicelane-integrity-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let asset = root.join("setup.sh");
+    fs::write(&asset, b"trusted").unwrap();
+    let hash = sha256_file(&asset).unwrap();
+    assert_eq!(
+        validate_bundle_asset(&root, &asset, &hash).unwrap(),
+        asset.canonicalize().unwrap()
+    );
+    fs::write(&asset, b"changed").unwrap();
+    assert!(
+        validate_bundle_asset(&root, &asset, &hash)
+            .unwrap_err()
+            .contains("integrity")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn bundle_assets_reject_symbolic_links() {
+    let root = std::env::temp_dir().join(format!("devicelane-links-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let target = root.join("target");
+    let link = root.join("link");
+    fs::write(&target, b"trusted").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+        fs::remove_dir_all(root).unwrap();
+        return;
+    }
+    assert!(
+        validate_bundle_asset(&root, &link, &sha256_file(&target).unwrap())
+            .unwrap_err()
+            .contains("link")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn hanging_repair_child_is_killed_and_reaped_at_the_deadline() {
+    let spec = devicelane_desktop::RepairSpec {
+        program: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into(),
+        arguments: vec![
+            "-NoProfile".into(),
+            "-Command".into(),
+            "Start-Sleep -Seconds 30".into(),
+        ],
+        service_binary: std::env::current_exe().unwrap(),
+    };
+    let started = Instant::now();
+    let error = devicelane_desktop::execute_repair_process(&spec, Duration::from_millis(100), 1024)
+        .unwrap_err();
+    assert!(error.contains("timed out"));
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[cfg(windows)]
+#[test]
+fn oversized_repair_stderr_is_drained_but_diagnostic_is_bounded() {
+    let spec = devicelane_desktop::RepairSpec {
+        program: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into(),
+        arguments: vec![
+            "-NoProfile".into(),
+            "-Command".into(),
+            "$x='x'*200000; [Console]::Error.Write($x); exit 7".into(),
+        ],
+        service_binary: std::env::current_exe().unwrap(),
+    };
+    let error = devicelane_desktop::execute_repair_process(&spec, Duration::from_secs(5), 1024)
+        .unwrap_err();
+    assert!(error.contains("output truncated"));
+    assert!(error.len() < 1200);
 }

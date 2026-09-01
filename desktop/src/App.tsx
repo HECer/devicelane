@@ -18,6 +18,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   const [diagnosticsPath, setDiagnosticsPath] = useState("");
   const [diagnostics, setDiagnostics] = useState<Awaited<ReturnType<DaemonClient["diagnostics"]>>["items"]>([]);
   const [busy, setBusy] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
   usePretext();
 
   const refresh = async () => {
@@ -33,12 +34,13 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
     void refresh();
   }, [client]);
 
-  const run = async (action: () => Promise<void>) => {
+  const run = async <T,>(action: () => Promise<T>, onSuccess?: (value: T) => void) => {
     setBusy(true);
     try {
-      await action();
-    } catch {
-      // Rust displays the native error notification; the UI still refreshes below.
+      const value = await action();
+      onSuccess?.(value);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
     } finally {
       await refresh();
       setBusy(false);
@@ -70,6 +72,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
         <p className="sidebar-foot">Dienst {snapshot.daemon_version}</p>
       </aside>
       <main className="shell" id="overview">
+        {errorMessage && <p className="error-banner" role="alert" aria-live="assertive">{errorMessage}</p>}
         <header className="page-header">
           <div><p className="eyebrow">Lokales Netzwerk</p><h1 data-pretext>Geräteübersicht</h1></div>
           <span className={`connection-pill connection-pill--${snapshot.connection}`}>
@@ -107,7 +110,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
           </article>
           <article className="control-card control-card--wide">
             <div><h2>Diagnose</h2><p data-pretext>Erstellt eine lokale Zusammenfassung mit Status und Logpfad für die Fehlersuche.</p><p className="path" aria-live="polite">{diagnosticsPath || snapshot.log_location}</p>{diagnostics.length > 0 && <ul className="diagnostic-list">{diagnostics.map((item) => <li key={item.code} data-healthy={item.healthy}><strong>{item.healthy ? "OK" : "Fehler"}</strong> {item.message}</li>)}</ul>}</div>
-            <button onClick={async () => { setBusy(true); try { const result = await client.diagnostics(); setDiagnosticsPath(result.path); setDiagnostics(result.items); } finally { setBusy(false); } }} disabled={busy}>Diagnosepaket erstellen</button>
+            <button onClick={() => void run(client.diagnostics, (result) => { setDiagnosticsPath(result.path); setDiagnostics(result.items); })} disabled={busy}>Diagnosepaket erstellen</button>
           </article>
         </section>
       </main>

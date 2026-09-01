@@ -885,8 +885,10 @@ dependencies = [
 name = "devicelane-desktop"
 version = "0.1.0"
 dependencies = [
+ "command-group",
  "devicelane",
  "serde",
+ "sha2",
  "tauri",
  "tauri-plugin-notification",
  "tauri-plugin-shell",

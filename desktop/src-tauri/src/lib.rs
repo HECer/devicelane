@@ -1,16 +1,26 @@
+use command_group::CommandGroup;
 use device_development_mesh::local_ipc::{
     DaemonSnapshot, DiagnosticItem, LocalProtocolVersion, LocalRequest, LocalResponse,
     local_endpoint, send_local_request,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::ShellExt;
+
+mod repair_integrity {
+    include!(concat!(env!("OUT_DIR"), "/repair_integrity.rs"));
+}
 
 pub trait DaemonTransport: Send + Sync + 'static {
     fn send(&self, request: LocalRequest) -> Result<LocalResponse, String>;
@@ -148,24 +158,148 @@ pub trait RepairProcess {
 
 struct CommandRepairProcess;
 
+const REPAIR_TIMEOUT: Duration = Duration::from_secs(120);
+const REPAIR_OUTPUT_LIMIT: usize = 64 * 1024;
+
+fn drain_bounded(mut reader: impl Read, limit: usize) -> Result<(Vec<u8>, bool), String> {
+    let mut kept = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        let available = limit.saturating_sub(kept.len());
+        kept.extend_from_slice(&buffer[..count.min(available)]);
+        truncated |= count > available;
+    }
+    Ok((kept, truncated))
+}
+
+fn format_output(bytes: &[u8], truncated: bool) -> String {
+    let mut text = String::from_utf8_lossy(bytes).trim().to_owned();
+    if truncated {
+        text.push_str(" [output truncated]");
+    }
+    text
+}
+
 impl RepairProcess for CommandRepairProcess {
     fn execute(&self, spec: &RepairSpec) -> Result<(), String> {
-        let output = Command::new(&spec.program)
-            .args(&spec.arguments)
-            .env("DEVICELANE_SERVICE_BINARY", &spec.service_binary)
-            .output()
-            .map_err(|error| format!("DeviceLane repair could not start: {error}"))?;
-        if output.status.success() {
-            Ok(())
+        execute_repair_process(spec, REPAIR_TIMEOUT, REPAIR_OUTPUT_LIMIT)
+    }
+}
+
+pub fn execute_repair_process(
+    spec: &RepairSpec,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<(), String> {
+    let mut child = Command::new(&spec.program)
+        .args(&spec.arguments)
+        .env("DEVICELANE_SERVICE_BINARY", &spec.service_binary)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .group_spawn()
+        .map_err(|error| format!("DeviceLane repair could not start: {error}"))?;
+    let stdout = child
+        .inner()
+        .stdout
+        .take()
+        .ok_or("repair stdout pipe unavailable")?;
+    let stderr = child
+        .inner()
+        .stderr
+        .take()
+        .ok_or("repair stderr pipe unavailable")?;
+    let stdout_reader = thread::spawn(move || drain_bounded(stdout, output_limit));
+    let stderr_reader = thread::spawn(move || drain_bounded(stderr, output_limit));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            child
+                .kill()
+                .map_err(|error| format!("repair timeout; process tree kill failed: {error}"))?;
+            child
+                .wait()
+                .map_err(|error| format!("repair timeout; child reap failed: {error}"))?;
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(format!(
+                "DeviceLane repair timed out after {} seconds",
+                timeout.as_secs_f64()
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let (_, _) = stdout_reader
+        .join()
+        .map_err(|_| "repair stdout reader panicked")??;
+    let (stderr, truncated) = stderr_reader
+        .join()
+        .map_err(|_| "repair stderr reader panicked")??;
+    if status.success() {
+        Ok(())
+    } else {
+        let detail = format_output(&stderr, truncated);
+        Err(if detail.is_empty() {
+            format!("DeviceLane repair exited with {status}")
         } else {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            Err(if detail.is_empty() {
-                format!("DeviceLane repair exited with {}", output.status)
-            } else {
-                format!("DeviceLane repair failed: {detail}")
-            })
+            format!("DeviceLane repair failed: {detail}")
+        })
+    }
+}
+
+pub fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| format!("asset cannot be opened: {error}"))?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut file, &mut digest)
+        .map_err(|error| format!("asset cannot be hashed: {error}"))?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+pub fn validate_bundle_asset(
+    root: &Path,
+    asset: &Path,
+    expected_sha256: &str,
+) -> Result<PathBuf, String> {
+    let relative = asset
+        .strip_prefix(root)
+        .map_err(|_| "asset is outside the trusted bundle root")?
+        .to_owned();
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("bundle root unavailable: {error}"))?;
+    let asset = root.join(&relative);
+    let mut component = root.clone();
+    for part in relative.components() {
+        component.push(part);
+        let metadata = std::fs::symlink_metadata(&component)
+            .map_err(|error| format!("bundle asset unavailable: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("bundle asset contains a symbolic link".into());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err("bundle asset contains a reparse point".into());
+            }
         }
     }
+    if !asset.is_file() {
+        return Err("bundle asset is not a regular file".into());
+    }
+    if sha256_file(&asset)? != expected_sha256 {
+        return Err("bundle asset integrity check failed".into());
+    }
+    Ok(asset)
 }
 
 pub fn repair_spec(
@@ -221,18 +355,24 @@ fn run_repair(platform: &str, resource_dir: &Path, service_binary: &Path) -> Res
     let spec = repair_spec(platform, &trusted_root, service_binary)?;
     let script_index = spec.arguments.len().saturating_sub(2);
     let script = PathBuf::from(&spec.arguments[script_index]);
-    let trusted_script = script
-        .canonicalize()
-        .map_err(|error| format!("DeviceLane repair asset is unavailable: {error}"))?;
-    if !trusted_script.starts_with(&trusted_root) || !trusted_script.is_file() {
-        return Err("DeviceLane repair asset failed path validation".into());
+    let script_hash = match platform {
+        "windows" => repair_integrity::WINDOWS_SCRIPT_SHA256,
+        "macos" => repair_integrity::MACOS_SCRIPT_SHA256,
+        "linux" => repair_integrity::LINUX_SCRIPT_SHA256,
+        _ => "",
+    };
+    if script_hash.is_empty() || repair_integrity::SIDECAR_SHA256.is_empty() {
+        return Err("DeviceLane bundle integrity manifest is incomplete".into());
     }
-    let trusted_service = service_binary
-        .canonicalize()
-        .map_err(|error| format!("Bundled DeviceLane service is unavailable: {error}"))?;
-    if !trusted_service.is_file() {
-        return Err("Bundled DeviceLane service failed path validation".into());
-    }
+    let trusted_script = validate_bundle_asset(&trusted_root, &script, script_hash)?;
+    let service_root = service_binary
+        .parent()
+        .ok_or("Bundled DeviceLane service has no parent directory")?;
+    let trusted_service = validate_bundle_asset(
+        service_root,
+        service_binary,
+        repair_integrity::SIDECAR_SHA256,
+    )?;
     let mut arguments = spec.arguments;
     arguments[script_index] = trusted_script.into_os_string();
     let trusted_spec = RepairSpec {
@@ -315,14 +455,20 @@ fn create_diagnostics(
 #[tauri::command]
 async fn repair_daemon(app: AppHandle) -> Result<(), String> {
     let service_binary = locate_service_sidecar(&app).await;
-    let result = app
+    let prepared = app
         .path()
         .resource_dir()
         .map_err(|error| format!("DeviceLane resources cannot be resolved: {error}"))
-        .and_then(|resources| {
-            service_binary
-                .and_then(|service| run_repair(std::env::consts::OS, &resources, &service))
-        });
+        .and_then(|resources| service_binary.map(|service| (resources, service)));
+    let result = match prepared {
+        Ok((resources, service)) => tauri::async_runtime::spawn_blocking(move || {
+            run_repair(std::env::consts::OS, &resources, &service)
+        })
+        .await
+        .map_err(|error| format!("DeviceLane repair worker failed: {error}"))
+        .and_then(|value| value),
+        Err(error) => Err(error),
+    };
     report(&app, result)
 }
 
