@@ -63,17 +63,55 @@ if ($Mode -eq "install") {
 }
 
 function Assert-CurrentUserTask($Task) {
-    if ($Task.Principal.UserId -ine $UserId) {
+    $PrincipalId = [string]$Task.Principal.UserId
+    if ($PrincipalId -match "^S-[0-9-]+$") {
+        $PrincipalSid = $PrincipalId
+    } else {
+        try {
+            $PrincipalSid = ([System.Security.Principal.NTAccount]$PrincipalId).Translate([System.Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            throw "refusing to manage a DeviceLane task with an unknown principal"
+        }
+    }
+    if ($PrincipalSid -ine $CurrentUserSid) {
         throw "refusing to manage a DeviceLane task owned by another user"
     }
     if ([System.IO.Path]::GetFileName($Task.Actions[0].Execute) -ine "powershell.exe") {
         throw "refusing to manage a DeviceLane task with an unexpected action"
     }
     $Arguments = [string]$Task.Actions[0].Arguments
-    $OwnsDeployedPath = $Arguments.IndexOf($DeployedRegistryExe, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    $VersionedPathPattern = [regex]::Escape((Join-Path $DeployDir "mesh-registry-")) + "[0-9a-f]{32}\.exe"
+    $OwnsDeployedPath = $Arguments -match $VersionedPathPattern
     $OwnsLegacyPath = $Arguments.IndexOf($LegacyRegistryExe, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
     if (-not ($OwnsDeployedPath -or $OwnsLegacyPath)) {
         throw "refusing to manage a DeviceLane task outside this user's deployment"
+    }
+}
+
+function Invoke-ControllerActivation($ExistingTask, $Operations) {
+    try {
+        & ($Operations["StageBinary"])
+        if ($null -ne $ExistingTask) {
+            & ($Operations["StopOld"])
+        }
+        & ($Operations["ActivateBinary"])
+        & ($Operations["RegisterNew"])
+        & ($Operations["StartNew"])
+        if ((& ($Operations["GetState"])) -ne "Running") {
+            throw "new DeviceLane controller task did not remain running"
+        }
+    } catch {
+        $ActivationError = $_
+        & ($Operations["CleanupStage"])
+        & ($Operations["CleanupFailedVersion"])
+        if ($null -ne $ExistingTask) {
+            & ($Operations["RestoreOld"]) $ExistingTask
+            & ($Operations["StartOld"])
+            if ((& ($Operations["GetState"])) -ne "Running") {
+                throw "new controller failed and the previous controller could not be restored: $ActivationError"
+            }
+        }
+        throw $ActivationError
     }
 }
 
@@ -117,8 +155,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($Mode -ne "install") { exit 0 }
 
 New-Item -ItemType Directory -Force -Path $IdentityDir, $LogDir, $DeployDir | Out-Null
-$StagedRegistryExe = Join-Path $DeployDir ("mesh-registry.stage-{0}.exe" -f [guid]::NewGuid().ToString("N"))
-Copy-Item -LiteralPath (Resolve-Path ".\target\debug\mesh-registry.exe").Path -Destination $StagedRegistryExe
+$BuildId = [guid]::NewGuid().ToString("N")
+$StagedRegistryExe = Join-Path $DeployDir "mesh-registry-$BuildId.stage"
+$DeployedRegistryExe = Join-Path $DeployDir "mesh-registry-$BuildId.exe"
+$BuiltRegistryExe = (Resolve-Path ".\target\debug\mesh-registry.exe").Path
 $RegistryLog = Join-Path $LogDir "registry.log"
 
 function ConvertTo-PowerShellLiteral([string]$Value) {
@@ -134,24 +174,22 @@ $Settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-T
 $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($null -ne $ExistingTask) {
     Assert-CurrentUserTask $ExistingTask
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 }
-try {
-    Move-Item -LiteralPath $StagedRegistryExe -Destination $DeployedRegistryExe -Force
-    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Description "Per-user DeviceLane registry controller" -Force | Out-Null
-    Start-ScheduledTask -TaskName $TaskName
-    Start-Sleep -Milliseconds 500
-    $StartedTask = Get-ScheduledTask -TaskName $TaskName
-    Assert-CurrentUserTask $StartedTask
-    if ($StartedTask.State -ne "Running") {
-        throw "DeviceLane controller failed to remain running; inspect $RegistryLog"
-    }
-} catch {
-    if ($null -ne $ExistingTask) {
-        Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    }
-    throw
+$Operations = @{
+    StageBinary = { Copy-Item -LiteralPath $BuiltRegistryExe -Destination $StagedRegistryExe }
+    StopOld = { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+    ActivateBinary = { Move-Item -LiteralPath $StagedRegistryExe -Destination $DeployedRegistryExe }
+    RegisterNew = { Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Description "Per-user DeviceLane registry controller" -Force | Out-Null }
+    StartNew = { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop; Start-Sleep -Milliseconds 500 }
+    GetState = { (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop).State.ToString() }
+    RestoreOld = { param($OldTask); Register-ScheduledTask -InputObject $OldTask -TaskName $TaskName -Force | Out-Null }
+    StartOld = { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop; Start-Sleep -Milliseconds 500 }
+    CleanupStage = { if (Test-Path -LiteralPath $StagedRegistryExe) { Remove-Item -LiteralPath $StagedRegistryExe -Force } }
+    CleanupFailedVersion = { if (Test-Path -LiteralPath $DeployedRegistryExe) { Remove-Item -LiteralPath $DeployedRegistryExe -Force } }
 }
+Invoke-ControllerActivation -ExistingTask $ExistingTask -Operations $Operations
+$StartedTask = Get-ScheduledTask -TaskName $TaskName
+Assert-CurrentUserTask $StartedTask
 Write-Output "DeviceLane controller installed or repaired for $UserId."
 Write-Output "Identity: $IdentityDir"
 Write-Output "Logs: $LogDir"

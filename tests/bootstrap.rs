@@ -66,7 +66,7 @@ fn bootstrap_assets_define_idempotent_setup_and_real_hardware_gates() {
     assert!(windows.contains("Register-ScheduledTask") && windows.contains("-Force"));
     assert_eq!(windows.matches("Unregister-ScheduledTask").count(), 1);
     assert!(windows.contains("-lt 1") && windows.contains("-gt 65535"));
-    assert!(windows.contains("State -ne \"Running\""));
+    assert!(windows.contains("new DeviceLane controller task did not remain running"));
     assert!(windows.contains("$Value.Replace(\"'\", \"''\")"));
     let task_command = windows
         .lines()
@@ -82,7 +82,6 @@ fn bootstrap_assets_define_idempotent_setup_and_real_hardware_gates() {
     let stage = install.find("$StagedRegistryExe").unwrap();
     let stop = install.find("Stop-ScheduledTask").unwrap();
     assert!(stage < stop);
-    assert!(!windows.contains("Remove-Item"));
     assert!(mac.contains("mkdir -p"));
     assert!(smoke.contains("cargo test --test bootstrap"));
     assert!(readme.contains("Windows"));
@@ -167,4 +166,66 @@ fn windows_controller_install_requires_every_public_runtime_argument_before_buil
             "unexpected error for port {port}: {stderr}"
         );
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_controller_activation_restores_the_old_definition_after_new_start_failure() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("scripts/setup-windows.ps1");
+    let harness = r#"
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $env:DEVICELANE_SETUP_SCRIPT, [ref]$tokens, [ref]$errors)
+$definition = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Invoke-ControllerActivation'
+}, $true)
+if ($null -eq $definition) { throw 'Invoke-ControllerActivation not found' }
+Invoke-Expression $definition.Extent.Text
+
+$script:events = [System.Collections.Generic.List[string]]::new()
+$script:current = 'old-definition'
+$script:state = 'Running'
+$oldTask = [pscustomobject]@{ Definition = 'old-definition' }
+$operations = @{
+    StageBinary = { $script:events.Add('stage-binary') }
+    StopOld = { $script:events.Add('stop-old'); $script:state = 'Ready' }
+    ActivateBinary = { $script:events.Add('activate-binary') }
+    RegisterNew = { $script:events.Add('register-new'); $script:current = 'new-definition' }
+    StartNew = { $script:events.Add('start-new'); throw 'simulated new start failure' }
+    GetState = { $script:state }
+    RestoreOld = { param($task); $script:events.Add("restore-$($task.Definition)"); $script:current = $task.Definition }
+    StartOld = { $script:events.Add('start-old'); $script:state = 'Running' }
+    CleanupStage = { $script:events.Add('cleanup-stage') }
+    CleanupFailedVersion = { $script:events.Add('cleanup-failed-version') }
+}
+try {
+    Invoke-ControllerActivation -ExistingTask $oldTask -Operations $operations
+    throw 'activation unexpectedly succeeded'
+} catch {
+    if ($_.Exception.Message -eq 'activation unexpectedly succeeded') { throw }
+}
+if ($script:current -ne 'old-definition') { throw "old definition was not restored: current=$script:current events=$($script:events -join ',')" }
+if ($script:state -ne 'Running') { throw 'old task was not restarted and verified' }
+$expected = 'stage-binary,stop-old,activate-binary,register-new,start-new,cleanup-stage,cleanup-failed-version,restore-old-definition,start-old'
+if (($script:events -join ',') -ne $expected) {
+    throw "unexpected rollback sequence: $($script:events -join ',')"
+}
+"rollback verified"
+"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", harness])
+        .env("DEVICELANE_SETUP_SCRIPT", script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("rollback verified"));
 }
