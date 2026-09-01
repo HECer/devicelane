@@ -6,7 +6,11 @@ use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::{io, path::PathBuf};
 
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+compile_error!("local IPC peer credentials are supported only on Linux and macOS Unix targets");
+
 pub const MAX_FRAME_BYTES: usize = 512 * 1024;
+pub const MAX_LOCAL_WORKERS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -324,15 +328,30 @@ pub fn local_endpoint(
     }
     #[cfg(unix)]
     {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if listen.contains("://") {
             return Err(LocalProtocolError::InvalidLocalEndpoint);
+        }
+        let original = std::fs::symlink_metadata(runtime_dir)
+            .map_err(|_| LocalProtocolError::InvalidLocalEndpoint)?;
+        if original.file_type().is_symlink() || !original.is_dir() {
+            return Err(LocalProtocolError::InvalidLocalEndpoint);
+        }
+        let runtime_dir = std::fs::canonicalize(runtime_dir)
+            .map_err(|_| LocalProtocolError::InvalidLocalEndpoint)?;
+        let metadata = std::fs::metadata(&runtime_dir)
+            .map_err(|_| LocalProtocolError::InvalidLocalEndpoint)?;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(LocalProtocolError::Unauthorized);
         }
         let path = if listen.is_empty() {
             runtime_dir.join("devicelane.sock")
         } else {
             PathBuf::from(listen)
         };
-        if !path.is_absolute() {
+        if !path.is_absolute() || path.parent() != Some(runtime_dir.as_path()) {
             return Err(LocalProtocolError::InvalidLocalEndpoint);
         }
         Ok(LocalEndpoint::UnixSocket(path))
@@ -348,6 +367,7 @@ pub fn serve_local(
 
 fn dispatch_connection(
     stream: PlatformStream,
+    peer: PeerCredentials,
     authorizer: &dyn Authorizer,
     state: &Arc<Mutex<DaemonState>>,
 ) {
@@ -355,13 +375,8 @@ fn dispatch_connection(
         Ok(writer) => writer,
         Err(_) => return,
     };
-    let request =
-        read_frame::<_, LocalRequest>(&mut std::io::BufReader::new(match stream.try_clone() {
-            Ok(reader) => reader,
-            Err(_) => return,
-        }));
-    let peer = platform::peer_credentials(&stream);
-    let response = if !peer.as_ref().is_ok_and(|peer| authorizer.authorize(peer)) {
+    let request = platform::read_request(&stream);
+    let response = if !authorizer.authorize(&peer) {
         LocalResponse::Error {
             code: "unauthorized".into(),
             message: "local IPC peer is not authorized".into(),
@@ -394,10 +409,49 @@ fn error_response(error: LocalProtocolError) -> LocalResponse {
     }
 }
 
+struct WorkerGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl WorkerGuard {
+    fn acquire(active: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |count| (count < MAX_LOCAL_WORKERS).then_some(count + 1),
+            )
+            .ok()?;
+        Some(Self(Arc::clone(active)))
+    }
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 #[cfg(unix)]
-type PlatformStream = std::os::unix::net::UnixStream;
+pub type PlatformStream = std::os::unix::net::UnixStream;
 #[cfg(windows)]
-type PlatformStream = std::fs::File;
+pub type PlatformStream = std::fs::File;
+
+pub type LocalStream = PlatformStream;
+
+pub fn open_local_stream(endpoint: &LocalEndpoint) -> Result<LocalStream, LocalProtocolError> {
+    connect_local(endpoint)
+}
+
+#[cfg(windows)]
+pub fn windows_pipe_security_sddl(user_sid: &str) -> Result<String, LocalProtocolError> {
+    (!user_sid.is_empty())
+        .then(|| format!("D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})"))
+        .ok_or(LocalProtocolError::Unauthorized)
+}
+
+#[cfg(not(windows))]
+pub fn windows_pipe_security_sddl(_user_sid: &str) -> Result<String, LocalProtocolError> {
+    Err(LocalProtocolError::InvalidLocalEndpoint)
+}
 
 fn duplicate_stream(stream: &PlatformStream) -> std::io::Result<PlatformStream> {
     stream.try_clone()
@@ -427,13 +481,47 @@ mod platform {
         endpoint: &LocalEndpoint,
         state: Arc<Mutex<DaemonState>>,
     ) -> Result<(), LocalProtocolError> {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let LocalEndpoint::UnixSocket(path) = endpoint;
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if !metadata.file_type().is_socket() {
+                return Err(LocalProtocolError::InvalidLocalEndpoint);
+            }
+            if PlatformStream::connect(path).is_ok() {
+                return Err(LocalProtocolError::InvalidLocalEndpoint);
+            }
+            std::fs::remove_file(path).map_err(|_| LocalProtocolError::Io)?;
+        }
         let listener = bind_local(endpoint).map_err(|_| LocalProtocolError::Io)?;
-        let authorizer = SameUserAuthorizer::unix(unsafe { libc::geteuid() });
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| LocalProtocolError::Io)?;
+        let _cleanup = SocketCleanup(path.clone());
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for accepted in listener.incoming() {
             let Ok(stream) = accepted else { continue };
-            dispatch_connection(stream, &authorizer, &state);
+            let Some(guard) = WorkerGuard::acquire(&active) else {
+                continue;
+            };
+            let Ok(peer) = peer_credentials(&stream) else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+            let state = Arc::clone(&state);
+            let authorizer = SameUserAuthorizer::unix(unsafe { libc::geteuid() });
+            std::thread::spawn(move || {
+                let _guard = guard;
+                dispatch_connection(stream, peer, &authorizer, &state)
+            });
         }
         Err(LocalProtocolError::Io)
+    }
+
+    struct SocketCleanup(PathBuf);
+    impl Drop for SocketCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 
     pub(super) fn peer_credentials(
@@ -473,6 +561,13 @@ mod platform {
             })
         }
     }
+
+    pub(super) fn read_request(
+        stream: &PlatformStream,
+    ) -> Result<LocalRequest, LocalProtocolError> {
+        let reader = stream.try_clone().map_err(|_| LocalProtocolError::Io)?;
+        read_frame(&mut std::io::BufReader::new(reader))
+    }
 }
 
 #[cfg(windows)]
@@ -482,20 +577,24 @@ mod platform {
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
     };
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::RevertToSelf;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_SHARE_NONE, FlushFileBuffers, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-        ImpersonateNamedPipeClient, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-        PIPE_WAIT, WaitNamedPipeW,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+        PIPE_WAIT, PeekNamedPipe, WaitNamedPipeW,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     pub fn connect(endpoint: &LocalEndpoint) -> Result<PlatformStream, LocalProtocolError> {
@@ -525,8 +624,9 @@ mod platform {
     ) -> Result<(), LocalProtocolError> {
         let LocalEndpoint::NamedPipe(path) = endpoint;
         let expected_sid = current_user_sid()?;
-        let authorizer = SameUserAuthorizer::windows(expected_sid);
+        let security = PipeSecurity::new(&windows_pipe_security_sddl(&expected_sid)?)?;
         let name: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut first = true;
         loop {
             let access = PIPE_ACCESS_DUPLEX
@@ -540,12 +640,12 @@ mod platform {
                 CreateNamedPipeW(
                     name.as_ptr(),
                     access,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                     PIPE_UNLIMITED_INSTANCES,
                     MAX_FRAME_BYTES as u32,
                     MAX_FRAME_BYTES as u32,
                     0,
-                    std::ptr::null(),
+                    &security.attributes,
                 )
             };
             if handle == INVALID_HANDLE_VALUE {
@@ -558,15 +658,26 @@ mod platform {
                 continue;
             }
             let stream = unsafe { PlatformStream::from_raw_handle(handle as _) };
-            dispatch_connection(
-                stream.try_clone().map_err(|_| LocalProtocolError::Io)?,
-                &authorizer,
-                &state,
-            );
-            unsafe {
-                FlushFileBuffers(stream.as_raw_handle() as HANDLE);
-                DisconnectNamedPipe(stream.as_raw_handle() as HANDLE);
-            }
+            let Some(guard) = WorkerGuard::acquire(&active) else {
+                unsafe { DisconnectNamedPipe(handle) };
+                continue;
+            };
+            let Ok(peer) = peer_credentials(&stream) else {
+                unsafe { DisconnectNamedPipe(handle) };
+                continue;
+            };
+            let state = Arc::clone(&state);
+            let expected_sid = expected_sid.clone();
+            std::thread::spawn(move || {
+                let _guard = guard;
+                let authorizer = SameUserAuthorizer::windows(expected_sid);
+                if let Ok(worker) = stream.try_clone() {
+                    dispatch_connection(worker, peer, &authorizer, &state);
+                }
+                unsafe {
+                    DisconnectNamedPipe(stream.as_raw_handle() as HANDLE);
+                }
+            });
         }
     }
 
@@ -578,21 +689,18 @@ mod platform {
         if unsafe { GetNamedPipeClientProcessId(handle, &mut process_id) } == 0 {
             return Err(LocalProtocolError::Unauthorized);
         }
-        if unsafe { ImpersonateNamedPipeClient(handle) } == 0 {
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+        if process.is_null() {
             return Err(LocalProtocolError::Unauthorized);
         }
         let mut token = std::ptr::null_mut();
-        let opened =
-            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } != 0;
-        let sid = if opened {
-            token_sid(token)
-        } else {
-            Err(LocalProtocolError::Unauthorized)
-        };
-        if !token.is_null() {
-            unsafe { CloseHandle(token) };
+        let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } != 0;
+        unsafe { CloseHandle(process) };
+        if !opened {
+            return Err(LocalProtocolError::Unauthorized);
         }
-        unsafe { RevertToSelf() };
+        let sid = token_sid(token);
+        unsafe { CloseHandle(token) };
         sid.map(|user_sid| PeerCredentials::Windows {
             process_id,
             user_sid,
@@ -637,9 +745,88 @@ mod platform {
         while unsafe { *text.add(length) } != 0 {
             length += 1;
         }
-        let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
-            .map_err(|_| LocalProtocolError::Unauthorized)?;
+        let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) });
         unsafe { LocalFree(text.cast()) };
-        Ok(sid)
+        sid.map_err(|_| LocalProtocolError::Unauthorized)
+    }
+
+    pub(super) fn read_request(
+        stream: &PlatformStream,
+    ) -> Result<LocalRequest, LocalProtocolError> {
+        use std::io::Read;
+        let started = std::time::Instant::now();
+        let mut frame = Vec::new();
+        let mut reader = stream.try_clone().map_err(|_| LocalProtocolError::Io)?;
+        while started.elapsed() < std::time::Duration::from_secs(2) {
+            let mut available = 0;
+            if unsafe {
+                PeekNamedPipe(
+                    stream.as_raw_handle() as HANDLE,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(LocalProtocolError::Io);
+            }
+            if available == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            let remaining = MAX_FRAME_BYTES + 1 - frame.len();
+            let mut chunk = vec![0_u8; remaining.min(available as usize)];
+            reader
+                .read_exact(&mut chunk)
+                .map_err(|_| LocalProtocolError::Io)?;
+            frame.extend_from_slice(&chunk);
+            if frame.len() > MAX_FRAME_BYTES {
+                return Err(LocalProtocolError::FrameTooLarge);
+            }
+            if frame.last() == Some(&b'\n') {
+                return serde_json::from_slice(&frame[..frame.len() - 1])
+                    .map_err(|_| LocalProtocolError::InvalidFrame);
+            }
+        }
+        Err(LocalProtocolError::Io)
+    }
+
+    struct PipeSecurity {
+        descriptor: *mut core::ffi::c_void,
+        attributes: SECURITY_ATTRIBUTES,
+    }
+
+    impl PipeSecurity {
+        fn new(sddl: &str) -> Result<Self, LocalProtocolError> {
+            let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+            let mut descriptor = std::ptr::null_mut();
+            if unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(LocalProtocolError::Unauthorized);
+            }
+            Ok(Self {
+                descriptor,
+                attributes: SECURITY_ATTRIBUTES {
+                    nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                    lpSecurityDescriptor: descriptor,
+                    bInheritHandle: 0,
+                },
+            })
+        }
+    }
+
+    impl Drop for PipeSecurity {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.descriptor) };
+        }
     }
 }

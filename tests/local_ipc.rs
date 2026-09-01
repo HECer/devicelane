@@ -1,9 +1,11 @@
 use device_development_mesh::local_ipc::{
     Authorizer, ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, DiagnosticItem,
     LocalProtocolError, LocalProtocolVersion, LocalRequest, LocalResponse, MAX_FRAME_BYTES,
-    PeerCredentials, SameUserAuthorizer, read_frame, send_local_request, send_raw_local_frame,
-    validate_state_paths, write_frame,
+    MAX_LOCAL_WORKERS, PeerCredentials, SameUserAuthorizer, open_local_stream, read_frame,
+    send_local_request, send_raw_local_frame, validate_state_paths, windows_pipe_security_sddl,
+    write_frame,
 };
+use std::io::Write;
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
 use std::process::Command;
@@ -275,10 +277,140 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
 }
 
 #[test]
+#[cfg(windows)]
+fn slow_client_cannot_block_a_second_named_pipe_client() {
+    let pipe = format!(r"\\.\pipe\devicelane-slow-{}", std::process::id());
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("identity");
+    let logs = temp.path().join("logs");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+        .args([
+            "--identity",
+            identity.to_str().unwrap(),
+            "--runtime-dir",
+            temp.path().to_str().unwrap(),
+            "--role",
+            "workstation",
+            "--registry",
+            "registry:7443",
+            "--listen",
+            &pipe,
+            "--agent-peer",
+            "agent",
+            "--log-dir",
+            logs.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    let endpoint = device_development_mesh::local_ipc::LocalEndpoint::NamedPipe(pipe);
+    let request = LocalRequest::Status {
+        version: LocalProtocolVersion::CURRENT,
+    };
+    for _ in 0..100 {
+        if send_local_request(&endpoint, &request).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut slow = open_local_stream(&endpoint).unwrap();
+    slow.write_all(br#"{"request":"status""#).unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        send_local_request(&endpoint, &request).unwrap(),
+        LocalResponse::Snapshot(_)
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    drop(slow);
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn named_pipe_security_is_explicitly_current_user_and_system_only() {
+    let sddl = windows_pipe_security_sddl("S-1-5-21-123").unwrap();
+    assert_eq!(sddl, "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-123)");
+    assert!(!sddl.contains("WD"));
+    let authorizer = SameUserAuthorizer::windows("S-1-5-21-123");
+    assert!(!authorizer.authorize(&PeerCredentials::Windows {
+        process_id: 7,
+        user_sid: "S-1-5-18".into()
+    }));
+}
+
+#[test]
+#[cfg(windows)]
+fn named_pipe_worker_pool_applies_bounded_backpressure() {
+    let pipe = format!(r"\\.\pipe\devicelane-saturation-{}", std::process::id());
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("identity");
+    let logs = temp.path().join("logs");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+        .args([
+            "--identity",
+            identity.to_str().unwrap(),
+            "--runtime-dir",
+            temp.path().to_str().unwrap(),
+            "--role",
+            "workstation",
+            "--registry",
+            "registry:7443",
+            "--listen",
+            &pipe,
+            "--agent-peer",
+            "agent",
+            "--log-dir",
+            logs.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    let endpoint = device_development_mesh::local_ipc::LocalEndpoint::NamedPipe(pipe);
+    let mut slow = Vec::new();
+    for _ in 0..MAX_LOCAL_WORKERS {
+        let mut connection = loop {
+            if let Ok(connection) = open_local_stream(&endpoint) {
+                break connection;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        connection.write_all(b"{").unwrap();
+        slow.push(connection);
+    }
+    let started = std::time::Instant::now();
+    assert!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::Status {
+                version: LocalProtocolVersion::CURRENT
+            }
+        )
+        .is_err()
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    drop(slow);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::Status {
+                version: LocalProtocolVersion::CURRENT
+            }
+        )
+        .is_ok()
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
 #[cfg(unix)]
 fn production_unix_socket_serves_state_and_recovers_after_bad_frames() {
+    use std::os::unix::fs::MetadataExt;
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("devicelane.sock");
+    let stale = std::os::unix::net::UnixDatagram::bind(&socket).unwrap();
+    drop(stale);
     let identity = temp.path().join("identity");
     let logs = temp.path().join("logs");
     let mut child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
@@ -312,6 +444,13 @@ fn production_unix_socket_serves_state_and_recovers_after_bad_frames() {
             })
         })
         .expect("service did not bind Unix socket");
+    let socket_path = match &endpoint {
+        device_development_mesh::local_ipc::LocalEndpoint::UnixSocket(path) => path,
+    };
+    assert_eq!(
+        std::fs::metadata(socket_path).unwrap().mode() & 0o777,
+        0o600
+    );
     assert!(matches!(first, LocalResponse::Snapshot(snapshot) if !snapshot.remote_access_paused));
     assert!(matches!(
         send_local_request(
@@ -342,4 +481,19 @@ fn production_unix_socket_serves_state_and_recovers_after_bad_frames() {
     assert!(child.try_wait().unwrap().is_none());
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn unix_runtime_rejects_symlinks_and_insecure_permissions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = temp.path().join("link");
+    symlink(&target, &link).unwrap();
+    assert!(device_development_mesh::local_ipc::local_endpoint(&link, "").is_err());
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(device_development_mesh::local_ipc::local_endpoint(&target, "").is_err());
 }
