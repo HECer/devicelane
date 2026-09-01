@@ -26,6 +26,10 @@ path = "src/lib.rs"
 name = "devicelane-service"
 path = "src/bin/devicelane-service.rs"
 
+[[bin]]
+name = "devicelane"
+path = "src/bin/devicelane.rs"
+
 [dependencies]
 cap-std = "3"
 command-group = "5"

@@ -1,3 +1,3 @@
 #!/usr/bin/env node
 import { run } from '../lib/run.mjs';
-await run('devicelane');
+await run('mesh-cli');

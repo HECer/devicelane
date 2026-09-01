@@ -13,6 +13,19 @@ import {
   verifiedCachedBinary,
 } from '../lib/run.mjs';
 
+test('publishes unified commands and deterministic legacy aliases', async () => {
+  const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.deepEqual(packageJson.bin, {
+    devicelane: 'bin/devicelane.mjs',
+    'devicelane-service': 'bin/devicelane-service.mjs',
+    'devicelane-agent': 'bin/devicelane-agent.mjs',
+    'devicelane-registry': 'bin/devicelane-registry.mjs',
+    'mesh-cli': 'bin/mesh-cli.mjs',
+    'mesh-agent': 'bin/mesh-agent.mjs',
+    'mesh-registry': 'bin/mesh-registry.mjs',
+  });
+});
+
 test('maps supported Node platforms to native release assets', () => {
   assert.equal(assetFor('win32', 'x64'), 'devicelane-windows-x64.zip');
   assert.equal(assetFor('linux', 'x64'), 'devicelane-linux-x64.tar.gz');
@@ -37,11 +50,11 @@ test('selects only an exact checksum asset name', () => {
 });
 
 test('accepts only the exact flat release archive layout', () => {
-  const unix = 'mesh-cli\nmesh-agent\nmesh-registry\nREADME.md\nLICENSE\n';
+  const unix = 'devicelane\ndevicelane-service\nmesh-cli\nmesh-agent\nmesh-registry\nREADME.md\nLICENSE\n';
   assert.equal(validateArchiveEntries(unix, 'linux'), true);
   assert.equal(validateArchiveEntries(`${unix}../payload\n`, 'linux'), false);
   assert.equal(validateArchiveEntries(unix.replace('mesh-agent\n', ''), 'linux'), false);
-  const windows = 'mesh-cli.exe\nmesh-agent.exe\nmesh-registry.exe\nREADME.md\nLICENSE\n';
+  const windows = 'devicelane.exe\ndevicelane-service.exe\nmesh-cli.exe\nmesh-agent.exe\nmesh-registry.exe\nREADME.md\nLICENSE\n';
   assert.equal(validateArchiveEntries(windows, 'win32'), true);
 });
 

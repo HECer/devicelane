@@ -12,7 +12,9 @@ The first invocation downloads the matching native binary from the corresponding
 the published SHA-256 manifest, and stores it in the user's cache directory. No
 package lifecycle scripts run during installation.
 
-Commands: `devicelane` (client), `devicelane-agent`, and `devicelane-registry`.
+Commands: `devicelane` (unified client), `devicelane-service`,
+`devicelane-agent`, and `devicelane-registry`. The legacy `mesh-cli`,
+`mesh-agent`, and `mesh-registry` command names remain available.
 
 DeviceLane is an experimental developer preview. Use it only on a trusted LAN or
 private VPN; do not expose its ports directly to the public internet.
