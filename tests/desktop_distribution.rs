@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::process::Command;
 
 fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("cannot read {}: {}", path, error))
@@ -84,12 +86,14 @@ fn unsigned_artifacts_can_never_be_published_as_production() {
     );
     assert!(workflow.contains("environment: production-release"));
     assert!(workflow.contains("unsigned-native:"));
-    assert!(workflow.contains("production-native:"));
+    assert!(workflow.contains("production-windows:"));
+    assert!(workflow.contains("production-macos:"));
+    assert!(workflow.contains("production-linux:"));
     let unsigned = workflow
         .split("unsigned-native:")
         .nth(1)
         .unwrap()
-        .split("production-native:")
+        .split("production-windows:")
         .next()
         .unwrap();
     assert!(!unsigned.contains("secrets."));
@@ -147,8 +151,10 @@ fn windows_smoke_has_a_non_ci_temporary_directory_fallback() {
 #[test]
 fn linux_smoke_exercises_the_documented_foreground_fallback() {
     let unix = read("scripts/desktop-release-smoke.sh");
-    assert!(unix.contains("--foreground"));
-    assert!(unix.contains(r#"--endpoint "$runtime/devicelane.sock""#));
+    let lifecycle = read("scripts/setup-linux.sh");
+    assert!(unix.contains("setup-linux.sh"));
+    assert!(lifecycle.contains("--foreground"));
+    assert!(unix.contains(r#"--endpoint "$runtime/devicelane/devicelane.sock""#));
 }
 
 #[test]
@@ -287,4 +293,127 @@ fn elevated_msi_gate_cannot_fall_back_to_administrative_extraction() {
     assert!(native_gate.contains("@('/i', $Artifact"));
     assert!(native_gate.contains("@('/x', $Artifact"));
     assert!(!native_gate.contains("@('/a', $Artifact"));
+}
+
+#[test]
+fn production_credentials_are_platform_isolated_and_step_scoped() {
+    let workflow = read(".github/workflows/desktop-release.yml");
+    for job in [
+        "production-windows:",
+        "production-macos:",
+        "production-linux:",
+    ] {
+        assert!(workflow.contains(job), "missing isolated job: {}", job);
+    }
+    assert!(!workflow.contains("production-native:"));
+    for secret in [
+        "APPLE_CERTIFICATE: ${{ secrets.",
+        "APPLE_ID: ${{ secrets.",
+        "WINDOWS_CERTIFICATE: ${{ secrets.",
+    ] {
+        let line = workflow.lines().find(|line| line.contains(secret)).unwrap();
+        assert!(
+            line.starts_with("          "),
+            "secret is not step scoped: {}",
+            line
+        );
+    }
+    assert!(
+        workflow.find("npm ci").unwrap()
+            < workflow.find("APPLE_CERTIFICATE: ${{ secrets.").unwrap()
+    );
+}
+
+#[test]
+fn windows_signing_is_bound_verified_and_cleaned_up() {
+    let workflow = read(".github/workflows/desktop-release.yml");
+    for declaration in [
+        "WINDOWS_EXPECTED_CERT_SUBJECT",
+        "WINDOWS_EXPECTED_CERT_THUMBPRINT",
+        "$env:WINDOWS_EXPECTED_CERT_THUMBPRINT -ne $certificate.Thumbprint",
+        "signtool sign /sha1",
+        "signtool verify /pa /all",
+        "Get-AuthenticodeSignature",
+        "$importedCertificates",
+        "Remove-Item -LiteralPath $_.PSPath",
+        "finally",
+    ] {
+        assert!(
+            workflow.contains(declaration),
+            "missing certificate binding: {}",
+            declaration
+        );
+    }
+}
+
+#[test]
+fn reproducibility_manifests_capture_security_metadata() {
+    let windows = read("scripts/compare-msi-payloads.ps1");
+    let unix = read("scripts/compare-native-payloads.sh");
+    for declaration in ["Attributes", "Get-Acl", "Sddl"] {
+        assert!(
+            windows.contains(declaration),
+            "missing Windows metadata: {}",
+            declaration
+        );
+    }
+    for declaration in ["type=", "mode=", "link=", "xattr="] {
+        assert!(
+            unix.contains(declaration),
+            "missing Unix metadata: {}",
+            declaration
+        );
+    }
+}
+
+#[test]
+fn linux_native_smoke_uses_packaged_lifecycle_and_real_deb_transactions() {
+    let smoke = read("scripts/desktop-release-smoke.sh");
+    for declaration in [
+        "setup-linux.sh",
+        "fake-systemctl",
+        "--autostart-disable",
+        "--autostart-enable",
+        "dpkg -i",
+        "dpkg -r",
+        "DEVICELANE_ALLOW_DPKG_SMOKE",
+    ] {
+        assert!(
+            smoke.contains(declaration),
+            "missing Linux native lifecycle: {}",
+            declaration
+        );
+    }
+    assert!(!smoke.contains("printf enabled > \"$state/autostart\""));
+    assert!(smoke.contains("mktemp -d"));
+    assert!(smoke.contains("trap cleanup"));
+    assert!(smoke.contains("realpath"));
+    let marker = smoke.find("smoke.identity").unwrap();
+    let install = smoke.find("sh \"$lifecycle\" --install").unwrap();
+    assert!(marker < install, "identity marker must predate mac install");
+}
+
+#[test]
+fn artifact_collection_preserves_paths_and_rejects_collisions() {
+    let workflow = read(".github/workflows/desktop-release.yml");
+    assert!(workflow.contains("cp --parents"));
+    assert!(workflow.contains("artifact path collision"));
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_lifecycle_adapter_self_test_executes() {
+    let output = Command::new("sh")
+        .args(["scripts/desktop-release-smoke.sh", "--self-test"])
+        .output()
+        .expect("run Linux smoke self-test");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Linux lifecycle adapter self-test passed")
+    );
 }

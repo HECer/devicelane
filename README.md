@@ -115,12 +115,25 @@ unsigned builds provide a reproducibility gate for unsigned payloads and configu
 normalized installed-file manifests must match before CI accepts an artifact. Native container
 hashes are recorded where the format is deterministic.
 
+The normalized comparison covers file-system semantics as well as bytes: entry type, executable
+or Unix permission mode, symbolic-link target, macOS extended attributes, and relevant Windows
+file attributes and ACL SDDL. Release files retain their bundle-relative paths during collection;
+an attempted destination collision aborts the workflow.
+
 Each artifact set includes `BUILD-INPUTS.txt` with the observed versions and input hashes. The
 signed envelope is intentionally outside the unsigned payload comparison: signing services add
 external timestamp and notarization evidence, so the signed MSI/DMG container need not be
 bit-for-bit identical to its unsigned envelope. Production acceptance is not weakened: native
 signature verification, the single-DMG notarization and stapling gates, checksums, SBOMs, and
 signed checksum evidence must all succeed.
+
+Each production platform has its own protected job. Credentials are unavailable while dependencies
+and unsigned payloads are built, and are injected only into the individual import, signing, or
+notarization step that needs them. Windows signing additionally pins the certificate subject and
+thumbprint, selects that certificate explicitly, verifies the resulting Publisher, and removes the
+temporary certificate and PFX. Linux package smoke tests exercise the packaged lifecycle script in
+an isolated home/runtime with a process-backed systemd adapter and perform real `dpkg` install and
+uninstall transactions on the hosted runner.
 
 ### Build from source
 

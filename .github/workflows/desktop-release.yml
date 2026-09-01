@@ -30,7 +30,7 @@ jobs:
         with: { node-version: 22.20.0, cache: npm, cache-dependency-path: desktop/package-lock.json }
       - name: Linux prerequisites
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+        run: sudo apt-get update && sudo apt-get install -y attr libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - name: Locked frontend
         working-directory: desktop
         run: npm ci
@@ -69,31 +69,25 @@ jobs:
       - name: Native artifact first-run smoke
         if: runner.os != 'Windows'
         shell: bash
+        env: { DEVICELANE_ALLOW_DPKG_SMOKE: '1' }
         run: DEVICELANE_DESKTOP_ARTIFACT="$RUNNER_TEMP/repro-build-b/release/bundle" sh scripts/desktop-release-smoke.sh --exercise-lifecycle
       - name: Build evidence, SBOM, and checksums
         shell: bash
         run: |
-          mkdir -p desktop-dist/SBOM
+          mkdir -p desktop-dist/SBOM desktop-dist/artifacts
           { rustc -vV; cargo -V; node -v; npm -v; printf 'runner=%s\nImageOS=%s\nImageVersion=%s\nSOURCE_DATE_EPOCH=%s\n' "$RUNNER_OS" "$ImageOS" "$ImageVersion" "$SOURCE_DATE_EPOCH"; sha256sum Cargo.lock desktop/package-lock.json rust-toolchain.toml .github/workflows/desktop-release.yml; } > desktop-dist/BUILD-INPUTS.txt
           cargo install cargo-cyclonedx --version 0.5.7 --locked
           cargo cyclonedx --all --format json
-          find . -name '*.cdx.json' -type f -exec cp {} desktop-dist/SBOM/ \;
-          find "$RUNNER_TEMP/repro-build-b/release/bundle" -type f -exec cp {} desktop-dist/ \;
+          find . -name '*.cdx.json' -type f -print0 | while IFS= read -r -d '' file; do rel=${file#./}; dest="desktop-dist/SBOM/$rel"; test ! -e "$dest" || { echo 'artifact path collision' >&2; exit 1; }; mkdir -p "$(dirname "$dest")"; cp "$file" "$dest"; done
+          (cd "$RUNNER_TEMP/repro-build-b/release/bundle" && find . -type f -print0 | while IFS= read -r -d '' file; do test ! -e "$GITHUB_WORKSPACE/desktop-dist/artifacts/$file" || { echo 'artifact path collision' >&2; exit 1; }; cp --parents "$file" "$GITHUB_WORKSPACE/desktop-dist/artifacts"; done)
           cd desktop-dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: 'unsigned-ci-${{ runner.os }}', path: desktop-dist, if-no-files-found: error, retention-days: 7 }
 
-  production-native:
+  production-windows:
     if: github.event_name == 'workflow_dispatch' && inputs.production == true
     environment: production-release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: windows-2025, bundles: msi }
-          - { os: macos-15, bundles: dmg }
-          - { os: ubuntu-24.04, bundles: 'appimage,deb' }
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-2025
     env:
       DEVICELANE_EXPECTED_IMAGE_OS: ${{ vars.DESKTOP_IMAGE_OS }}
       DEVICELANE_EXPECTED_IMAGE_VERSION: ${{ vars.DESKTOP_IMAGE_VERSION }}
@@ -101,17 +95,6 @@ jobs:
       DEVICELANE_EXPECTED_APPLE_SDK: ${{ vars.DESKTOP_APPLE_SDK_VERSION }}
       DEVICELANE_EXPECTED_MSVC: ${{ vars.DESKTOP_MSVC_VERSION }}
       DEVICELANE_EXPECTED_WIX: ${{ vars.DESKTOP_WIX_VERSION }}
-      DEVICELANE_EXPECTED_APT_VERSIONS_SHA256: ${{ vars.DESKTOP_APT_VERSIONS_SHA256 }}
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
         with: { persist-credentials: false }
@@ -121,7 +104,7 @@ jobs:
       - uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
       - name: Linux prerequisites
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+        run: sudo apt-get update && sudo apt-get install -y attr libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - name: Verify pinned production environment
         shell: bash
         run: |
@@ -151,7 +134,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          apt_versions=$(dpkg-query -W -f='${Package}=${Version}\n' libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf | LC_ALL=C sort)
+          apt_versions=$(dpkg-query -W -f='${Package}=${Version}\n' attr libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf | LC_ALL=C sort)
           actual_apt_hash=$(printf '%s\n' "$apt_versions" | sha256sum | cut -d' ' -f1)
           test -n "$DEVICELANE_EXPECTED_APT_VERSIONS_SHA256" && test "$actual_apt_hash" = "$DEVICELANE_EXPECTED_APT_VERSIONS_SHA256"
           { printf '%s\n' "$apt_versions"; printf 'APT_SHA256=%s\n' "$actual_apt_hash"; } >> "$RUNNER_TEMP/devicelane-native-inputs.txt"
@@ -161,37 +144,11 @@ jobs:
       - name: Locked frontend
         working-directory: desktop
         run: npm ci
-      - name: Require production credentials
-        shell: bash
-        run: |
-          test -n "$TAURI_SIGNING_PRIVATE_KEY" || { echo "Refusing production release without signing and notarization inputs" >&2; exit 1; }
-          case "$RUNNER_OS" in
-            macOS) for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do test -n "${!name}" || exit 1; done ;;
-            Windows) test -n "$WINDOWS_CERTIFICATE" && test -n "$WINDOWS_CERTIFICATE_PASSWORD" || exit 1 ;;
-          esac
-      - name: Import Apple identity
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          keychain="$RUNNER_TEMP/devicelane-signing.keychain-db"
-          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/apple-signing.p12"
-          security create-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$keychain"
-          security unlock-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$keychain"
-          security import "$RUNNER_TEMP/apple-signing.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_CERTIFICATE_PASSWORD" "$keychain"
-          security list-keychains -d user -s "$keychain" login.keychain-db
-      - name: Import Windows identity
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $pfx = Join-Path $env:RUNNER_TEMP 'devicelane-signing.pfx'
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
-          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password (ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force) | Out-Null
       - name: Locked CLI and service
         run: cargo build --release --locked --bin devicelane --bin devicelane-service
       - name: Signed native installer
         working-directory: desktop
-        run: npm exec tauri build -- --bundles ${{ matrix.bundles }} -- --locked
+        run: npm exec tauri build -- --no-sign --bundles msi -- --locked
       - name: Verify pinned WiX version
         if: runner.os == 'Windows'
         shell: pwsh
@@ -201,9 +158,34 @@ jobs:
           if (-not $env:DEVICELANE_EXPECTED_WIX -or $actual -ne $env:DEVICELANE_EXPECTED_WIX) { throw "WiX drift: expected $env:DEVICELANE_EXPECTED_WIX, got $actual" }
           Add-Content -LiteralPath "$env:RUNNER_TEMP\devicelane-native-inputs.txt" -Value "WiX=$actual"
       - name: Sign MSI
-        if: runner.os == 'Windows'
         shell: pwsh
-        run: Get-ChildItem target\release\bundle\msi\*.msi | ForEach-Object { & signtool sign /a /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_EXPECTED_CERT_SUBJECT: ${{ vars.WINDOWS_CERT_SUBJECT }}
+          WINDOWS_EXPECTED_CERT_THUMBPRINT: ${{ vars.WINDOWS_CERT_THUMBPRINT }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'devicelane-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $importedCertificates = @()
+          try {
+            $importedCertificates = @(Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password (ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force))
+            $matches = @($importedCertificates | Where-Object Thumbprint -eq $env:WINDOWS_EXPECTED_CERT_THUMBPRINT)
+            if ($matches.Count -ne 1) { throw 'expected exactly one imported signing certificate' }
+            $certificate = $matches[0]
+            if ($certificate.Subject -ne $env:WINDOWS_EXPECTED_CERT_SUBJECT -or $env:WINDOWS_EXPECTED_CERT_THUMBPRINT -ne $certificate.Thumbprint) { throw 'imported Windows certificate identity mismatch' }
+            Get-ChildItem target\release\bundle\msi\*.msi | ForEach-Object {
+              & signtool sign /sha1 $certificate.Thumbprint /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+              if ($LASTEXITCODE) { throw 'signtool sign failed' }
+              & signtool verify /pa /all $_.FullName
+              if ($LASTEXITCODE) { throw 'signtool verify failed' }
+              $signature = Get-AuthenticodeSignature -FilePath $_.FullName
+              if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint -or $signature.SignerCertificate.Subject -ne $env:WINDOWS_EXPECTED_CERT_SUBJECT) { throw 'signed MSI Publisher mismatch' }
+            }
+          } finally {
+            $importedCertificates | ForEach-Object { Remove-Item -LiteralPath $_.PSPath -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $pfx -Force
+          }
       - name: Validate notarization
         if: runner.os == 'macOS'
         shell: bash
@@ -242,14 +224,136 @@ jobs:
       - name: Signed evidence and SBOM
         shell: bash
         run: |
-          mkdir -p desktop-dist/SBOM
+          mkdir -p desktop-dist/SBOM desktop-dist/artifacts
           { rustc -vV; cargo -V; node -v; npm -v; printf 'runner=%s\nSOURCE_DATE_EPOCH=%s\n' "$RUNNER_OS" "$SOURCE_DATE_EPOCH"; cat "$RUNNER_TEMP/devicelane-native-inputs.txt"; sha256sum Cargo.lock desktop/package-lock.json rust-toolchain.toml .github/workflows/desktop-release.yml; } > desktop-dist/BUILD-INPUTS.txt
           test ! -f desktop-notary-history.txt || cp desktop-notary-history.txt desktop-dist/
           cargo install cargo-cyclonedx --version 0.5.7 --locked
           cargo cyclonedx --all --format json
-          find . -name '*.cdx.json' -type f -exec cp {} desktop-dist/SBOM/ \;
-          find target/release/bundle -type f -exec cp {} desktop-dist/ \;
+          find . -name '*.cdx.json' -type f -print0 | while IFS= read -r -d '' file; do rel=${file#./}; dest="desktop-dist/SBOM/$rel"; test ! -e "$dest" || { echo 'artifact path collision' >&2; exit 1; }; mkdir -p "$(dirname "$dest")"; cp "$file" "$dest"; done
+          (cd target/release/bundle && find . -type f -print0 | while IFS= read -r -d '' file; do test ! -e "$GITHUB_WORKSPACE/desktop-dist/artifacts/$file" || { echo 'artifact path collision' >&2; exit 1; }; cp --parents "$file" "$GITHUB_WORKSPACE/desktop-dist/artifacts"; done)
           cd desktop-dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
           cosign sign-blob --yes --bundle SHA256SUMS.sigstore SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: 'production-${{ runner.os }}', path: desktop-dist, if-no-files-found: error }
+
+  production-macos:
+    if: github.event_name == 'workflow_dispatch' && inputs.production == true
+    environment: production-release
+    runs-on: macos-15
+    env:
+      DEVICELANE_EXPECTED_IMAGE_OS: ${{ vars.DESKTOP_IMAGE_OS }}
+      DEVICELANE_EXPECTED_IMAGE_VERSION: ${{ vars.DESKTOP_IMAGE_VERSION }}
+      DEVICELANE_EXPECTED_XCODE: ${{ vars.DESKTOP_XCODE_VERSION }}
+      DEVICELANE_EXPECTED_APPLE_SDK: ${{ vars.DESKTOP_APPLE_SDK_VERSION }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 22.20.0, cache: npm, cache-dependency-path: desktop/package-lock.json }
+      - uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+      - name: Locked dependencies and native clients
+        run: npm ci --prefix desktop && cargo build --release --locked --workspace
+      - name: Verify pinned production environment
+        shell: bash
+        run: |
+          test "$ImageOS" = "$DEVICELANE_EXPECTED_IMAGE_OS" && test "$ImageVersion" = "$DEVICELANE_EXPECTED_IMAGE_VERSION"
+          actual_xcode=$(xcodebuild -version | tr '\n' ' ' | sed 's/ $//'); actual_sdk=$(xcrun --sdk macosx --show-sdk-version)
+          test "$actual_xcode" = "$DEVICELANE_EXPECTED_XCODE" && test "$actual_sdk" = "$DEVICELANE_EXPECTED_APPLE_SDK"
+          printf 'ImageOS=%s\nImageVersion=%s\nXcode=%s\nAppleSDK=%s\n' "$ImageOS" "$ImageVersion" "$actual_xcode" "$actual_sdk" > "$RUNNER_TEMP/devicelane-native-inputs.txt"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: Import Apple identity
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          test -n "$APPLE_CERTIFICATE" || { echo "Refusing production release without signing and notarization inputs" >&2; exit 1; }
+          keychain="$RUNNER_TEMP/devicelane-signing.keychain-db"; printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/apple-signing.p12"
+          security create-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$keychain"; security unlock-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$keychain"
+          security import "$RUNNER_TEMP/apple-signing.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_CERTIFICATE_PASSWORD" "$keychain"; security list-keychains -d user -s "$keychain" login.keychain-db
+      - name: Signed and notarized native installer
+        working-directory: desktop
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm exec tauri build -- --bundles dmg -- --locked
+      - name: Validate notarization
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          mapfile -t dmgs < <(find target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print); [ "${#dmgs[@]}" -eq 1 ]; dmg=${dmgs[0]}
+          mount=$(mktemp -d "$RUNNER_TEMP/notary-verify.XXXXXX"); trap 'hdiutil detach "$mount" >/dev/null 2>&1 || true; rm -rf "$mount"' EXIT
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount" >/dev/null; app=$(find "$mount" -maxdepth 1 -type d -name '*.app' -print)
+          codesign --verify --deep --strict "$app"; spctl --assess --type execute "$app"; hdiutil detach "$mount"; spctl --assess --type open "$dmg"; xcrun stapler validate "$dmg"
+          xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" > desktop-notary-history.txt
+      - name: Native artifact first-run smoke
+        run: DEVICELANE_DESKTOP_ARTIFACT="$PWD/target/release/bundle" sh scripts/desktop-release-smoke.sh --exercise-lifecycle
+      - name: Collect production artifacts preserving relative paths
+        shell: bash
+        run: |
+          mkdir -p desktop-dist/artifacts; cd target/release/bundle
+          find . -type f -print0 | while IFS= read -r -d '' file; do test ! -e "$GITHUB_WORKSPACE/desktop-dist/artifacts/$file" || { echo 'artifact path collision' >&2; exit 1; }; cp --parents "$file" "$GITHUB_WORKSPACE/desktop-dist/artifacts"; done
+      - name: Build inputs, SBOM, checksums, and signature
+        shell: bash
+        run: |
+          { cat "$RUNNER_TEMP/devicelane-native-inputs.txt"; rustc -vV; cargo -V; node -v; npm -v; printf 'SOURCE_DATE_EPOCH=%s\n' "$SOURCE_DATE_EPOCH"; shasum -a 256 Cargo.lock desktop/package-lock.json rust-toolchain.toml .github/workflows/desktop-release.yml; } > desktop-dist/BUILD-INPUTS.txt
+          cp desktop-notary-history.txt desktop-dist/
+          cargo install cargo-cyclonedx --version 0.5.7 --locked; cargo cyclonedx --all --format json
+          mkdir -p desktop-dist/SBOM; find . -name '*.cdx.json' -type f -print0 | while IFS= read -r -d '' file; do rel=${file#./}; dest="desktop-dist/SBOM/$rel"; test ! -e "$dest" || { echo 'artifact path collision' >&2; exit 1; }; mkdir -p "$(dirname "$dest")"; cp "$file" "$dest"; done
+          (cd desktop-dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS && cosign sign-blob --yes --bundle SHA256SUMS.sigstore SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: production-macOS, path: desktop-dist, if-no-files-found: error }
+
+  production-linux:
+    if: github.event_name == 'workflow_dispatch' && inputs.production == true
+    environment: production-release
+    runs-on: ubuntu-24.04
+    env:
+      DEVICELANE_EXPECTED_IMAGE_OS: ${{ vars.DESKTOP_IMAGE_OS }}
+      DEVICELANE_EXPECTED_IMAGE_VERSION: ${{ vars.DESKTOP_IMAGE_VERSION }}
+      DEVICELANE_EXPECTED_APT_VERSIONS_SHA256: ${{ vars.DESKTOP_APT_VERSIONS_SHA256 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 22.20.0, cache: npm, cache-dependency-path: desktop/package-lock.json }
+      - uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+      - name: Linux prerequisites
+        run: sudo apt-get update && sudo apt-get install -y attr libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Locked dependencies and native clients
+        run: npm ci --prefix desktop && cargo build --release --locked --workspace
+      - name: Verify pinned production environment
+        shell: bash
+        run: |
+          test "$ImageOS" = "$DEVICELANE_EXPECTED_IMAGE_OS" && test "$ImageVersion" = "$DEVICELANE_EXPECTED_IMAGE_VERSION"
+          apt_versions=$(dpkg-query -W -f='${Package}=${Version}\n' attr libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf | LC_ALL=C sort); actual=$(printf '%s\n' "$apt_versions" | sha256sum | cut -d' ' -f1)
+          test "$actual" = "$DEVICELANE_EXPECTED_APT_VERSIONS_SHA256"; printf 'ImageOS=%s\nImageVersion=%s\n%s\nAPT_SHA256=%s\n' "$ImageOS" "$ImageVersion" "$apt_versions" "$actual" > "$RUNNER_TEMP/devicelane-native-inputs.txt"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: Native installers
+        working-directory: desktop
+        run: npm exec tauri build -- --no-sign --bundles appimage,deb -- --locked
+      - name: Native artifact first-run smoke
+        env: { DEVICELANE_ALLOW_DPKG_SMOKE: '1' }
+        run: DEVICELANE_DESKTOP_ARTIFACT="$PWD/target/release/bundle" sh scripts/desktop-release-smoke.sh --exercise-lifecycle
+      - name: Collect production artifacts preserving relative paths
+        shell: bash
+        run: |
+          mkdir -p desktop-dist/artifacts; cd target/release/bundle
+          find . -type f -print0 | while IFS= read -r -d '' file; do test ! -e "$GITHUB_WORKSPACE/desktop-dist/artifacts/$file" || { echo 'artifact path collision' >&2; exit 1; }; cp --parents "$file" "$GITHUB_WORKSPACE/desktop-dist/artifacts"; done
+      - name: Build inputs, SBOM, checksums, and signature
+        shell: bash
+        run: |
+          { cat "$RUNNER_TEMP/devicelane-native-inputs.txt"; rustc -vV; cargo -V; node -v; npm -v; printf 'SOURCE_DATE_EPOCH=%s\n' "$SOURCE_DATE_EPOCH"; sha256sum Cargo.lock desktop/package-lock.json rust-toolchain.toml .github/workflows/desktop-release.yml; } > desktop-dist/BUILD-INPUTS.txt
+          cargo install cargo-cyclonedx --version 0.5.7 --locked; cargo cyclonedx --all --format json
+          mkdir -p desktop-dist/SBOM; find . -name '*.cdx.json' -type f -print0 | while IFS= read -r -d '' file; do rel=${file#./}; dest="desktop-dist/SBOM/$rel"; test ! -e "$dest" || { echo 'artifact path collision' >&2; exit 1; }; mkdir -p "$(dirname "$dest")"; cp "$file" "$dest"; done
+          (cd desktop-dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS && cosign sign-blob --yes --bundle SHA256SUMS.sigstore SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: production-Linux, path: desktop-dist, if-no-files-found: error }

@@ -16,6 +16,9 @@
 - Added exact production image/native-tool drift gates, deterministic double-build payload
   comparison, strict macOS signature/notarization acceptance, and an elevated-only MSI install
   gate that cannot silently degrade to administrative extraction.
+- Isolated production credentials per platform and signing step, bound Windows signing to the
+  approved certificate identity, extended reproducibility checks to file-system security metadata,
+  and replaced simulated Linux lifecycle markers with packaged-script and real deb transactions.
 
 ## 0.1.0 — 2026-07-31
 
