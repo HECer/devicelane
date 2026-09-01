@@ -22,6 +22,10 @@ exclude = [".agents/**", ".codex/**", ".yoke/**", "AGENTS.md", "RTK.md"]
 name = "device_development_mesh"
 path = "src/lib.rs"
 
+[[bin]]
+name = "devicelane-service"
+path = "src/bin/devicelane-service.rs"
+
 [dependencies]
 cap-std = "3"
 command-group = "5"

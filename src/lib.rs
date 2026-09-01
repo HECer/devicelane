@@ -6058,4 +6058,5 @@ mod tests {
         assert_eq!(env!("CARGO_PKG_NAME"), "devicelane");
     }
 }
+pub mod local_ipc;
 pub mod mac_bootstrap;
