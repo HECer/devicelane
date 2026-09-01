@@ -15,8 +15,22 @@ struct Args {
 
 fn parse_args() -> Result<Option<Args>, String> {
     let values: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(values.as_slice(), [flag] if flag == "--help" || flag == "-h") {
-        println!("{HELP}");
+    if values
+        .iter()
+        .any(|value| value == "--help" || value == "-h")
+    {
+        match values.first().map(String::as_str) {
+            Some("status") => {
+                println!("Usage: devicelane status --local [--json] [--endpoint ENDPOINT]")
+            }
+            Some("diagnostics") => {
+                println!("Usage: devicelane diagnostics --local [--json] [--endpoint ENDPOINT]")
+            }
+            Some("remote-access") => println!(
+                "Usage: devicelane remote-access <pause|resume> --local [--json] [--endpoint ENDPOINT]"
+            ),
+            _ => println!("{HELP}"),
+        }
         return Ok(None);
     }
     if matches!(values.as_slice(), [flag] if flag == "--version" || flag == "-V") {
@@ -31,12 +45,11 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--json" if !json => json = true,
             "--endpoint" if endpoint.is_none() => {
                 index += 1;
-                endpoint = Some(
-                    values
-                        .get(index)
-                        .ok_or("missing value for --endpoint")?
-                        .clone(),
-                );
+                let value = values
+                    .get(index)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or("missing value for --endpoint")?;
+                endpoint = Some(value.clone());
             }
             value if value.starts_with('-') => return Err(format!("unknown flag: {value}")),
             value => positional.push(value.to_owned()),
@@ -140,13 +153,31 @@ fn run() -> Result<(), String> {
     let Some(args) = parse_args()? else {
         return Ok(());
     };
-    let response = send_local_request(&resolve_endpoint(args.endpoint.as_deref())?, &args.request)
-        .map_err(|e| e.to_string())?;
+    let response = match resolve_endpoint(args.endpoint.as_deref()).and_then(|endpoint| {
+        send_local_request(&endpoint, &args.request).map_err(|e| e.to_string())
+    }) {
+        Ok(response) => response,
+        Err(message) if args.json => {
+            let response = LocalResponse::Error {
+                code: "local_ipc_error".into(),
+                message: message.clone(),
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&response).map_err(|e| e.to_string())?
+            );
+            return Err(message);
+        }
+        Err(message) => return Err(message),
+    };
     if args.json {
         println!(
             "{}",
             serde_json::to_string(&response).map_err(|e| e.to_string())?
         );
+        if let LocalResponse::Error { code, message } = response {
+            return Err(format!("daemon error ({code}): {message}"));
+        }
     } else {
         println!("{}", text(&response, args.message)?);
     }

@@ -163,3 +163,36 @@ fn invalid_flags_fail_without_panicking_and_legacy_cli_remains() {
         .unwrap();
     assert!(legacy.status.success());
 }
+
+#[test]
+fn json_protocol_errors_are_structured_and_fail_the_process() {
+    #[cfg(windows)]
+    let endpoint = format!(r"\\.\pipe\devicelane-missing-{}", std::process::id());
+    #[cfg(unix)]
+    let endpoint = "/definitely/missing/devicelane.sock".to_owned();
+    let output = run_cli(&endpoint, &["status", "--local", "--json"]);
+    assert!(!output.status.success());
+    let response: LocalResponse = serde_json::from_slice(&output.stdout).unwrap();
+    let LocalResponse::Error { code, message } = response else {
+        panic!("expected structured daemon error")
+    };
+    assert_eq!(code, "local_ipc_error");
+    assert!(!message.is_empty());
+}
+
+#[test]
+fn subcommand_help_succeeds_and_endpoint_does_not_consume_another_flag() {
+    let help = Command::new(env!("CARGO_BIN_EXE_devicelane"))
+        .args(["status", "--local", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("devicelane status"));
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_devicelane"))
+        .args(["status", "--local", "--endpoint", "--json"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing value for --endpoint"));
+}
