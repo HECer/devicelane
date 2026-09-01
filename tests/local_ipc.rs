@@ -1,10 +1,11 @@
 use device_development_mesh::local_ipc::{
-    Authorizer, ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, DiagnosticItem,
-    LocalProtocolError, LocalProtocolVersion, LocalRequest, LocalResponse, MAX_FRAME_BYTES,
-    MAX_LOCAL_WORKERS, PeerCredentials, SameUserAuthorizer, open_local_stream, read_frame,
-    send_local_request, send_raw_local_frame, validate_state_paths, windows_pipe_security_sddl,
-    write_frame,
+    Authorizer, AutostartAdapter, ConnectionState, DaemonRole, DaemonSnapshot, DaemonState,
+    DiagnosticItem, LocalProtocolError, LocalProtocolVersion, LocalRequest, LocalResponse,
+    MAX_FRAME_BYTES, MAX_LOCAL_WORKERS, PeerCredentials, SameUserAuthorizer, open_local_stream,
+    read_frame, send_local_request, send_raw_local_frame, validate_state_paths,
+    windows_pipe_security_sddl, write_frame,
 };
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn unix_transport_does_not_swallow_timeout_or_arbitrary_socket_probe_errors() {
@@ -23,8 +24,64 @@ fn production_service_routes_autostart_requests_to_platform_lifecycle() {
     let ipc = std::fs::read_to_string(root.join("src/local_ipc.rs")).unwrap();
     let service = std::fs::read_to_string(root.join("src/bin/devicelane-service.rs")).unwrap();
     assert!(service.contains("DaemonState::new_with_platform_lifecycle"));
-    assert!(ipc.contains("set_platform_autostart(enabled)?"));
+    assert!(ipc.contains("adapter.set_enabled(enabled)?"));
+    assert!(ipc.contains("set_platform_autostart(enabled)"));
     assert!(service.contains("platform_autostart_enabled()"));
+    assert!(!ipc.contains("\"--now\""));
+    assert!(!ipc.contains("Stop-ScheduledTask -TaskName \"DeviceLane Service-$sid\""));
+    assert!(!ipc.contains("Start-ScheduledTask -TaskName \"DeviceLane Service-$sid\""));
+}
+
+struct RecordingAutostart(Arc<Mutex<Vec<bool>>>);
+
+impl AutostartAdapter for RecordingAutostart {
+    fn set_enabled(&self, enabled: bool) -> Result<(), LocalProtocolError> {
+        self.0.lock().unwrap().push(enabled);
+        Ok(())
+    }
+}
+
+#[test]
+fn autostart_request_acknowledges_without_stopping_the_serving_daemon() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut state = DaemonState::new_with_autostart_adapter(
+        snapshot(),
+        Vec::new(),
+        Arc::new(RecordingAutostart(Arc::clone(&calls))),
+    );
+    let response = state
+        .handle(LocalRequest::SetAutostart {
+            version: LocalProtocolVersion::CURRENT,
+            enabled: false,
+        })
+        .unwrap();
+    assert_eq!(response, LocalResponse::Acknowledged);
+    assert_eq!(*calls.lock().unwrap(), vec![false]);
+}
+
+#[test]
+fn mac_autostart_requires_an_installed_launch_agent() {
+    let home = tempfile::tempdir().unwrap();
+    let missing = home.path().join("dev.devicelane.service.plist");
+    assert!(
+        !device_development_mesh::local_ipc::launch_agent_autostart_enabled(
+            &missing,
+            b"disabled services = {}",
+        )
+    );
+    std::fs::write(&missing, "plist").unwrap();
+    assert!(
+        device_development_mesh::local_ipc::launch_agent_autostart_enabled(
+            &missing,
+            b"disabled services = {}",
+        )
+    );
+    assert!(
+        !device_development_mesh::local_ipc::launch_agent_autostart_enabled(
+            &missing,
+            b"\"dev.devicelane.service\" => true",
+        )
+    );
 }
 use std::io::Write;
 use std::io::{BufReader, Cursor};

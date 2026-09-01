@@ -252,7 +252,19 @@ impl Authorizer for SameUserAuthorizer {
 pub struct DaemonState {
     snapshot: DaemonSnapshot,
     diagnostics: Vec<DiagnosticItem>,
-    manage_platform_autostart: bool,
+    autostart_adapter: Option<Arc<dyn AutostartAdapter>>,
+}
+
+pub trait AutostartAdapter: Send + Sync {
+    fn set_enabled(&self, enabled: bool) -> Result<(), LocalProtocolError>;
+}
+
+struct PlatformAutostartAdapter;
+
+impl AutostartAdapter for PlatformAutostartAdapter {
+    fn set_enabled(&self, enabled: bool) -> Result<(), LocalProtocolError> {
+        set_platform_autostart(enabled)
+    }
 }
 
 impl DaemonState {
@@ -260,7 +272,7 @@ impl DaemonState {
         Self {
             snapshot,
             diagnostics,
-            manage_platform_autostart: false,
+            autostart_adapter: None,
         }
     }
 
@@ -271,7 +283,19 @@ impl DaemonState {
         Self {
             snapshot,
             diagnostics,
-            manage_platform_autostart: true,
+            autostart_adapter: Some(Arc::new(PlatformAutostartAdapter)),
+        }
+    }
+
+    pub fn new_with_autostart_adapter(
+        snapshot: DaemonSnapshot,
+        diagnostics: Vec<DiagnosticItem>,
+        autostart_adapter: Arc<dyn AutostartAdapter>,
+    ) -> Self {
+        Self {
+            snapshot,
+            diagnostics,
+            autostart_adapter: Some(autostart_adapter),
         }
     }
 
@@ -292,8 +316,8 @@ impl DaemonState {
                 Ok(LocalResponse::Acknowledged)
             }
             LocalRequest::SetAutostart { enabled, .. } => {
-                if self.manage_platform_autostart {
-                    set_platform_autostart(enabled)?;
+                if let Some(adapter) = &self.autostart_adapter {
+                    adapter.set_enabled(enabled)?;
                 }
                 self.snapshot.autostart = enabled;
                 Ok(LocalResponse::Acknowledged)
@@ -311,7 +335,6 @@ fn set_platform_autostart(enabled: bool) -> Result<(), LocalProtocolError> {
         .args([
             "--user",
             if enabled { "enable" } else { "disable" },
-            "--now",
             "devicelane.service",
         ])
         .status();
@@ -329,9 +352,9 @@ fn set_platform_autostart(enabled: bool) -> Result<(), LocalProtocolError> {
             "-NonInteractive",
             "-Command",
             if enabled {
-                "$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Enable-ScheduledTask -TaskName \"DeviceLane Service-$sid\" | Out-Null; Start-ScheduledTask -TaskName \"DeviceLane Service-$sid\""
+                "$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Enable-ScheduledTask -TaskName \"DeviceLane Service-$sid\" | Out-Null"
             } else {
-                "$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Stop-ScheduledTask -TaskName \"DeviceLane Service-$sid\" -ErrorAction SilentlyContinue; Disable-ScheduledTask -TaskName \"DeviceLane Service-$sid\" | Out-Null"
+                "$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Disable-ScheduledTask -TaskName \"DeviceLane Service-$sid\" | Out-Null"
             },
         ])
         .status();
@@ -349,17 +372,18 @@ pub fn platform_autostart_enabled() -> bool {
         .status()
         .is_ok_and(|status| status.success());
     #[cfg(target_os = "macos")]
-    return std::process::Command::new("launchctl")
-        .args([
-            "print-disabled",
-            &format!("gui/{}", unsafe { libc::geteuid() }),
-        ])
-        .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && !String::from_utf8_lossy(&output.stdout)
-                    .contains("\"dev.devicelane.service\" => true")
-        });
+    return std::env::var_os("HOME").is_some_and(|home| {
+        let plist = PathBuf::from(home).join("Library/LaunchAgents/dev.devicelane.service.plist");
+        std::process::Command::new("launchctl")
+            .args([
+                "print-disabled",
+                &format!("gui/{}", unsafe { libc::geteuid() }),
+            ])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success() && launch_agent_autostart_enabled(&plist, &output.stdout)
+            })
+    });
     #[cfg(windows)]
     return std::process::Command::new("powershell.exe")
         .args([
@@ -370,6 +394,12 @@ pub fn platform_autostart_enabled() -> bool {
         ])
         .status()
         .is_ok_and(|status| status.success());
+}
+
+pub fn launch_agent_autostart_enabled(plist: &Path, print_disabled_output: &[u8]) -> bool {
+    plist.is_file()
+        && !String::from_utf8_lossy(print_disabled_output)
+            .contains("\"dev.devicelane.service\" => true")
 }
 
 pub fn validate_state_paths<'a>(
