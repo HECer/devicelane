@@ -1,0 +1,25 @@
+[package]
+name = "devicelane-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[lib]
+name = "devicelane_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devicelane-desktop"
+path = "src/main.rs"
+
+[dependencies]
+device_development_mesh = { package = "devicelane", path = "../.." }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

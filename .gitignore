@@ -1,5 +1,10 @@
 # Yoke runtime artifacts (managed by yoke retrofit)
 /target/
+/desktop/node_modules/
+/desktop/dist/
+/desktop/src-tauri/gen/
+/desktop/src-tauri/icons/android/
+/desktop/src-tauri/icons/ios/
 /.mesh/
 .worktrees/
 .yoke/worktrees/

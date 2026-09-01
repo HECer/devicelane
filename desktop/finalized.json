@@ -1,0 +1,12 @@
+{
+  "source_mockup": null,
+  "source_plan": "docs/yoke/plans/2026-09-01-desktop-foundation-daemon.md",
+  "mode": "plan-driven",
+  "html_file": "desktop/src/App.tsx",
+  "pretext_tier": "card-grid: prepare() + layout()",
+  "framework": "react-typescript",
+  "iterations": 0,
+  "date": "2026-09-01",
+  "screen": "device-overview",
+  "branch": "feat/speechwalker-remote-builds"
+}
