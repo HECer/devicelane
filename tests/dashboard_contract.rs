@@ -2,9 +2,9 @@ use device_development_mesh::dashboard::{
     ActivityEvent, ActivityId, ActivityState, ActivitySummary, ApprovalDecision, ApprovalId,
     ApprovalRequest, AuditRecord, AuditResult, Authorization, ConnectionPath, CursorPage,
     DashboardDevice, DashboardHost, DashboardScope, DashboardSnapshot, DashboardWarning, DeviceId,
-    EventCursor, Freshness, HostId, MetricSnapshot, MetricValue, OperationId, PolicyEffect,
-    PolicyOrigin, PolicyRule, Presence, PrincipalId, RedactedText, ResourceClass,
-    ResourceOccupancy, RuleId, TrustState, ValidatedId,
+    DisplayMessage, EventCursor, Freshness, HostId, MessageCode, MetricSnapshot, MetricValue,
+    OperationId, PolicyEffect, PolicyOrigin, PolicyRule, Presence, PrincipalId, ResourceClass,
+    ResourceOccupancy, RuleId, SafeCode, TrustState, ValidatedId,
 };
 use serde_json::json;
 
@@ -28,27 +28,35 @@ fn operation_id(value: &str) -> OperationId {
     OperationId::parse(value).unwrap()
 }
 
+fn code(value: &str) -> SafeCode {
+    SafeCode::parse(value).unwrap()
+}
+
+fn message(value: MessageCode) -> DisplayMessage {
+    DisplayMessage::new(value, vec![]).unwrap()
+}
+
 fn sample_host() -> DashboardHost {
     DashboardHost {
         id: host_id("mac-studio"),
         display_name: "Build Mac".into(),
-        platform: "macos".into(),
-        architecture: "arm64".into(),
+        platform: code("macos"),
+        architecture: code("arm64"),
         presence: Presence::Online,
         freshness: Freshness::Live,
         trust: TrustState::Trusted,
         connection_path: ConnectionPath::Registry,
-        capabilities: vec!["xcode_build".into()],
-        permissions: vec!["workspace_read".into()],
+        capabilities: vec![code("xcode_build")],
+        permissions: vec![code("workspace_read")],
         devices: vec![DashboardDevice {
             id: device_id("iphone-1"),
             host_id: host_id("mac-studio"),
             display_name: "iPhone".into(),
-            platform: "ios".into(),
+            platform: code("ios"),
             presence: Presence::Busy,
             freshness: Freshness::Live,
-            capabilities: vec!["application_install".into()],
-            permissions: vec!["device_lease".into()],
+            capabilities: vec![code("application_install")],
+            permissions: vec![code("device_lease")],
         }],
     }
 }
@@ -70,12 +78,12 @@ fn sample_event() -> ActivityEvent {
             approval_id: None,
         },
         state: ActivityState::Running,
-        message: Some(RedactedText::parse("build started [redacted]").unwrap()),
+        message: Some(message(MessageCode::ActivityStarted)),
         metrics: MetricSnapshot {
             current_memory_bytes: MetricValue::Available { value: 512 },
             peak_memory_bytes: MetricValue::Available { value: 1024 },
             cpu_time_ms: MetricValue::Unavailable {
-                reason: "observer_failed".into(),
+                reason: code("observer_failed"),
             },
             process_count: MetricValue::Available { value: 3 },
         },
@@ -104,11 +112,11 @@ fn representative_contracts_round_trip() {
             resources: event.resources.clone(),
             requested_at_ms: 1_788_220_800_000,
             expires_at_ms: 1_788_221_100_000,
-            risk: "target_confirmation_required".into(),
+            risk: code("target_confirmation_required"),
         }],
         warnings: vec![DashboardWarning {
-            code: "stale_registry".into(),
-            message: RedactedText::parse("Registry observation is stale").unwrap(),
+            code: code("stale_registry"),
+            message: message(MessageCode::RegistryStale),
             host_id: Some(host_id("mac-studio")),
         }],
     };
@@ -149,7 +157,7 @@ fn every_representative_struct_rejects_unknown_fields() {
             resources: vec![ResourceClass::WorkspaceRead],
             requested_at_ms: 10,
             expires_at_ms: 20,
-            risk: "normal".into(),
+            risk: code("normal"),
         })
         .unwrap(),
         serde_json::to_value(PolicyRule {
@@ -180,7 +188,7 @@ fn every_representative_struct_rejects_unknown_fields() {
             resources: vec![ResourceClass::WorkspaceRead],
             decision: PolicyEffect::Allow,
             result: AuditResult::Succeeded,
-            redacted_message: Some(RedactedText::parse("ok").unwrap()),
+            redacted_message: Some(message(MessageCode::OperationSucceeded)),
         })
         .unwrap(),
     ];
@@ -259,7 +267,7 @@ fn metrics_reject_peak_below_current_and_unavailable_is_not_zero() {
     );
 
     let value = serde_json::to_value(MetricValue::Unavailable {
-        reason: "observer_failed".into(),
+        reason: code("observer_failed"),
     })
     .unwrap();
     assert_eq!(value, json!({"unavailable":{"reason":"observer_failed"}}));
@@ -473,10 +481,10 @@ fn ids_text_and_vectors_have_explicit_bounds() {
         HostId::parse("x".repeat(257)).unwrap_err().code(),
         "id_too_long"
     );
-    assert!(RedactedText::parse("x".repeat(4096)).is_ok());
+    assert!(SafeCode::parse("x".repeat(128)).is_ok());
     assert_eq!(
-        RedactedText::parse("x".repeat(4097)).unwrap_err().code(),
-        "text_too_long"
+        SafeCode::parse("x".repeat(129)).unwrap_err().code(),
+        "code_too_long"
     );
 
     let mut event = serde_json::to_value(sample_event()).unwrap();
@@ -493,12 +501,14 @@ fn ids_text_and_vectors_have_explicit_bounds() {
     assert!(serde_json::from_value::<CursorPage<u64>>(page).is_ok());
 
     let mut warning = serde_json::to_value(DashboardWarning {
-        code: "warning".into(),
-        message: RedactedText::parse("safe").unwrap(),
+        code: code("warning"),
+        message: message(MessageCode::Redacted),
         host_id: None,
     })
     .unwrap();
-    warning["message"] = json!("x".repeat(4097));
+    warning["message"] = json!({
+        "code":"redacted", "params":vec!["local"; 129]
+    });
     assert!(serde_json::from_value::<DashboardWarning>(warning).is_err());
 }
 
@@ -569,7 +579,6 @@ fn sensitive_message_values_are_rejected_before_serialization() {
             serde_json::from_value::<DashboardWarning>(warning).is_err(),
             "accepted warning {sensitive}"
         );
-        assert!(RedactedText::parse(sensitive).is_err());
     }
 }
 
@@ -581,4 +590,187 @@ fn validation_errors_include_stable_location_context() {
     assert_eq!(error.code(), "duplicate_resource_class");
     assert_eq!(error.path(), "resources");
     assert_eq!(error.index(), Some(2));
+}
+
+#[test]
+fn invalid_in_memory_models_cannot_cross_the_serialization_boundary() {
+    let mut event = sample_event();
+    event.resources.push(ResourceClass::WorkspaceRead);
+    assert!(serde_json::to_value(event).is_err());
+
+    let mut metrics = sample_event().metrics;
+    metrics.current_memory_bytes = MetricValue::Available { value: 2 };
+    metrics.peak_memory_bytes = MetricValue::Available { value: 1 };
+    assert!(serde_json::to_value(metrics).is_err());
+
+    let mut summary = ActivitySummary::from(&sample_event());
+    summary.started_at_ms = None;
+    assert!(serde_json::to_value(summary).is_err());
+
+    let mut host = sample_host();
+    host.devices[0].host_id = host_id("wrong-host");
+    assert!(serde_json::to_value(host).is_err());
+
+    let mut device = sample_host().devices.remove(0);
+    device.presence = Presence::Offline;
+    device.freshness = Freshness::Unknown;
+    assert!(serde_json::to_value(device).is_err());
+
+    let approval = ApprovalRequest {
+        id: ApprovalId::parse("approval").unwrap(),
+        activity_id: activity_id("activity"),
+        principal_id: principal_id("principal"),
+        source_host_id: host_id("source"),
+        target_host_id: host_id("target"),
+        device_id: None,
+        operation: operation_id("build"),
+        resources: vec![ResourceClass::WorkspaceRead, ResourceClass::WorkspaceRead],
+        requested_at_ms: 1,
+        expires_at_ms: 2,
+        risk: code("normal"),
+    };
+    assert!(serde_json::to_value(approval).is_err());
+
+    let approval = ApprovalRequest {
+        id: ApprovalId::parse("approval").unwrap(),
+        activity_id: activity_id("activity"),
+        principal_id: principal_id("principal"),
+        source_host_id: host_id("source"),
+        target_host_id: host_id("target"),
+        device_id: None,
+        operation: operation_id("build"),
+        resources: vec![ResourceClass::WorkspaceRead],
+        requested_at_ms: 2,
+        expires_at_ms: 2,
+        risk: code("normal"),
+    };
+    assert!(serde_json::to_value(approval).is_err());
+
+    let rule = PolicyRule {
+        id: RuleId::parse("rule").unwrap(),
+        revision: 1,
+        effect: PolicyEffect::Allow,
+        principal_id: None,
+        source_host_id: None,
+        target_host_id: None,
+        device_id: None,
+        operation: None,
+        resources: vec![ResourceClass::Signing, ResourceClass::Signing],
+        expires_at_ms: None,
+        require_user_presence: false,
+        enabled: true,
+        origin: PolicyOrigin::User,
+    };
+    assert!(serde_json::to_value(rule).is_err());
+
+    let audit = AuditRecord {
+        sequence: 1,
+        occurred_at_ms: 1,
+        activity_id: None,
+        principal_id: principal_id("principal"),
+        source_host_id: host_id("source"),
+        target_host_id: host_id("target"),
+        device_id: None,
+        operation: operation_id("build"),
+        resources: vec![ResourceClass::Signing, ResourceClass::Signing],
+        decision: PolicyEffect::Allow,
+        result: AuditResult::Succeeded,
+        redacted_message: None,
+    };
+    assert!(serde_json::to_value(audit).is_err());
+
+    let warning = DashboardWarning {
+        code: code("warning"),
+        message: DisplayMessage {
+            code: MessageCode::Redacted,
+            params: vec![device_development_mesh::dashboard::MessageParam::Local; 129],
+        },
+        host_id: None,
+    };
+    assert!(serde_json::to_value(warning).is_err());
+
+    let oversized_page = CursorPage {
+        items: vec![1_u64; 257],
+        next_cursor: None,
+    };
+    assert!(serde_json::to_value(oversized_page).is_err());
+
+    let invalid_snapshot = DashboardSnapshot {
+        revision: 1,
+        generated_at_ms: 1,
+        scope: DashboardScope::Local,
+        hosts: vec![sample_host(); 129],
+        activities: vec![],
+        pending_approvals: vec![],
+        warnings: vec![],
+    };
+    assert!(serde_json::to_value(invalid_snapshot).is_err());
+}
+
+#[test]
+fn approval_expiry_must_be_strictly_after_request_time() {
+    for (requested_at_ms, expires_at_ms) in [(2, 1), (1, 1)] {
+        let approval = json!({
+            "id":"approval", "activity_id":"activity", "principal_id":"principal",
+            "source_host_id":"source", "target_host_id":"target", "device_id":null,
+            "operation":"build", "resources":["workspace_read"],
+            "requested_at_ms":requested_at_ms, "expires_at_ms":expires_at_ms, "risk":"normal"
+        });
+        assert!(serde_json::from_value::<ApprovalRequest>(approval).is_err());
+    }
+}
+
+#[test]
+fn denied_and_cancelled_are_valid_before_execution_starts() {
+    for state in [ActivityState::Denied, ActivityState::Cancelled] {
+        let mut event = sample_event();
+        event.state = state;
+        event.started_at_ms = None;
+        event.finished_at_ms = Some(event.occurred_at_ms);
+        assert!(event.validate().is_ok());
+        assert!(serde_json::to_value(event).is_ok());
+    }
+}
+
+#[test]
+fn nested_validation_errors_report_the_complete_object_path() {
+    let mut snapshot = DashboardSnapshot {
+        revision: 1,
+        generated_at_ms: 1,
+        scope: DashboardScope::Mesh,
+        hosts: vec![sample_host()],
+        activities: vec![ActivitySummary::from(&sample_event())],
+        pending_approvals: vec![],
+        warnings: vec![],
+    };
+    snapshot.hosts[0].devices[0].presence = Presence::Offline;
+    snapshot.hosts[0].devices[0].freshness = Freshness::Unknown;
+    assert_eq!(
+        snapshot.validate().unwrap_err().path(),
+        "hosts[0].devices[0].freshness"
+    );
+
+    snapshot.hosts[0].devices[0].presence = Presence::Online;
+    snapshot.activities[0]
+        .resources
+        .push(ResourceClass::WorkspaceRead);
+    assert_eq!(
+        snapshot.validate().unwrap_err().path(),
+        "activities[0].resources"
+    );
+}
+
+#[test]
+fn arbitrary_display_payloads_are_not_vetted_messages() {
+    assert!(
+        serde_json::from_value::<DisplayMessage>(json!("let customer_secret = workspace.read();"))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<DisplayMessage>(json!({
+            "code":"activity_started", "params":["customer_secret"]
+        }))
+        .is_err()
+    );
+    assert!(SafeCode::parse("ToKeN : disguised-value").is_err());
 }

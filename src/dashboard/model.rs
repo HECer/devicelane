@@ -1,3 +1,4 @@
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::fmt;
@@ -6,23 +7,23 @@ use std::hash::Hash;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationError {
     code: &'static str,
-    path: &'static str,
+    path: String,
     index: Option<usize>,
 }
 
 impl ValidationError {
-    fn at(code: &'static str, path: &'static str) -> Self {
+    fn at(code: &'static str, path: impl Into<String>) -> Self {
         Self {
             code,
-            path,
+            path: path.into(),
             index: None,
         }
     }
 
-    fn at_index(code: &'static str, path: &'static str, index: usize) -> Self {
+    fn at_index(code: &'static str, path: impl Into<String>, index: usize) -> Self {
         Self {
             code,
-            path,
+            path: path.into(),
             index: Some(index),
         }
     }
@@ -31,12 +32,22 @@ impl ValidationError {
         self.code
     }
 
-    pub fn path(&self) -> &'static str {
-        self.path
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     pub fn index(&self) -> Option<usize> {
         self.index
+    }
+
+    fn prepend(mut self, prefix: impl AsRef<str>) -> Self {
+        let prefix = prefix.as_ref();
+        self.path = if self.path.is_empty() {
+            prefix.to_owned()
+        } else {
+            format!("{prefix}.{}", self.path)
+        };
+        self
     }
 }
 
@@ -79,32 +90,23 @@ pub const MAX_TEXT_BYTES: usize = 4096;
 pub const MAX_COLLECTION_ITEMS: usize = 128;
 pub const MAX_PAGE_ITEMS: usize = 256;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
-pub struct RedactedText(String);
+pub struct SafeCode(String);
 
-impl RedactedText {
+impl SafeCode {
     pub fn parse(value: impl Into<String>) -> Result<Self, ValidationError> {
         let value = value.into();
-        if value.len() > MAX_TEXT_BYTES {
-            return Err(ValidationError::at("text_too_long", "text"));
+        if value.is_empty() {
+            return Err(ValidationError::at("empty_code", "code"));
         }
-        let normalized = value.to_ascii_lowercase();
-        const FORBIDDEN: [&str; 11] = [
-            "bearer ",
-            "token=",
-            "\"token\"",
-            "private_key",
-            "private key",
-            "environment:",
-            "environment=",
-            "env=",
-            "workspace_content",
-            "workspace contents",
-            "secret=",
-        ];
-        if FORBIDDEN.iter().any(|pattern| normalized.contains(pattern)) {
-            return Err(ValidationError::at("sensitive_text", "text"));
+        if value.len() > 128 {
+            return Err(ValidationError::at("code_too_long", "code"));
+        }
+        if !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte)
+        }) {
+            return Err(ValidationError::at("invalid_code", "code"));
         }
         Ok(Self(value))
     }
@@ -114,12 +116,83 @@ impl RedactedText {
     }
 }
 
-impl<'de> Deserialize<'de> for RedactedText {
+impl<'de> Deserialize<'de> for SafeCode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum MessageCode {
+    ActivityStarted,
+    RegistryStale,
+    ObserverUnavailable,
+    OperationSucceeded,
+    OperationFailed,
+    AccessDenied,
+    TargetConfirmationRequired,
+    Redacted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum MessageParam {
+    Local,
+    Remote,
+    Allowed,
+    Denied,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "DisplayMessageWire")]
+pub struct DisplayMessage {
+    pub code: MessageCode,
+    pub params: Vec<MessageParam>,
+}
+
+impl DisplayMessage {
+    pub fn new(code: MessageCode, params: Vec<MessageParam>) -> Result<Self, ValidationError> {
+        let value = Self { code, params };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_len(self.params.len(), "params")
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayMessageWire {
+    code: MessageCode,
+    params: Vec<MessageParam>,
+}
+
+impl TryFrom<DisplayMessageWire> for DisplayMessage {
+    type Error = ValidationError;
+
+    fn try_from(wire: DisplayMessageWire) -> Result<Self, Self::Error> {
+        Self::new(wire.code, wire.params)
+    }
+}
+
+impl Serialize for DisplayMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        DisplayMessageWire {
+            code: self.code,
+            params: self.params.clone(),
+        }
+        .serialize(serializer)
     }
 }
 
@@ -199,7 +272,7 @@ pub enum Freshness {
 )]
 pub enum MetricValue {
     Available { value: u64 },
-    Unavailable { reason: String },
+    Unavailable { reason: SafeCode },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -283,61 +356,59 @@ pub enum AuditResult {
     Deleted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "DashboardDeviceWire")]
 pub struct DashboardDevice {
     pub id: DeviceId,
     pub host_id: HostId,
     pub display_name: String,
-    pub platform: String,
+    pub platform: SafeCode,
     pub presence: Presence,
     pub freshness: Freshness,
-    pub capabilities: Vec<String>,
-    pub permissions: Vec<String>,
+    pub capabilities: Vec<SafeCode>,
+    pub permissions: Vec<SafeCode>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "DashboardHostWire")]
 pub struct DashboardHost {
     pub id: HostId,
     pub display_name: String,
-    pub platform: String,
-    pub architecture: String,
+    pub platform: SafeCode,
+    pub architecture: SafeCode,
     pub presence: Presence,
     pub freshness: Freshness,
     pub trust: TrustState,
     pub connection_path: ConnectionPath,
-    pub capabilities: Vec<String>,
-    pub permissions: Vec<String>,
+    pub capabilities: Vec<SafeCode>,
+    pub permissions: Vec<SafeCode>,
     pub devices: Vec<DashboardDevice>,
 }
 
 impl DashboardDevice {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_text(&self.display_name, "display_name")?;
-        validate_text(&self.platform, "platform")?;
         validate_presence(self.presence, &self.freshness)?;
-        validate_texts(&self.capabilities, "capabilities")?;
-        validate_texts(&self.permissions, "permissions")
+        validate_len(self.capabilities.len(), "capabilities")?;
+        validate_len(self.permissions.len(), "permissions")
     }
 }
 
 impl DashboardHost {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_text(&self.display_name, "display_name")?;
-        validate_text(&self.platform, "platform")?;
-        validate_text(&self.architecture, "architecture")?;
         validate_presence(self.presence, &self.freshness)?;
-        validate_texts(&self.capabilities, "capabilities")?;
-        validate_texts(&self.permissions, "permissions")?;
+        validate_len(self.capabilities.len(), "capabilities")?;
+        validate_len(self.permissions.len(), "permissions")?;
         validate_len(self.devices.len(), "devices")?;
         for (index, device) in self.devices.iter().enumerate() {
-            device.validate()?;
+            device
+                .validate()
+                .map_err(|error| error.prepend(format!("devices[{index}]")))?;
             if device.host_id != self.id {
-                return Err(ValidationError::at_index(
+                return Err(ValidationError::at(
                     "device_host_mismatch",
-                    "devices",
-                    index,
+                    format!("devices[{index}].host_id"),
                 ));
             }
         }
@@ -345,7 +416,7 @@ impl DashboardHost {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "MetricSnapshotWire")]
 pub struct MetricSnapshot {
     pub current_memory_bytes: MetricValue,
@@ -362,7 +433,7 @@ pub struct Authorization {
     pub approval_id: Option<ApprovalId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "ActivityEventWire")]
 pub struct ActivityEvent {
     pub activity_id: ActivityId,
@@ -376,7 +447,7 @@ pub struct ActivityEvent {
     pub resources: Vec<ResourceClass>,
     pub authorization: Authorization,
     pub state: ActivityState,
-    pub message: Option<RedactedText>,
+    pub message: Option<DisplayMessage>,
     pub metrics: MetricSnapshot,
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
@@ -407,21 +478,11 @@ impl MetricSnapshot {
                 ));
             }
         }
-        for value in [
-            &self.current_memory_bytes,
-            &self.peak_memory_bytes,
-            &self.cpu_time_ms,
-            &self.process_count,
-        ] {
-            if matches!(value, MetricValue::Unavailable { reason } if reason.trim().is_empty()) {
-                return Err(ValidationError::at("missing_metric_reason", "metrics"));
-            }
-        }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "ActivitySummaryWire")]
 pub struct ActivitySummary {
     pub activity_id: ActivityId,
@@ -471,7 +532,7 @@ pub struct ResourceOccupancy {
     pub acquired_at_ms: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "ApprovalRequestWire")]
 pub struct ApprovalRequest {
     pub id: ApprovalId,
@@ -484,21 +545,20 @@ pub struct ApprovalRequest {
     pub resources: Vec<ResourceClass>,
     pub requested_at_ms: u64,
     pub expires_at_ms: u64,
-    pub risk: String,
+    pub risk: SafeCode,
 }
 
 impl ApprovalRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_unique_resources(&self.resources)?;
-        validate_text(&self.risk, "risk")?;
-        if self.requested_at_ms > self.expires_at_ms {
+        if self.requested_at_ms >= self.expires_at_ms {
             return Err(ValidationError::at("non_monotonic_time", "expires_at_ms"));
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "PolicyRuleWire")]
 pub struct PolicyRule {
     pub id: RuleId,
@@ -522,7 +582,7 @@ impl PolicyRule {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "AuditRecordWire")]
 pub struct AuditRecord {
     pub sequence: u64,
@@ -536,7 +596,7 @@ pub struct AuditRecord {
     pub resources: Vec<ResourceClass>,
     pub decision: PolicyEffect,
     pub result: AuditResult,
-    pub redacted_message: Option<RedactedText>,
+    pub redacted_message: Option<DisplayMessage>,
 }
 
 impl AuditRecord {
@@ -545,21 +605,21 @@ impl AuditRecord {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "DashboardWarningWire")]
 pub struct DashboardWarning {
-    pub code: String,
-    pub message: RedactedText,
+    pub code: SafeCode,
+    pub message: DisplayMessage,
     pub host_id: Option<HostId>,
 }
 
 impl DashboardWarning {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        validate_text(&self.code, "code")
+        self.message.validate()
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "DashboardSnapshotWire")]
 pub struct DashboardSnapshot {
     pub revision: u64,
@@ -577,17 +637,24 @@ impl DashboardSnapshot {
         validate_len(self.activities.len(), "activities")?;
         validate_len(self.pending_approvals.len(), "pending_approvals")?;
         validate_len(self.warnings.len(), "warnings")?;
-        for host in &self.hosts {
-            host.validate()?;
+        for (index, host) in self.hosts.iter().enumerate() {
+            host.validate()
+                .map_err(|error| error.prepend(format!("hosts[{index}]")))?;
         }
-        for activity in &self.activities {
-            activity.validate()?;
+        for (index, activity) in self.activities.iter().enumerate() {
+            activity
+                .validate()
+                .map_err(|error| error.prepend(format!("activities[{index}]")))?;
         }
-        for approval in &self.pending_approvals {
-            approval.validate()?;
+        for (index, approval) in self.pending_approvals.iter().enumerate() {
+            approval
+                .validate()
+                .map_err(|error| error.prepend(format!("pending_approvals[{index}]")))?;
         }
-        for warning in &self.warnings {
-            warning.validate()?;
+        for (index, warning) in self.warnings.iter().enumerate() {
+            warning
+                .validate()
+                .map_err(|error| error.prepend(format!("warnings[{index}]")))?;
         }
         Ok(())
     }
@@ -607,24 +674,39 @@ macro_rules! validate_wire {
     };
 }
 
-#[derive(Deserialize)]
+macro_rules! validated_serialize {
+    ($model:ty, $wire:ty, $convert:expr) => {
+        impl Serialize for $model {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                self.validate().map_err(serde::ser::Error::custom)?;
+                let wire: $wire = ($convert)(self);
+                wire.serialize(serializer)
+            }
+        }
+    };
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DashboardDeviceWire {
     id: DeviceId,
     host_id: HostId,
     display_name: String,
-    platform: String,
+    platform: SafeCode,
     presence: Presence,
     freshness: Freshness,
-    capabilities: Vec<String>,
-    permissions: Vec<String>,
+    capabilities: Vec<SafeCode>,
+    permissions: Vec<SafeCode>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum MetricValueWire {
     Available { value: u64 },
-    Unavailable { reason: String },
+    Unavailable { reason: SafeCode },
 }
 
 impl TryFrom<MetricValueWire> for MetricValue {
@@ -633,10 +715,7 @@ impl TryFrom<MetricValueWire> for MetricValue {
     fn try_from(wire: MetricValueWire) -> Result<Self, Self::Error> {
         match wire {
             MetricValueWire::Available { value } => Ok(Self::Available { value }),
-            MetricValueWire::Unavailable { reason } => {
-                validate_text(&reason, "reason")?;
-                Ok(Self::Unavailable { reason })
-            }
+            MetricValueWire::Unavailable { reason } => Ok(Self::Unavailable { reason }),
         }
     }
 }
@@ -655,20 +734,34 @@ validate_wire!(
         permissions: wire.permissions,
     }
 );
+validated_serialize!(
+    DashboardDevice,
+    DashboardDeviceWire,
+    |value: &DashboardDevice| DashboardDeviceWire {
+        id: value.id.clone(),
+        host_id: value.host_id.clone(),
+        display_name: value.display_name.clone(),
+        platform: value.platform.clone(),
+        presence: value.presence,
+        freshness: value.freshness.clone(),
+        capabilities: value.capabilities.clone(),
+        permissions: value.permissions.clone(),
+    }
+);
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DashboardHostWire {
     id: HostId,
     display_name: String,
-    platform: String,
-    architecture: String,
+    platform: SafeCode,
+    architecture: SafeCode,
     presence: Presence,
     freshness: Freshness,
     trust: TrustState,
     connection_path: ConnectionPath,
-    capabilities: Vec<String>,
-    permissions: Vec<String>,
+    capabilities: Vec<SafeCode>,
+    permissions: Vec<SafeCode>,
     devices: Vec<DashboardDevice>,
 }
 
@@ -689,8 +782,23 @@ validate_wire!(
         devices: wire.devices,
     }
 );
+validated_serialize!(DashboardHost, DashboardHostWire, |value: &DashboardHost| {
+    DashboardHostWire {
+        id: value.id.clone(),
+        display_name: value.display_name.clone(),
+        platform: value.platform.clone(),
+        architecture: value.architecture.clone(),
+        presence: value.presence,
+        freshness: value.freshness.clone(),
+        trust: value.trust,
+        connection_path: value.connection_path,
+        capabilities: value.capabilities.clone(),
+        permissions: value.permissions.clone(),
+        devices: value.devices.clone(),
+    }
+});
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MetricSnapshotWire {
     current_memory_bytes: MetricValue,
@@ -709,8 +817,18 @@ validate_wire!(
         process_count: wire.process_count,
     }
 );
+validated_serialize!(
+    MetricSnapshot,
+    MetricSnapshotWire,
+    |value: &MetricSnapshot| MetricSnapshotWire {
+        current_memory_bytes: value.current_memory_bytes.clone(),
+        peak_memory_bytes: value.peak_memory_bytes.clone(),
+        cpu_time_ms: value.cpu_time_ms.clone(),
+        process_count: value.process_count.clone(),
+    }
+);
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActivityEventWire {
     activity_id: ActivityId,
@@ -724,7 +842,7 @@ struct ActivityEventWire {
     resources: Vec<ResourceClass>,
     authorization: Authorization,
     state: ActivityState,
-    message: Option<RedactedText>,
+    message: Option<DisplayMessage>,
     metrics: MetricSnapshot,
     started_at_ms: Option<u64>,
     finished_at_ms: Option<u64>,
@@ -751,8 +869,27 @@ validate_wire!(
         finished_at_ms: wire.finished_at_ms,
     }
 );
+validated_serialize!(ActivityEvent, ActivityEventWire, |value: &ActivityEvent| {
+    ActivityEventWire {
+        activity_id: value.activity_id.clone(),
+        sequence: value.sequence,
+        occurred_at_ms: value.occurred_at_ms,
+        principal_id: value.principal_id.clone(),
+        source_host_id: value.source_host_id.clone(),
+        target_host_id: value.target_host_id.clone(),
+        device_id: value.device_id.clone(),
+        operation: value.operation.clone(),
+        resources: value.resources.clone(),
+        authorization: value.authorization.clone(),
+        state: value.state,
+        message: value.message.clone(),
+        metrics: value.metrics.clone(),
+        started_at_ms: value.started_at_ms,
+        finished_at_ms: value.finished_at_ms,
+    }
+});
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActivitySummaryWire {
     activity_id: ActivityId,
@@ -783,8 +920,24 @@ validate_wire!(
         finished_at_ms: wire.finished_at_ms,
     }
 );
+validated_serialize!(
+    ActivitySummary,
+    ActivitySummaryWire,
+    |value: &ActivitySummary| ActivitySummaryWire {
+        activity_id: value.activity_id.clone(),
+        principal_id: value.principal_id.clone(),
+        source_host_id: value.source_host_id.clone(),
+        target_host_id: value.target_host_id.clone(),
+        device_id: value.device_id.clone(),
+        operation: value.operation.clone(),
+        resources: value.resources.clone(),
+        state: value.state,
+        started_at_ms: value.started_at_ms,
+        finished_at_ms: value.finished_at_ms,
+    }
+);
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApprovalRequestWire {
     id: ApprovalId,
@@ -797,7 +950,7 @@ struct ApprovalRequestWire {
     resources: Vec<ResourceClass>,
     requested_at_ms: u64,
     expires_at_ms: u64,
-    risk: String,
+    risk: SafeCode,
 }
 
 validate_wire!(
@@ -817,8 +970,25 @@ validate_wire!(
         risk: wire.risk,
     }
 );
+validated_serialize!(
+    ApprovalRequest,
+    ApprovalRequestWire,
+    |value: &ApprovalRequest| ApprovalRequestWire {
+        id: value.id.clone(),
+        activity_id: value.activity_id.clone(),
+        principal_id: value.principal_id.clone(),
+        source_host_id: value.source_host_id.clone(),
+        target_host_id: value.target_host_id.clone(),
+        device_id: value.device_id.clone(),
+        operation: value.operation.clone(),
+        resources: value.resources.clone(),
+        requested_at_ms: value.requested_at_ms,
+        expires_at_ms: value.expires_at_ms,
+        risk: value.risk.clone(),
+    }
+);
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyRuleWire {
     id: RuleId,
@@ -853,8 +1023,25 @@ validate_wire!(PolicyRuleWire, PolicyRule, |wire: PolicyRuleWire| {
         origin: wire.origin,
     }
 });
+validated_serialize!(PolicyRule, PolicyRuleWire, |value: &PolicyRule| {
+    PolicyRuleWire {
+        id: value.id.clone(),
+        revision: value.revision,
+        effect: value.effect,
+        principal_id: value.principal_id.clone(),
+        source_host_id: value.source_host_id.clone(),
+        target_host_id: value.target_host_id.clone(),
+        device_id: value.device_id.clone(),
+        operation: value.operation.clone(),
+        resources: value.resources.clone(),
+        expires_at_ms: value.expires_at_ms,
+        require_user_presence: value.require_user_presence,
+        enabled: value.enabled,
+        origin: value.origin,
+    }
+});
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuditRecordWire {
     sequence: u64,
@@ -868,7 +1055,7 @@ struct AuditRecordWire {
     resources: Vec<ResourceClass>,
     decision: PolicyEffect,
     result: AuditResult,
-    redacted_message: Option<RedactedText>,
+    redacted_message: Option<DisplayMessage>,
 }
 
 validate_wire!(AuditRecordWire, AuditRecord, |wire: AuditRecordWire| {
@@ -887,12 +1074,28 @@ validate_wire!(AuditRecordWire, AuditRecord, |wire: AuditRecordWire| {
         redacted_message: wire.redacted_message,
     }
 });
+validated_serialize!(AuditRecord, AuditRecordWire, |value: &AuditRecord| {
+    AuditRecordWire {
+        sequence: value.sequence,
+        occurred_at_ms: value.occurred_at_ms,
+        activity_id: value.activity_id.clone(),
+        principal_id: value.principal_id.clone(),
+        source_host_id: value.source_host_id.clone(),
+        target_host_id: value.target_host_id.clone(),
+        device_id: value.device_id.clone(),
+        operation: value.operation.clone(),
+        resources: value.resources.clone(),
+        decision: value.decision,
+        result: value.result,
+        redacted_message: value.redacted_message.clone(),
+    }
+});
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DashboardWarningWire {
-    code: String,
-    message: RedactedText,
+    code: SafeCode,
+    message: DisplayMessage,
     host_id: Option<HostId>,
 }
 
@@ -905,8 +1108,17 @@ validate_wire!(
         host_id: wire.host_id,
     }
 );
+validated_serialize!(
+    DashboardWarning,
+    DashboardWarningWire,
+    |value: &DashboardWarning| DashboardWarningWire {
+        code: value.code.clone(),
+        message: value.message.clone(),
+        host_id: value.host_id.clone(),
+    }
+);
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DashboardSnapshotWire {
     revision: u64,
@@ -931,6 +1143,19 @@ validate_wire!(
         warnings: wire.warnings,
     }
 );
+validated_serialize!(
+    DashboardSnapshot,
+    DashboardSnapshotWire,
+    |value: &DashboardSnapshot| DashboardSnapshotWire {
+        revision: value.revision,
+        generated_at_ms: value.generated_at_ms,
+        scope: value.scope,
+        hosts: value.hosts.clone(),
+        activities: value.activities.clone(),
+        pending_approvals: value.pending_approvals.clone(),
+        warnings: value.warnings.clone(),
+    }
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -939,11 +1164,31 @@ pub struct EventCursor {
     pub sequence: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorPage<T> {
     pub items: Vec<T>,
     pub next_cursor: Option<EventCursor>,
+}
+
+impl<T> Serialize for CursorPage<T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.items.len() > MAX_PAGE_ITEMS {
+            return Err(serde::ser::Error::custom(ValidationError::at(
+                "page_too_large",
+                "items",
+            )));
+        }
+        let mut state = serializer.serialize_struct("CursorPage", 2)?;
+        state.serialize_field("items", &self.items)?;
+        state.serialize_field("next_cursor", &self.next_cursor)?;
+        state.end()
+    }
 }
 
 impl<'de, T> Deserialize<'de> for CursorPage<T>
@@ -1029,13 +1274,15 @@ fn validate_lifecycle(
                 ));
             }
         }
-        ActivityState::Succeeded
-        | ActivityState::Failed
-        | ActivityState::Denied
-        | ActivityState::Cancelled => {
+        ActivityState::Succeeded | ActivityState::Failed => {
             if started_at_ms.is_none() {
                 return Err(ValidationError::at("missing_started_at", "started_at_ms"));
             }
+            if finished_at_ms.is_none() {
+                return Err(ValidationError::at("missing_finished_at", "finished_at_ms"));
+            }
+        }
+        ActivityState::Denied | ActivityState::Cancelled => {
             if finished_at_ms.is_none() {
                 return Err(ValidationError::at("missing_finished_at", "finished_at_ms"));
             }
@@ -1073,14 +1320,6 @@ fn validate_text(value: &str, path: &'static str) -> Result<(), ValidationError>
     }
     if value.len() > MAX_TEXT_BYTES {
         return Err(ValidationError::at("text_too_long", path));
-    }
-    Ok(())
-}
-
-fn validate_texts(values: &[String], path: &'static str) -> Result<(), ValidationError> {
-    validate_len(values.len(), path)?;
-    for value in values {
-        validate_text(value, path)?;
     }
     Ok(())
 }
