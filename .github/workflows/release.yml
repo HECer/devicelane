@@ -51,11 +51,11 @@ jobs:
       - name: Package Unix binaries
         if: matrix.archive == 'tar'
         shell: bash
-        run: tar -czf "${{ matrix.asset }}" -C target/release mesh-cli mesh-agent mesh-registry -C ../.. README.md LICENSE
+        run: tar -czf "${{ matrix.asset }}" -C target/release devicelane devicelane-service mesh-cli mesh-agent mesh-registry -C ../.. README.md LICENSE
       - name: Package Windows binaries
         if: matrix.archive == 'zip'
         shell: pwsh
-        run: Compress-Archive -Path target/release/mesh-cli.exe,target/release/mesh-agent.exe,target/release/mesh-registry.exe,README.md,LICENSE -DestinationPath "${{ matrix.asset }}"
+        run: Compress-Archive -Path target/release/devicelane.exe,target/release/devicelane-service.exe,target/release/mesh-cli.exe,target/release/mesh-agent.exe,target/release/mesh-registry.exe,README.md,LICENSE -DestinationPath "${{ matrix.asset }}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.asset }}

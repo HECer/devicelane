@@ -14,14 +14,14 @@ impl Drop for Service {
     }
 }
 
-fn endpoint_text(runtime_dir: &std::path::Path) -> String {
+fn endpoint_text(_runtime_dir: &std::path::Path) -> String {
     #[cfg(windows)]
     {
         format!(r"\\.\pipe\devicelane-test-{}", std::process::id())
     }
     #[cfg(unix)]
     {
-        runtime_dir.join("devicelane.sock").display().to_string()
+        _runtime_dir.join("devicelane.sock").display().to_string()
     }
 }
 
