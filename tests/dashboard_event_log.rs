@@ -126,6 +126,24 @@ fn journal_and_pages_enforce_exact_event_and_byte_bounds() {
 }
 
 #[test]
+fn custom_bounds_cannot_weaken_fixed_global_limits() {
+    let journal = EventJournal::with_bounds(
+        1,
+        1,
+        MAX_EVENTS.saturating_mul(10),
+        MAX_EVENT_BYTES.saturating_mul(10),
+    );
+    for sequence in 1..=(MAX_EVENTS as u64 + 1) {
+        journal
+            .append(format!("key-{sequence}"), event("a", sequence))
+            .unwrap();
+    }
+    let stats = journal.stats();
+    assert_eq!(stats.events, MAX_EVENTS);
+    assert!(stats.serialized_bytes <= MAX_EVENT_BYTES);
+}
+
+#[test]
 fn one_logical_event_is_never_silently_truncated() {
     let journal = EventJournal::with_bounds(1, 1, 1000, 64);
     assert!(matches!(
@@ -149,6 +167,77 @@ fn auxiliary_indexes_remain_bounded_with_many_distinct_activities() {
     let stats = journal.stats();
     assert!(stats.idempotency_entries <= MAX_EVENTS);
     assert!(stats.activity_entries <= MAX_EVENTS);
+}
+
+#[test]
+fn evicted_activity_continuations_remain_monotonic_until_bounded_epoch_rotation() {
+    let journal = EventJournal::with_bounds(4, 19, 1, MAX_EVENT_BYTES);
+    journal.append("a-1", event("a", 1)).unwrap();
+    journal.append("b-1", event("b", 1)).unwrap();
+    assert_eq!(
+        journal.append("a-replay", event("a", 1)),
+        Err(AppendError::NonMonotonicSequence { expected: 2 })
+    );
+    journal.append("a-2", event("a", 2)).unwrap();
+
+    let rotation = EventJournal::with_bounds(4, 19, 1, MAX_EVENT_BYTES);
+    for index in 0..MAX_EVENTS {
+        rotation
+            .append(
+                format!("distinct-{index}"),
+                event(&format!("distinct-{index}"), 1),
+            )
+            .unwrap();
+    }
+    let old = EventCursor {
+        epoch: 4,
+        sequence: rotation.stats().newest_sequence,
+    };
+    rotation
+        .append("rotation-trigger", event("new-activity", 1))
+        .unwrap();
+    assert_eq!(rotation.stats().epoch, 5);
+    assert!(matches!(
+        rotation.read(old, ReadLimit::default()),
+        EventRead::ResyncRequired {
+            snapshot_revision: 19,
+            ..
+        }
+    ));
+    assert!(rotation.stats().activity_entries <= MAX_EVENTS);
+}
+
+#[test]
+fn sequence_and_epoch_overflow_fail_explicitly() {
+    let journal = EventJournal::new(u64::MAX, 1);
+    assert_eq!(
+        journal.rotate_epoch(u64::MAX, 2),
+        Err(device_development_mesh::dashboard::event_log::RotateError::EpochNotIncreasing)
+    );
+    assert_eq!(
+        journal.rotate_epoch(0, 2),
+        Err(device_development_mesh::dashboard::event_log::RotateError::EpochNotIncreasing)
+    );
+
+    let event_overflow = EventJournal::new(1, 1);
+    assert_eq!(
+        event_overflow.append("max", event("a", u64::MAX)),
+        Err(AppendError::SequenceOverflow)
+    );
+
+    let automatic_rotation = EventJournal::new(u64::MAX, 1);
+    for index in 0..MAX_EVENTS {
+        automatic_rotation
+            .append(
+                format!("key-{index}"),
+                event(&format!("activity-{index}"), 1),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        automatic_rotation.append("overflow", event("overflow", 1)),
+        Err(AppendError::EpochOverflow)
+    );
 }
 
 #[test]
@@ -227,7 +316,7 @@ fn epoch_rotation_and_cursor_ahead_require_explicit_recovery() {
             newest_available: EventCursor { sequence: 1, .. }
         }
     ));
-    journal.rotate_epoch(8, 42);
+    journal.rotate_epoch(8, 42).unwrap();
     assert!(matches!(
         journal.read(
             EventCursor {

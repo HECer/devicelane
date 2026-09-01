@@ -56,6 +56,8 @@ pub enum AppendError {
     NonMonotonicSequence {
         expected: u64,
     },
+    SequenceOverflow,
+    EpochOverflow,
     LimitExceeded {
         serialized_bytes: usize,
         maximum_bytes: usize,
@@ -79,8 +81,14 @@ pub enum AcknowledgeError {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RotateError {
+    EpochNotIncreasing,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JournalStats {
+    pub epoch: u64,
     pub events: usize,
     pub serialized_bytes: usize,
     pub oldest_sequence: Option<u64>,
@@ -144,8 +152,8 @@ impl EventJournal {
                 idempotency: HashMap::new(),
                 activity_sequences: HashMap::new(),
                 subscribers: HashMap::new(),
-                max_events,
-                max_bytes,
+                max_events: max_events.min(MAX_EVENTS),
+                max_bytes: max_bytes.min(MAX_EVENT_BYTES),
             })),
         }
     }
@@ -176,12 +184,8 @@ impl EventJournal {
                 Err(AppendError::IdempotencyConflict)
             };
         }
-        let expected = inner
-            .activity_sequences
-            .get(&event.activity_id)
-            .map_or(1, |value| value.saturating_add(1));
-        if event.sequence != expected {
-            return Err(AppendError::NonMonotonicSequence { expected });
+        if event.sequence == u64::MAX {
+            return Err(AppendError::SequenceOverflow);
         }
         if inner.max_events == 0 || event_json.len() > inner.max_bytes {
             return Err(AppendError::LimitExceeded {
@@ -189,8 +193,34 @@ impl EventJournal {
                 maximum_bytes: inner.max_bytes,
             });
         }
+        let previous_activity_sequence = inner.activity_sequences.get(&event.activity_id).copied();
+        let expected = previous_activity_sequence
+            .map_or(Some(1), |value| value.checked_add(1))
+            .ok_or(AppendError::SequenceOverflow)?;
+        if event.sequence != expected {
+            return Err(AppendError::NonMonotonicSequence { expected });
+        }
+        let needs_rotation =
+            previous_activity_sequence.is_none() && inner.activity_sequences.len() >= MAX_EVENTS;
+        if needs_rotation {
+            let next_epoch = inner
+                .epoch
+                .checked_add(1)
+                .ok_or(AppendError::EpochOverflow)?;
+            let snapshot_revision = inner.snapshot_revision;
+            rotate_locked(&mut inner, next_epoch, snapshot_revision);
+            if let Some(previous) = previous_activity_sequence {
+                inner
+                    .activity_sequences
+                    .insert(event.activity_id.clone(), previous);
+            }
+        }
+        let next_cursor_sequence = inner
+            .next_cursor_sequence
+            .checked_add(1)
+            .ok_or(AppendError::SequenceOverflow)?;
         while inner.events.len() >= inner.max_events
-            || inner.serialized_bytes.saturating_add(event_json.len()) > inner.max_bytes
+            || inner.serialized_bytes > inner.max_bytes - event_json.len()
         {
             let removed = inner
                 .events
@@ -198,16 +228,9 @@ impl EventJournal {
                 .expect("non-empty journal while over capacity");
             inner.serialized_bytes -= removed.serialized_bytes;
             inner.idempotency.remove(&removed.idempotency_key);
-            if !inner
-                .events
-                .iter()
-                .any(|entry| entry.event.activity_id == removed.event.activity_id)
-            {
-                inner.activity_sequences.remove(&removed.event.activity_id);
-            }
         }
         let cursor_sequence = inner.next_cursor_sequence;
-        inner.next_cursor_sequence = inner.next_cursor_sequence.saturating_add(1);
+        inner.next_cursor_sequence = next_cursor_sequence;
         let serialized_bytes = event_json.len();
         inner.serialized_bytes += serialized_bytes;
         inner
@@ -228,12 +251,12 @@ impl EventJournal {
     pub fn read(&self, cursor: EventCursor, limit: ReadLimit) -> EventRead {
         let inner = self.lock();
         let oldest_event = inner.events.front().map(|entry| entry.cursor_sequence);
-        let newest = inner.next_cursor_sequence.saturating_sub(1);
+        let newest = inner.next_cursor_sequence - 1;
         if cursor.epoch != inner.epoch {
             return EventRead::ResyncRequired {
                 oldest_available: EventCursor {
                     epoch: inner.epoch,
-                    sequence: oldest_event.map_or(newest, |value| value.saturating_sub(1)),
+                    sequence: oldest_event.map_or(newest, |value| value - 1),
                 },
                 snapshot_revision: inner.snapshot_revision,
             };
@@ -246,11 +269,11 @@ impl EventJournal {
                 },
             };
         }
-        if oldest_event.is_some_and(|oldest| cursor.sequence.saturating_add(1) < oldest) {
+        if oldest_event.is_some_and(|oldest| cursor.sequence < oldest - 1) {
             return EventRead::ResyncRequired {
                 oldest_available: EventCursor {
                     epoch: inner.epoch,
-                    sequence: oldest_event.unwrap().saturating_sub(1),
+                    sequence: oldest_event.unwrap() - 1,
                 },
                 snapshot_revision: inner.snapshot_revision,
             };
@@ -326,11 +349,11 @@ impl EventJournal {
             return Err(AcknowledgeError::CursorAhead);
         }
         if let Some(oldest) = inner.events.front().map(|event| event.cursor_sequence) {
-            if cursor.sequence.saturating_add(1) < oldest {
+            if cursor.sequence < oldest - 1 {
                 return Err(AcknowledgeError::ResyncRequired {
                     oldest_available: EventCursor {
                         epoch: inner.epoch,
-                        sequence: oldest.saturating_sub(1),
+                        sequence: oldest - 1,
                     },
                     snapshot_revision: inner.snapshot_revision,
                 });
@@ -356,25 +379,23 @@ impl EventJournal {
         before - inner.subscribers.len()
     }
 
-    pub fn rotate_epoch(&self, epoch: u64, snapshot_revision: u64) {
+    pub fn rotate_epoch(&self, epoch: u64, snapshot_revision: u64) -> Result<(), RotateError> {
         let mut inner = self.lock();
-        inner.epoch = epoch;
-        inner.snapshot_revision = snapshot_revision;
-        inner.next_cursor_sequence = 1;
-        inner.events.clear();
-        inner.serialized_bytes = 0;
-        inner.idempotency.clear();
-        inner.activity_sequences.clear();
-        inner.subscribers.clear();
+        if epoch <= inner.epoch {
+            return Err(RotateError::EpochNotIncreasing);
+        }
+        rotate_locked(&mut inner, epoch, snapshot_revision);
+        Ok(())
     }
 
     pub fn stats(&self) -> JournalStats {
         let inner = self.lock();
         JournalStats {
+            epoch: inner.epoch,
             events: inner.events.len(),
             serialized_bytes: inner.serialized_bytes,
             oldest_sequence: inner.events.front().map(|event| event.cursor_sequence),
-            newest_sequence: inner.next_cursor_sequence.saturating_sub(1),
+            newest_sequence: inner.next_cursor_sequence - 1,
             subscribers: inner.subscribers.len(),
             idempotency_entries: inner.idempotency.len(),
             activity_entries: inner.activity_sequences.len(),
@@ -386,4 +407,15 @@ impl EventJournal {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+fn rotate_locked(inner: &mut Inner, epoch: u64, snapshot_revision: u64) {
+    inner.epoch = epoch;
+    inner.snapshot_revision = snapshot_revision;
+    inner.next_cursor_sequence = 1;
+    inner.events.clear();
+    inner.serialized_bytes = 0;
+    inner.idempotency.clear();
+    inner.activity_sequences.clear();
+    inner.subscribers.clear();
 }
