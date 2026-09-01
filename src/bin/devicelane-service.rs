@@ -1,5 +1,9 @@
-use device_development_mesh::local_ipc::{local_endpoint, validate_state_paths};
+use device_development_mesh::local_ipc::{
+    ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, DiagnosticItem, LocalProtocolVersion,
+    local_endpoint, serve_local, validate_state_paths,
+};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct Args {
@@ -52,28 +56,40 @@ fn run() -> Result<(), String> {
     // State path validation deliberately precedes endpoint creation/binding.
     let endpoint =
         local_endpoint(&args.runtime_dir, &args.listen).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    {
-        let _listener = device_development_mesh::local_ipc::bind_local(&endpoint)
-            .map_err(|error| error.to_string())?;
-        if args.foreground {
-            loop {
-                std::thread::park();
-            }
-        }
+    let role = match args.role.as_str() {
+        "workstation" => DaemonRole::Workstation,
+        "agent" => DaemonRole::Agent,
+        "registry" => DaemonRole::Registry,
+        _ => return Err("invalid --role".into()),
+    };
+    let public_identity = args
+        .identity
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("devicelane")
+        .to_owned();
+    let state = Arc::new(Mutex::new(DaemonState::new(
+        DaemonSnapshot {
+            public_identity,
+            role,
+            endpoint: args.listen.clone(),
+            connection: ConnectionState::Disconnected,
+            local_protocol: LocalProtocolVersion::CURRENT,
+            remote_protocol: "1.0".into(),
+            warnings: Vec::new(),
+            remote_access_paused: false,
+            autostart: false,
+        },
+        vec![DiagnosticItem {
+            code: "ready".into(),
+            message: "local daemon is ready".into(),
+            healthy: true,
+        }],
+    )));
+    if args.foreground {
+        eprintln!("devicelane-service: listening on {}", args.listen);
     }
-    #[cfg(windows)]
-    {
-        // The named-pipe endpoint is consumed by the Windows service host. Keeping it typed
-        // prevents an accidental TCP fallback in this transport-neutral service bootstrap.
-        let _endpoint = endpoint;
-        if args.foreground {
-            loop {
-                std::thread::park();
-            }
-        }
-    }
-    Ok(())
+    serve_local(&endpoint, state).map_err(|error| error.to_string())
 }
 
 fn main() {

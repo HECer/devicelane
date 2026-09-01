@@ -1,11 +1,11 @@
 use device_development_mesh::local_ipc::{
     Authorizer, ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, DiagnosticItem,
     LocalProtocolError, LocalProtocolVersion, LocalRequest, LocalResponse, MAX_FRAME_BYTES,
-    PeerCredentials, SameUserAuthorizer, read_frame, validate_state_paths, write_frame,
+    PeerCredentials, SameUserAuthorizer, read_frame, send_local_request, send_raw_local_frame,
+    validate_state_paths, write_frame,
 };
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
-#[cfg(windows)]
 use std::process::Command;
 
 fn snapshot() -> DaemonSnapshot {
@@ -176,29 +176,8 @@ fn state_paths_must_be_absolute_before_transport_binding() {
 
 #[test]
 #[cfg(windows)]
-fn service_accepts_endpoint_and_peer_values_but_rejects_relative_state_paths() {
+fn service_rejects_relative_state_paths_before_binding() {
     let service = env!("CARGO_BIN_EXE_devicelane-service");
-    let status = Command::new(service)
-        .args([
-            "--identity",
-            r"C:\state\identity",
-            "--runtime-dir",
-            r"C:\state\run",
-            "--role",
-            "workstation",
-            "--registry",
-            "registry.example:7443",
-            "--listen",
-            r"\\.\pipe\devicelane-test",
-            "--agent-peer",
-            "mac-agent-1",
-            "--log-dir",
-            r"C:\state\logs",
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success());
-
     let status = Command::new(service)
         .args([
             "--identity",
@@ -219,4 +198,148 @@ fn service_accepts_endpoint_and_peer_values_but_rejects_relative_state_paths() {
         .status()
         .unwrap();
     assert!(!status.success());
+}
+
+#[test]
+#[cfg(windows)]
+fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
+    let pipe = format!(r"\\.\pipe\devicelane-e2e-{}", std::process::id());
+    let temp = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+        .args([
+            "--identity",
+            temp.path().join("identity").to_str().unwrap(),
+            "--runtime-dir",
+            temp.path().to_str().unwrap(),
+            "--role",
+            "workstation",
+            "--registry",
+            "registry.example:7443",
+            "--listen",
+            &pipe,
+            "--agent-peer",
+            "mac-agent-1",
+            "--log-dir",
+            temp.path().join("logs").to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+
+    let endpoint = device_development_mesh::local_ipc::LocalEndpoint::NamedPipe(pipe);
+    let request = LocalRequest::Status {
+        version: LocalProtocolVersion::CURRENT,
+    };
+    let first = (0..100)
+        .find_map(|_| {
+            send_local_request(&endpoint, &request).ok().or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            })
+        })
+        .expect("service did not bind named pipe");
+    assert!(matches!(first, LocalResponse::Snapshot(snapshot) if !snapshot.remote_access_paused));
+
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::PauseRemoteAccess {
+                version: LocalProtocolVersion::CURRENT
+            }
+        )
+        .unwrap(),
+        LocalResponse::Acknowledged
+    ));
+    assert!(
+        matches!(send_local_request(&endpoint, &request).unwrap(), LocalResponse::Snapshot(snapshot) if snapshot.remote_access_paused)
+    );
+
+    assert!(matches!(
+        send_raw_local_frame(&endpoint, b"not-json\n").unwrap(),
+        LocalResponse::Error { .. }
+    ));
+    let oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
+    assert!(matches!(
+        send_raw_local_frame(&endpoint, &oversized).unwrap(),
+        LocalResponse::Error { .. }
+    ));
+    assert!(matches!(
+        send_local_request(&endpoint, &request).unwrap(),
+        LocalResponse::Snapshot(_)
+    ));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "service exited instead of remaining available"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn production_unix_socket_serves_state_and_recovers_after_bad_frames() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("devicelane.sock");
+    let identity = temp.path().join("identity");
+    let logs = temp.path().join("logs");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+        .args([
+            "--identity",
+            identity.to_str().unwrap(),
+            "--runtime-dir",
+            temp.path().to_str().unwrap(),
+            "--role",
+            "workstation",
+            "--registry",
+            "registry.example:7443",
+            "--listen",
+            socket.to_str().unwrap(),
+            "--agent-peer",
+            "mac-agent-1",
+            "--log-dir",
+            logs.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    let endpoint = device_development_mesh::local_ipc::LocalEndpoint::UnixSocket(socket);
+    let request = LocalRequest::Status {
+        version: LocalProtocolVersion::CURRENT,
+    };
+    let first = (0..100)
+        .find_map(|_| {
+            send_local_request(&endpoint, &request).ok().or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            })
+        })
+        .expect("service did not bind Unix socket");
+    assert!(matches!(first, LocalResponse::Snapshot(snapshot) if !snapshot.remote_access_paused));
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::PauseRemoteAccess {
+                version: LocalProtocolVersion::CURRENT
+            }
+        )
+        .unwrap(),
+        LocalResponse::Acknowledged
+    ));
+    assert!(
+        matches!(send_local_request(&endpoint, &request).unwrap(), LocalResponse::Snapshot(snapshot) if snapshot.remote_access_paused)
+    );
+    assert!(matches!(
+        send_raw_local_frame(&endpoint, b"not-json\n").unwrap(),
+        LocalResponse::Error { .. }
+    ));
+    let oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
+    assert!(matches!(
+        send_raw_local_frame(&endpoint, &oversized).unwrap(),
+        LocalResponse::Error { .. }
+    ));
+    assert!(matches!(
+        send_local_request(&endpoint, &request).unwrap(),
+        LocalResponse::Snapshot(_)
+    ));
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
