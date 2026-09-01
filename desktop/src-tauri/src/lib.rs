@@ -1,9 +1,11 @@
 use device_development_mesh::local_ipc::{
-    DaemonRole, DaemonSnapshot, LocalProtocolVersion, LocalRequest, LocalResponse, local_endpoint,
-    send_local_request,
+    DaemonSnapshot, DiagnosticItem, LocalProtocolVersion, LocalRequest, LocalResponse,
+    local_endpoint, send_local_request,
 };
 use serde::Serialize;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, State, WindowEvent};
@@ -23,52 +25,25 @@ impl DaemonTransport for LocalDaemonTransport {
 }
 
 #[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DesktopSnapshot {
-    pub protocol: LocalProtocolVersion,
-    pub daemon_version: String,
-    pub os: String,
-    pub architecture: String,
-    pub role: DaemonRole,
-    pub connection: device_development_mesh::local_ipc::ConnectionState,
-    pub paused: bool,
-    pub autostart_enabled: bool,
-    pub warnings: Vec<String>,
-    pub log_location: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
 pub struct DiagnosticsResult {
     pub path: String,
+    pub items: Vec<DiagnosticItem>,
 }
 
 pub struct DesktopBridge<T> {
     transport: T,
-    os: String,
-    architecture: String,
-    log_location: String,
 }
 
 impl<T: DaemonTransport> DesktopBridge<T> {
-    pub fn new(
-        transport: T,
-        os: impl Into<String>,
-        architecture: impl Into<String>,
-        log_location: impl Into<String>,
-    ) -> Self {
-        Self {
-            transport,
-            os: os.into(),
-            architecture: architecture.into(),
-            log_location: log_location.into(),
-        }
+    pub fn new(transport: T) -> Self {
+        Self { transport }
     }
 
-    pub fn status(&self) -> Result<DesktopSnapshot, String> {
+    pub fn status(&self) -> Result<DaemonSnapshot, String> {
         match self.transport.send(LocalRequest::Status {
             version: LocalProtocolVersion::CURRENT,
         })? {
-            LocalResponse::Snapshot(snapshot) => Ok(self.map_snapshot(snapshot)),
+            LocalResponse::Snapshot(snapshot) => Ok(snapshot),
             response => Err(unexpected_response(response)),
         }
     }
@@ -96,8 +71,9 @@ impl<T: DaemonTransport> DesktopBridge<T> {
         match self.transport.send(LocalRequest::Diagnostics {
             version: LocalProtocolVersion::CURRENT,
         })? {
-            LocalResponse::Diagnostics(_) => Ok(DiagnosticsResult {
+            LocalResponse::Diagnostics(items) => Ok(DiagnosticsResult {
                 path: diagnostics_dir().display().to_string(),
+                items,
             }),
             response => Err(unexpected_response(response)),
         }
@@ -107,21 +83,6 @@ impl<T: DaemonTransport> DesktopBridge<T> {
         match self.transport.send(request)? {
             LocalResponse::Acknowledged => Ok(()),
             response => Err(unexpected_response(response)),
-        }
-    }
-
-    fn map_snapshot(&self, snapshot: DaemonSnapshot) -> DesktopSnapshot {
-        DesktopSnapshot {
-            protocol: snapshot.local_protocol,
-            daemon_version: env!("CARGO_PKG_VERSION").into(),
-            os: self.os.clone(),
-            architecture: self.architecture.clone(),
-            role: snapshot.role,
-            connection: snapshot.connection,
-            paused: snapshot.remote_access_paused,
-            autostart_enabled: snapshot.autostart,
-            warnings: snapshot.warnings,
-            log_location: self.log_location.clone(),
         }
     }
 }
@@ -173,6 +134,106 @@ fn diagnostics_dir() -> PathBuf {
 
 type AppBridge = DesktopBridge<LocalDaemonTransport>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepairSpec {
+    pub program: PathBuf,
+    pub arguments: Vec<OsString>,
+    pub service_binary: PathBuf,
+}
+
+pub fn repair_spec(
+    platform: &str,
+    resource_dir: &Path,
+    executable_dir: &Path,
+) -> Result<RepairSpec, String> {
+    let (program, script, mode, prefix): (PathBuf, &str, &str, Vec<OsString>) = match platform {
+        "windows" => (
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "setup-windows.ps1",
+            "--service-repair",
+            [
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        ),
+        "macos" => (
+            PathBuf::from("/bin/sh"),
+            "setup-mac.sh",
+            "--repair",
+            Vec::new(),
+        ),
+        "linux" => (
+            PathBuf::from("/bin/sh"),
+            "setup-linux.sh",
+            "--repair",
+            Vec::new(),
+        ),
+        _ => return Err(format!("unsupported repair platform: {platform}")),
+    };
+    let script = resource_dir.join("scripts").join(script);
+    let mut arguments = prefix;
+    arguments.push(script.into_os_string());
+    arguments.push(mode.into());
+    let service_name = if platform == "windows" {
+        "devicelane-service.exe"
+    } else {
+        "devicelane-service"
+    };
+    Ok(RepairSpec {
+        program,
+        arguments,
+        service_binary: executable_dir.join(service_name),
+    })
+}
+
+fn run_repair(platform: &str, resource_dir: &Path, executable_dir: &Path) -> Result<(), String> {
+    let trusted_root = resource_dir
+        .canonicalize()
+        .map_err(|error| format!("DeviceLane resource directory is unavailable: {error}"))?;
+    let trusted_executable_dir = executable_dir
+        .canonicalize()
+        .map_err(|error| format!("DeviceLane program directory is unavailable: {error}"))?;
+    let spec = repair_spec(platform, &trusted_root, &trusted_executable_dir)?;
+    let script_index = spec.arguments.len().saturating_sub(2);
+    let script = PathBuf::from(&spec.arguments[script_index]);
+    let trusted_script = script
+        .canonicalize()
+        .map_err(|error| format!("DeviceLane repair asset is unavailable: {error}"))?;
+    if !trusted_script.starts_with(&trusted_root) || !trusted_script.is_file() {
+        return Err("DeviceLane repair asset failed path validation".into());
+    }
+    let trusted_service = spec
+        .service_binary
+        .canonicalize()
+        .map_err(|error| format!("Bundled DeviceLane service is unavailable: {error}"))?;
+    if !trusted_service.starts_with(&trusted_executable_dir) || !trusted_service.is_file() {
+        return Err("Bundled DeviceLane service failed path validation".into());
+    }
+    let mut arguments = spec.arguments;
+    arguments[script_index] = trusted_script.into_os_string();
+    let output = Command::new(&spec.program)
+        .args(arguments)
+        .env("DEVICELANE_SERVICE_BINARY", trusted_service)
+        .output()
+        .map_err(|error| format!("DeviceLane repair could not start: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if detail.is_empty() {
+            format!("DeviceLane repair exited with {}", output.status)
+        } else {
+            format!("DeviceLane repair failed: {detail}")
+        })
+    }
+}
+
 fn notify_error(app: &AppHandle, error: &str) {
     let _ = app
         .notification()
@@ -190,7 +251,7 @@ fn report<T>(app: &AppHandle, result: Result<T, String>) -> Result<T, String> {
 }
 
 #[tauri::command]
-fn daemon_status(app: AppHandle, bridge: State<'_, AppBridge>) -> Result<DesktopSnapshot, String> {
+fn daemon_status(app: AppHandle, bridge: State<'_, AppBridge>) -> Result<DaemonSnapshot, String> {
     report(&app, bridge.status())
 }
 
@@ -223,9 +284,22 @@ fn create_diagnostics(
 
 #[tauri::command]
 fn repair_daemon(app: AppHandle) -> Result<(), String> {
-    let error = "Der DeviceLane-Dienst ist nicht erreichbar. Bitte führe die Reparatur über den Installer oder `devicelane` aus.".to_owned();
-    notify_error(&app, &error);
-    Err(error)
+    let executable_dir = std::env::current_exe()
+        .map_err(|error| format!("DeviceLane executable cannot be resolved: {error}"))
+        .and_then(|path| {
+            path.parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "DeviceLane executable directory is unavailable".into())
+        });
+    let result = app
+        .path()
+        .resource_dir()
+        .map_err(|error| format!("DeviceLane resources cannot be resolved: {error}"))
+        .and_then(|resources| {
+            executable_dir
+                .and_then(|binaries| run_repair(std::env::consts::OS, &resources, &binaries))
+        });
+    report(&app, result)
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -236,12 +310,7 @@ fn show_main_window(app: &AppHandle) {
 }
 
 pub fn run() {
-    let bridge = DesktopBridge::new(
-        LocalDaemonTransport,
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        log_dir().display().to_string(),
-    );
+    let bridge = DesktopBridge::new(LocalDaemonTransport);
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             show_main_window(app)

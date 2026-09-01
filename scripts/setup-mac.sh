@@ -199,12 +199,19 @@ if [ -n "$DAEMON_MODE" ]; then
     esac
     mkdir -p "$DAEMON_PROGRAM_DIR" "$DAEMON_IDENTITY_DIR" "$DAEMON_STATE_DIR" "$DAEMON_RUNTIME_DIR" "$DAEMON_LOG_DIR" "$(dirname "$DAEMON_PLIST_PATH")"
     chmod 700 "$DAEMON_PROGRAM_DIR" "$DAEMON_IDENTITY_DIR" "$DAEMON_STATE_DIR" "$DAEMON_RUNTIME_DIR" "$DAEMON_LOG_DIR"
-    cd "$ROOT"
-    cargo build --release --bin devicelane-service >/dev/null
+    if [ -n "${DEVICELANE_SERVICE_BINARY:-}" ]; then
+        [ "${DEVICELANE_SERVICE_BINARY#/}" != "$DEVICELANE_SERVICE_BINARY" ] || { echo "bundled service path must be absolute" >&2; exit 1; }
+        [ -f "$DEVICELANE_SERVICE_BINARY" ] && [ ! -L "$DEVICELANE_SERVICE_BINARY" ] || { echo "bundled service is unavailable" >&2; exit 1; }
+        DAEMON_BUILD_PATH=$DEVICELANE_SERVICE_BINARY
+    else
+        cd "$ROOT"
+        cargo build --release --bin devicelane-service >/dev/null
+        DAEMON_BUILD_PATH=target/release/devicelane-service
+    fi
     DAEMON_PROGRAM_STAGE="$DAEMON_PROGRAM_PATH.next"
     DAEMON_PROGRAM_BACKUP="$DAEMON_PROGRAM_PATH.previous"
     DAEMON_PLIST_BACKUP="$DAEMON_PLIST_PATH.previous"
-    install -m 700 target/release/devicelane-service "$DAEMON_PROGRAM_STAGE"
+    install -m 700 "$DAEMON_BUILD_PATH" "$DAEMON_PROGRAM_STAGE"
     DAEMON_PLIST_STAGE="$DAEMON_PLIST_PATH.next"
     DAEMON_PLIST_PROGRAM_PATH=$(printf '%s' "$DAEMON_PROGRAM_PATH" | xml_escape)
     DAEMON_PLIST_IDENTITY_DIR=$(printf '%s' "$DAEMON_IDENTITY_DIR" | xml_escape)

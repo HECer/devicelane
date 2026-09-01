@@ -107,15 +107,26 @@ if ($Mode -eq "service-uninstall") {
     exit 0
 }
 if ($Mode -eq "service-install") {
-    Set-Location $Root
-    cargo build --release --bin devicelane-service
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $BuiltServiceExe = $env:DEVICELANE_SERVICE_BINARY
+    if ([string]::IsNullOrWhiteSpace($BuiltServiceExe)) {
+        Set-Location $Root
+        cargo build --release --bin devicelane-service
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $BuiltServiceExe = (Resolve-Path ".\target\release\devicelane-service.exe").Path
+    } else {
+        $BuiltServiceExe = [System.IO.Path]::GetFullPath($BuiltServiceExe)
+        if (-not [System.IO.Path]::IsPathFullyQualified($BuiltServiceExe) -or -not (Test-Path -LiteralPath $BuiltServiceExe -PathType Leaf)) {
+            throw "Bundled DeviceLane service is unavailable."
+        }
+        if ((Get-Item -LiteralPath $BuiltServiceExe -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "Bundled DeviceLane service must not be a reparse point."
+        }
+    }
     New-Item -ItemType Directory -Force -Path $ServiceDeployDir, $ServiceIdentityDir, $ServiceRuntimeDir, $ServiceLogDir | Out-Null
     $ExistingServiceTask = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
     $ServiceBuildId = [guid]::NewGuid().ToString("N")
     $ServiceExe = Join-Path $ServiceDeployDir "devicelane-service-$ServiceBuildId.exe"
     $ServiceStage = "$ServiceExe.stage"
-    $BuiltServiceExe = (Resolve-Path ".\target\release\devicelane-service.exe").Path
     $ServiceArguments = "--identity `"$ServiceIdentityDir`" --runtime-dir `"$ServiceRuntimeDir`" --log-dir `"$ServiceLogDir`" --role workstation --foreground"
     $ServiceAction = New-ScheduledTaskAction -Execute $ServiceExe -Argument $ServiceArguments
     $ServiceTrigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId

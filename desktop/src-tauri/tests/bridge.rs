@@ -1,7 +1,9 @@
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, LocalProtocolVersion, LocalRequest, LocalResponse,
 };
-use devicelane_desktop::{DaemonTransport, DesktopBridge};
+use devicelane_desktop::{DaemonTransport, DesktopBridge, repair_spec};
+use std::ffi::OsString;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 struct FakeTransport {
@@ -19,6 +21,9 @@ impl DaemonTransport for FakeTransport {
 fn snapshot() -> DaemonSnapshot {
     DaemonSnapshot {
         public_identity: "mac-agent".into(),
+        daemon_version: "0.1.0-service".into(),
+        os: "macOS".into(),
+        architecture: "arm64".into(),
         role: DaemonRole::Agent,
         endpoint: "local".into(),
         connection: ConnectionState::Connected,
@@ -27,6 +32,7 @@ fn snapshot() -> DaemonSnapshot {
         warnings: vec!["warning".into()],
         remote_access_paused: false,
         autostart: true,
+        log_location: "/logs/service.log".into(),
     }
 }
 
@@ -36,16 +42,15 @@ fn status_maps_the_wire_snapshot_to_the_typed_desktop_contract() {
         requests: Arc::new(Mutex::new(vec![])),
         response: LocalResponse::Snapshot(snapshot()),
     };
-    let bridge = DesktopBridge::new(transport, "macOS", "arm64", "/logs/service.log");
+    let bridge = DesktopBridge::new(transport);
 
     let status = bridge.status().unwrap();
 
-    assert_eq!(status.os, "macOS");
-    assert_eq!(status.architecture, "arm64");
-    assert_eq!(status.role, DaemonRole::Agent);
-    assert_eq!(status.connection, ConnectionState::Connected);
-    assert!(status.autostart_enabled);
-    assert_eq!(status.log_location, "/logs/service.log");
+    assert_eq!(status, snapshot());
+    assert_eq!(status.public_identity, "mac-agent");
+    assert_eq!(status.endpoint, "local");
+    assert_eq!(status.remote_protocol, "mesh/1");
+    assert_eq!(status.daemon_version, "0.1.0-service");
 }
 
 #[test]
@@ -55,7 +60,7 @@ fn controls_send_only_versioned_local_ipc_requests() {
         requests: Arc::clone(&requests),
         response: LocalResponse::Acknowledged,
     };
-    let bridge = DesktopBridge::new(transport, "Windows", "x86_64", "logs");
+    let bridge = DesktopBridge::new(transport);
 
     bridge.pause().unwrap();
     bridge.resume().unwrap();
@@ -87,10 +92,44 @@ fn daemon_errors_remain_errors_at_the_command_boundary() {
             message: "wrong user".into(),
         },
     };
-    let bridge = DesktopBridge::new(transport, "Linux", "x86_64", "logs");
+    let bridge = DesktopBridge::new(transport);
 
     assert_eq!(
         bridge.pause().unwrap_err(),
         "daemon error (unauthorized): wrong user"
+    );
+}
+
+#[test]
+fn repair_uses_only_fixed_platform_programs_and_arguments() {
+    let root = Path::new("/trusted/resources");
+    let binaries = Path::new("/trusted/bin");
+    let linux = repair_spec("linux", root, binaries).unwrap();
+    assert_eq!(linux.program, Path::new("/bin/sh"));
+    assert_eq!(
+        linux.arguments,
+        [root.join("scripts/setup-linux.sh"), "--repair".into()]
+    );
+
+    assert_eq!(linux.service_binary, binaries.join("devicelane-service"));
+
+    let windows = repair_spec("windows", root, binaries).unwrap();
+    assert_eq!(
+        windows.program,
+        Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    );
+    let expected: Vec<OsString> = vec![
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-ExecutionPolicy".into(),
+        "Bypass".into(),
+        "-File".into(),
+        root.join("scripts").join("setup-windows.ps1").into(),
+        "--service-repair".into(),
+    ];
+    assert_eq!(windows.arguments, expected);
+    assert_eq!(
+        windows.service_binary,
+        binaries.join("devicelane-service.exe")
     );
 }

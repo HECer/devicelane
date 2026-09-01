@@ -75,6 +75,9 @@ fn run() -> Result<(), String> {
     let state = Arc::new(Mutex::new(DaemonState::new_with_platform_lifecycle(
         DaemonSnapshot {
             public_identity,
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            os: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
             role,
             endpoint: args.listen.clone(),
             connection: ConnectionState::Disconnected,
@@ -83,6 +86,7 @@ fn run() -> Result<(), String> {
             warnings: Vec::new(),
             remote_access_paused: false,
             autostart: platform_autostart_enabled(),
+            log_location: args.log_dir.display().to_string(),
         },
         vec![DiagnosticItem {
             code: "ready".into(),

@@ -4,20 +4,30 @@ export type ConnectionState = "disconnected" | "connecting" | "connected" | "deg
 export type DaemonRole = "workstation" | "agent" | "registry";
 
 export interface DaemonSnapshot {
-  protocol: { major: number; minor: number };
-  daemonVersion: string;
+  public_identity: string;
+  daemon_version: string;
   os: string;
   architecture: string;
   role: DaemonRole;
+  endpoint: string;
   connection: ConnectionState;
-  paused: boolean;
-  autostartEnabled: boolean;
+  local_protocol: { major: number; minor: number };
+  remote_protocol: string;
   warnings: string[];
-  logLocation: string;
+  remote_access_paused: boolean;
+  autostart: boolean;
+  log_location: string;
+}
+
+export interface DiagnosticItem {
+  code: string;
+  message: string;
+  healthy: boolean;
 }
 
 export interface DiagnosticsResult {
   path: string;
+  items: DiagnosticItem[];
 }
 
 export interface DaemonClient {

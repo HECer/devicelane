@@ -91,6 +91,9 @@ use std::process::Command;
 fn snapshot() -> DaemonSnapshot {
     DaemonSnapshot {
         public_identity: "sha256:public-fingerprint".into(),
+        daemon_version: "0.1.0".into(),
+        os: "test-os".into(),
+        architecture: "test-arch".into(),
         role: DaemonRole::Workstation,
         endpoint: "local://devicelane".into(),
         connection: ConnectionState::Connected,
@@ -99,6 +102,7 @@ fn snapshot() -> DaemonSnapshot {
         warnings: vec!["certificate expires soon".into()],
         remote_access_paused: false,
         autostart: false,
+        log_location: "/logs".into(),
     }
 }
 

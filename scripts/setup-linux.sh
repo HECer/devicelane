@@ -123,13 +123,20 @@ validate_systemd_path "$LOG_DIR"
 validate_systemd_path "$UNIT_PATH"
 mkdir -p "$PROGRAM_DIR" "$IDENTITY_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$UNIT_DIR"
 chmod 700 "$PROGRAM_DIR" "$IDENTITY_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$UNIT_DIR"
-cd "$ROOT"
-cargo build --release --bin devicelane-service
+if [ -n "${DEVICELANE_SERVICE_BINARY:-}" ]; then
+    case "$DEVICELANE_SERVICE_BINARY" in /*) ;; *) echo "bundled service path must be absolute" >&2; exit 1 ;; esac
+    [ -f "$DEVICELANE_SERVICE_BINARY" ] && [ ! -L "$DEVICELANE_SERVICE_BINARY" ] || { echo "bundled service is unavailable" >&2; exit 1; }
+    SERVICE_BUILD_PATH=$DEVICELANE_SERVICE_BINARY
+else
+    cd "$ROOT"
+    cargo build --release --bin devicelane-service
+    SERVICE_BUILD_PATH=target/release/devicelane-service
+fi
 BINARY_STAGE="$SERVICE_PATH.next"
 BINARY_BACKUP="$SERVICE_PATH.previous"
 UNIT_STAGE="$UNIT_PATH.next"
 UNIT_BACKUP="$UNIT_PATH.previous"
-install -m 700 target/release/devicelane-service "$BINARY_STAGE"
+install -m 700 "$SERVICE_BUILD_PATH" "$BINARY_STAGE"
 trap 'rm -f "$BINARY_STAGE" "$UNIT_STAGE"' EXIT HUP INT TERM
 cat >"$UNIT_STAGE" <<EOF
 [Unit]

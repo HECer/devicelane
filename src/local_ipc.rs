@@ -85,6 +85,9 @@ pub enum LocalResponse {
 #[serde(deny_unknown_fields)]
 pub struct DaemonSnapshot {
     pub public_identity: String,
+    pub daemon_version: String,
+    pub os: String,
+    pub architecture: String,
     pub role: DaemonRole,
     pub endpoint: String,
     pub connection: ConnectionState,
@@ -93,6 +96,7 @@ pub struct DaemonSnapshot {
     pub warnings: Vec<String>,
     pub remote_access_paused: bool,
     pub autostart: bool,
+    pub log_location: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

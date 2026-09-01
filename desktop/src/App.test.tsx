@@ -5,26 +5,32 @@ import { App } from "./App";
 import type { DaemonClient, DaemonSnapshot } from "./api";
 
 const connected: DaemonSnapshot = {
-  protocol: { major: 1, minor: 0 },
-  daemonVersion: "0.1.0",
+  public_identity: "mac-agent",
+  endpoint: "local",
+  local_protocol: { major: 1, minor: 0 },
+  remote_protocol: "mesh/1",
+  daemon_version: "0.1.0-service",
   os: "macOS",
   architecture: "arm64",
   role: "agent",
   connection: "connected",
-  paused: false,
-  autostartEnabled: true,
+  remote_access_paused: false,
+  autostart: true,
   warnings: ["Xcode license requires confirmation"],
-  logLocation: "/Users/hecer/Library/Logs/DeviceLane/service.log"
+  log_location: "/Users/hecer/Library/Logs/DeviceLane/service.log"
 };
 
 function fakeClient(overrides: Partial<DaemonClient> = {}): DaemonClient {
   let state = { ...connected };
   const client: DaemonClient = {
     status: vi.fn(() => Promise.resolve({ ...state })),
-    pause: vi.fn(() => { state = { ...state, paused: true }; return Promise.resolve(); }),
-    resume: vi.fn(() => { state = { ...state, paused: false }; return Promise.resolve(); }),
-    setAutostart: vi.fn((enabled) => { state = { ...state, autostartEnabled: enabled }; return Promise.resolve(); }),
-    diagnostics: vi.fn().mockResolvedValue({ path: "/tmp/devicelane-diagnostics" }),
+    pause: vi.fn(() => { state = { ...state, remote_access_paused: true }; return Promise.resolve(); }),
+    resume: vi.fn(() => { state = { ...state, remote_access_paused: false }; return Promise.resolve(); }),
+    setAutostart: vi.fn((enabled) => { state = { ...state, autostart: enabled }; return Promise.resolve(); }),
+    diagnostics: vi.fn().mockResolvedValue({
+      path: "/tmp/devicelane-diagnostics",
+      items: [{ code: "ready", message: "Lokaler Dienst ist bereit", healthy: true }]
+    }),
     repair: vi.fn().mockResolvedValue(undefined),
     ...overrides
   };
@@ -58,6 +64,19 @@ describe("DeviceLane desktop foundation", () => {
     await user.click(screen.getByRole("button", { name: "Diagnosepaket erstellen" }));
     expect(client.diagnostics).toHaveBeenCalledOnce();
     expect(await screen.findByText("/tmp/devicelane-diagnostics")).toBeVisible();
+    expect(screen.getByText("Lokaler Dienst ist bereit")).toBeVisible();
+  });
+
+  it("refreshes daemon state after a failed control action", async () => {
+    const user = userEvent.setup();
+    const status = vi.fn().mockResolvedValue(connected);
+    const client = fakeClient({ status, pause: vi.fn().mockRejectedValue(new Error("denied")) });
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole("button", { name: "Remotezugriff pausieren" }));
+
+    expect(status).toHaveBeenCalledTimes(2);
+    expect(screen.getAllByText("Verbunden")).toHaveLength(2);
   });
 
   it("offers repair when the daemon cannot be reached", async () => {
