@@ -64,7 +64,7 @@ fn bootstrap_assets_define_idempotent_setup_and_real_hardware_gates() {
     assert!(windows.contains("$StagedRegistryExe"));
     assert!(windows.contains("Copy-Item"));
     assert!(windows.contains("Register-ScheduledTask") && windows.contains("-Force"));
-    assert_eq!(windows.matches("Unregister-ScheduledTask").count(), 1);
+    assert_eq!(windows.matches("Unregister-ScheduledTask").count(), 2);
     assert!(windows.contains("-lt 1") && windows.contains("-gt 65535"));
     assert!(windows.contains("new DeviceLane controller task did not remain running"));
     assert!(windows.contains("$Value.Replace(\"'\", \"''\")"));
@@ -170,7 +170,7 @@ fn windows_controller_install_requires_every_public_runtime_argument_before_buil
 
 #[cfg(windows)]
 #[test]
-fn windows_controller_activation_restores_the_old_definition_after_new_start_failure() {
+fn windows_controller_activation_restores_old_even_when_health_and_cleanup_fail() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = root.join("scripts/setup-windows.ps1");
     let harness = r#"
@@ -189,18 +189,26 @@ Invoke-Expression $definition.Extent.Text
 $script:events = [System.Collections.Generic.List[string]]::new()
 $script:current = 'old-definition'
 $script:state = 'Running'
+$script:healthChecks = 0
 $oldTask = [pscustomobject]@{ Definition = 'old-definition' }
 $operations = @{
     StageBinary = { $script:events.Add('stage-binary') }
     StopOld = { $script:events.Add('stop-old'); $script:state = 'Ready' }
     ActivateBinary = { $script:events.Add('activate-binary') }
     RegisterNew = { $script:events.Add('register-new'); $script:current = 'new-definition' }
-    StartNew = { $script:events.Add('start-new'); throw 'simulated new start failure' }
-    GetState = { $script:state }
+    StartNew = { $script:events.Add('start-new'); $script:state = 'Running' }
+    GetState = {
+        $script:healthChecks++
+        if ($script:healthChecks -eq 1) { $script:events.Add('health-throws'); throw 'simulated health failure' }
+        $script:events.Add('health-old'); $script:state
+    }
+    StopFailedNew = { $script:events.Add('stop-new'); $script:state = 'Ready' }
+    UnregisterFailedNew = { $script:events.Add('unregister-new'); $script:current = 'absent' }
+    VerifyAbsent = { throw 'unexpected absent verification during repair' }
     RestoreOld = { param($task); $script:events.Add("restore-$($task.Definition)"); $script:current = $task.Definition }
     StartOld = { $script:events.Add('start-old'); $script:state = 'Running' }
     CleanupStage = { $script:events.Add('cleanup-stage') }
-    CleanupFailedVersion = { $script:events.Add('cleanup-failed-version') }
+    CleanupFailedVersion = { $script:events.Add('cleanup-failed-version'); throw 'simulated cleanup failure' }
 }
 try {
     Invoke-ControllerActivation -ExistingTask $oldTask -Operations $operations
@@ -210,7 +218,7 @@ try {
 }
 if ($script:current -ne 'old-definition') { throw "old definition was not restored: current=$script:current events=$($script:events -join ',')" }
 if ($script:state -ne 'Running') { throw 'old task was not restarted and verified' }
-$expected = 'stage-binary,stop-old,activate-binary,register-new,start-new,cleanup-stage,cleanup-failed-version,restore-old-definition,start-old'
+$expected = 'stage-binary,stop-old,activate-binary,register-new,start-new,health-throws,stop-new,unregister-new,restore-old-definition,start-old,health-old,cleanup-stage,cleanup-failed-version'
 if (($script:events -join ',') -ne $expected) {
     throw "unexpected rollback sequence: $($script:events -join ',')"
 }
@@ -228,4 +236,60 @@ if (($script:events -join ',') -ne $expected) {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("rollback verified"));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_controller_failed_fresh_activation_leaves_no_task_or_binary() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("scripts/setup-windows.ps1");
+    let harness = r#"
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $env:DEVICELANE_SETUP_SCRIPT, [ref]$null, [ref]$null)
+$definition = $ast.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Invoke-ControllerActivation'
+}, $true)
+if ($null -eq $definition) { throw 'Invoke-ControllerActivation not found' }
+Invoke-Expression $definition.Extent.Text
+$script:events = [System.Collections.Generic.List[string]]::new()
+$script:task = 'absent'
+$operations = @{
+    StageBinary = { $script:events.Add('stage-binary') }
+    StopOld = { throw 'fresh install must not stop an old task' }
+    ActivateBinary = { $script:events.Add('activate-binary') }
+    RegisterNew = { $script:events.Add('register-new'); $script:task = 'new' }
+    StartNew = { $script:events.Add('start-new'); throw 'simulated fresh start failure' }
+    GetState = { 'Ready' }
+    StopFailedNew = { $script:events.Add('stop-new') }
+    UnregisterFailedNew = { $script:events.Add('unregister-new'); $script:task = 'absent' }
+    VerifyAbsent = { $script:events.Add('verify-absent'); if ($script:task -ne 'absent') { throw 'task remains' } }
+    RestoreOld = { throw 'fresh install must not restore an old task' }
+    StartOld = { throw 'fresh install must not start an old task' }
+    CleanupStage = { $script:events.Add('cleanup-stage') }
+    CleanupFailedVersion = { $script:events.Add('delete-failed-binary') }
+}
+try {
+    Invoke-ControllerActivation -ExistingTask $null -Operations $operations
+    throw 'activation unexpectedly succeeded'
+} catch {
+    if ($_.Exception.Message -eq 'activation unexpectedly succeeded') { throw }
+}
+if ($script:task -ne 'absent') { throw 'failed fresh task remains registered' }
+$expected = 'stage-binary,activate-binary,register-new,start-new,stop-new,unregister-new,verify-absent,cleanup-stage,delete-failed-binary'
+if (($script:events -join ',') -ne $expected) { throw "unexpected fresh rollback: $($script:events -join ',')" }
+"fresh rollback verified"
+"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", harness])
+        .env("DEVICELANE_SETUP_SCRIPT", script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fresh rollback verified"));
 }

@@ -89,6 +89,7 @@ function Assert-CurrentUserTask($Task) {
 }
 
 function Invoke-ControllerActivation($ExistingTask, $Operations) {
+    $NewRegistered = $false
     try {
         & ($Operations["StageBinary"])
         if ($null -ne $ExistingTask) {
@@ -96,20 +97,35 @@ function Invoke-ControllerActivation($ExistingTask, $Operations) {
         }
         & ($Operations["ActivateBinary"])
         & ($Operations["RegisterNew"])
+        $NewRegistered = $true
         & ($Operations["StartNew"])
         if ((& ($Operations["GetState"])) -ne "Running") {
             throw "new DeviceLane controller task did not remain running"
         }
     } catch {
         $ActivationError = $_
-        & ($Operations["CleanupStage"])
-        & ($Operations["CleanupFailedVersion"])
+        $RollbackErrors = [System.Collections.Generic.List[string]]::new()
+        if ($NewRegistered) {
+            try { & ($Operations["StopFailedNew"]) } catch { $RollbackErrors.Add("stop failed task: $_") }
+            try { & ($Operations["UnregisterFailedNew"]) } catch { $RollbackErrors.Add("unregister failed task: $_") }
+        }
         if ($null -ne $ExistingTask) {
-            & ($Operations["RestoreOld"]) $ExistingTask
-            & ($Operations["StartOld"])
-            if ((& ($Operations["GetState"])) -ne "Running") {
-                throw "new controller failed and the previous controller could not be restored: $ActivationError"
+            try { & ($Operations["RestoreOld"]) $ExistingTask } catch { $RollbackErrors.Add("restore previous definition: $_") }
+            try { & ($Operations["StartOld"]) } catch { $RollbackErrors.Add("restart previous task: $_") }
+            try {
+                if ((& ($Operations["GetState"])) -ne "Running") {
+                    $RollbackErrors.Add("previous task did not return to Running")
+                }
+            } catch {
+                $RollbackErrors.Add("verify previous task: $_")
             }
+        } else {
+            try { & ($Operations["VerifyAbsent"]) } catch { $RollbackErrors.Add("verify failed task removal: $_") }
+        }
+        try { & ($Operations["CleanupStage"]) } catch { $RollbackErrors.Add("clean staged binary: $_") }
+        try { & ($Operations["CleanupFailedVersion"]) } catch { $RollbackErrors.Add("clean failed binary: $_") }
+        if ($RollbackErrors.Count -gt 0) {
+            Write-Warning "controller activation failed; rollback issues: $($RollbackErrors -join '; ')"
         }
         throw $ActivationError
     }
@@ -182,6 +198,9 @@ $Operations = @{
     RegisterNew = { Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Description "Per-user DeviceLane registry controller" -Force | Out-Null }
     StartNew = { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop; Start-Sleep -Milliseconds 500 }
     GetState = { (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop).State.ToString() }
+    StopFailedNew = { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+    UnregisterFailedNew = { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop }
+    VerifyAbsent = { if ($null -ne (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) { throw "failed DeviceLane task remains registered" } }
     RestoreOld = { param($OldTask); Register-ScheduledTask -InputObject $OldTask -TaskName $TaskName -Force | Out-Null }
     StartOld = { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop; Start-Sleep -Milliseconds 500 }
     CleanupStage = { if (Test-Path -LiteralPath $StagedRegistryExe) { Remove-Item -LiteralPath $StagedRegistryExe -Force } }
