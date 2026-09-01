@@ -4,6 +4,10 @@ $CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $CurrentUserSid = $CurrentIdentity.User.Value
 $UserId = $CurrentIdentity.Name
 $TaskName = "DeviceLane Registry-$CurrentUserSid"
+$Root = Split-Path -Parent $PSScriptRoot
+$DeployDir = Join-Path $env:LOCALAPPDATA "DeviceLane\registry\bin"
+$DeployedRegistryExe = Join-Path $DeployDir "mesh-registry.exe"
+$LegacyRegistryExe = Join-Path $Root "target\debug\mesh-registry.exe"
 $Mode = "bootstrap"
 $AgentPeer = $null
 $ListenAddress = $null
@@ -50,6 +54,27 @@ if ($Mode -eq "install") {
             throw "--controller-install requires explicit $($RequiredOption.Name)"
         }
     }
+    if ($AgentPeer -notmatch "^[A-Za-z0-9._:-]+$") { throw "invalid --agent-peer value" }
+    if ($ListenAddress -notmatch "^[A-Za-z0-9.:[\]-]+:(?<port>[0-9]+)$") { throw "invalid --controller-listen value" }
+    $ListenPort = 0
+    if (-not [int]::TryParse($Matches.port, [ref]$ListenPort) -or $ListenPort -lt 1 -or $ListenPort -gt 65535) {
+        throw "--controller-listen port must be between 1 and 65535"
+    }
+}
+
+function Assert-CurrentUserTask($Task) {
+    if ($Task.Principal.UserId -ine $UserId) {
+        throw "refusing to manage a DeviceLane task owned by another user"
+    }
+    if ([System.IO.Path]::GetFileName($Task.Actions[0].Execute) -ine "powershell.exe") {
+        throw "refusing to manage a DeviceLane task with an unexpected action"
+    }
+    $Arguments = [string]$Task.Actions[0].Arguments
+    $OwnsDeployedPath = $Arguments.IndexOf($DeployedRegistryExe, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    $OwnsLegacyPath = $Arguments.IndexOf($LegacyRegistryExe, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    if (-not ($OwnsDeployedPath -or $OwnsLegacyPath)) {
+        throw "refusing to manage a DeviceLane task outside this user's deployment"
+    }
 }
 
 if ($Mode -eq "status") {
@@ -58,6 +83,7 @@ if ($Mode -eq "status") {
         Write-Output "DeviceLane controller is not installed."
         exit 1
     }
+    Assert-CurrentUserTask $Task
     $Info = Get-ScheduledTaskInfo -TaskName $TaskName
     [pscustomobject]@{
         TaskName = $Task.TaskName
@@ -73,6 +99,7 @@ if ($Mode -eq "status") {
 if ($Mode -eq "uninstall") {
     $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($null -ne $Task) {
+        Assert-CurrentUserTask $Task
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
@@ -80,7 +107,6 @@ if ($Mode -eq "uninstall") {
     exit 0
 }
 
-$Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 New-Item -ItemType Directory -Force -Path ".mesh\registry", ".mesh\agent", ".mesh\cli", ".mesh\workspaces" | Out-Null
 cargo build --workspace
@@ -89,18 +115,17 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 if ($Mode -ne "install") { exit 0 }
-if ($AgentPeer -notmatch "^[A-Za-z0-9._:-]+$") { throw "invalid --agent-peer value" }
-if ($ListenAddress -notmatch "^[A-Za-z0-9.:[\]-]+:[0-9]+$") { throw "invalid --controller-listen value" }
 
-New-Item -ItemType Directory -Force -Path $IdentityDir, $LogDir | Out-Null
-$RegistryExe = (Resolve-Path ".\target\debug\mesh-registry.exe").Path
+New-Item -ItemType Directory -Force -Path $IdentityDir, $LogDir, $DeployDir | Out-Null
+$StagedRegistryExe = Join-Path $DeployDir ("mesh-registry.stage-{0}.exe" -f [guid]::NewGuid().ToString("N"))
+Copy-Item -LiteralPath (Resolve-Path ".\target\debug\mesh-registry.exe").Path -Destination $StagedRegistryExe
 $RegistryLog = Join-Path $LogDir "registry.log"
 
 function ConvertTo-PowerShellLiteral([string]$Value) {
     return "'" + $Value.Replace("'", "''") + "'"
 }
 
-$RegistryCommand = "& $(ConvertTo-PowerShellLiteral $RegistryExe) --listen $(ConvertTo-PowerShellLiteral $ListenAddress) --identity $(ConvertTo-PowerShellLiteral $IdentityDir) --offline-after-ms 5000 --agent-peer $(ConvertTo-PowerShellLiteral $AgentPeer) *>> $(ConvertTo-PowerShellLiteral $RegistryLog)"
+$RegistryCommand = "& $(ConvertTo-PowerShellLiteral $DeployedRegistryExe) --listen $(ConvertTo-PowerShellLiteral $ListenAddress) --identity $(ConvertTo-PowerShellLiteral $IdentityDir) --offline-after-ms 5000 --agent-peer $(ConvertTo-PowerShellLiteral $AgentPeer) *>> $(ConvertTo-PowerShellLiteral $RegistryLog)"
 $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -Command `"$RegistryCommand`""
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
 $Principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
@@ -108,11 +133,25 @@ $Settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-T
 
 $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($null -ne $ExistingTask) {
+    Assert-CurrentUserTask $ExistingTask
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Description "Per-user DeviceLane registry controller" | Out-Null
-Start-ScheduledTask -TaskName $TaskName
+try {
+    Move-Item -LiteralPath $StagedRegistryExe -Destination $DeployedRegistryExe -Force
+    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Description "Per-user DeviceLane registry controller" -Force | Out-Null
+    Start-ScheduledTask -TaskName $TaskName
+    Start-Sleep -Milliseconds 500
+    $StartedTask = Get-ScheduledTask -TaskName $TaskName
+    Assert-CurrentUserTask $StartedTask
+    if ($StartedTask.State -ne "Running") {
+        throw "DeviceLane controller failed to remain running; inspect $RegistryLog"
+    }
+} catch {
+    if ($null -ne $ExistingTask) {
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    }
+    throw
+}
 Write-Output "DeviceLane controller installed or repaired for $UserId."
 Write-Output "Identity: $IdentityDir"
 Write-Output "Logs: $LogDir"

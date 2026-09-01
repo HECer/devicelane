@@ -149,10 +149,12 @@ explicit agent peer ID printed by the Mac installer:
 ```
 
 Installation and repair require explicit `--agent-peer`, `--controller-listen`,
-`--controller-identity`, and `--controller-log-dir` values. The Scheduled Task contains only
-the registry executable and public runtime arguments; private keys and pairing secrets remain
-in the identity directory. Re-running `--controller-install` repairs the current user's task
-idempotently. Uninstall removes only that user's task and preserves identity and logs.
+`--controller-identity`, and `--controller-log-dir` values. The Scheduled Task launches a
+PowerShell logging wrapper whose command contains only the deployed registry path and public
+runtime arguments; private keys and pairing secrets remain in the identity directory. A repair
+builds and stages a new per-user binary before briefly stopping and replacing the running
+controller. Re-running `--controller-install` repairs the current user's task idempotently.
+Uninstall removes only that user's task and preserves the deployed binary, identity, and logs.
 
 Do not expose the registry to the public Internet. Permit inbound TCP `7443` in Windows
 Firewall only from trusted private LAN subnets or VPN peers; keep the firewall rule disabled

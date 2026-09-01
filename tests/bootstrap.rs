@@ -57,7 +57,31 @@ fn bootstrap_assets_define_idempotent_setup_and_real_hardware_gates() {
     assert!(windows.contains("$CurrentUserSid"));
     assert!(windows.contains("DeviceLane Registry-$CurrentUserSid"));
     assert!(windows.contains("New-ScheduledTaskPrincipal -UserId $UserId"));
-    assert!(windows.matches("Unregister-ScheduledTask").count() >= 2);
+    assert!(windows.contains("Assert-CurrentUserTask"));
+    assert!(windows.contains("$Task.Principal.UserId"));
+    assert!(windows.contains("$Task.Actions[0].Execute"));
+    assert!(windows.contains("$DeployedRegistryExe"));
+    assert!(windows.contains("$StagedRegistryExe"));
+    assert!(windows.contains("Copy-Item"));
+    assert!(windows.contains("Register-ScheduledTask") && windows.contains("-Force"));
+    assert_eq!(windows.matches("Unregister-ScheduledTask").count(), 1);
+    assert!(windows.contains("-lt 1") && windows.contains("-gt 65535"));
+    assert!(windows.contains("State -ne \"Running\""));
+    assert!(windows.contains("$Value.Replace(\"'\", \"''\")"));
+    let task_command = windows
+        .lines()
+        .find(|line| line.starts_with("$RegistryCommand ="))
+        .unwrap();
+    for public_argument in ["--listen", "--identity", "--agent-peer"] {
+        assert!(task_command.contains(public_argument));
+    }
+    assert!(!task_command.to_ascii_lowercase().contains("secret"));
+    assert!(!task_command.to_ascii_lowercase().contains("private-key"));
+    let build = windows.find("cargo build --workspace").unwrap();
+    let install = &windows[build..];
+    let stage = install.find("$StagedRegistryExe").unwrap();
+    let stop = install.find("Stop-ScheduledTask").unwrap();
+    assert!(stage < stop);
     assert!(!windows.contains("Remove-Item"));
     assert!(mac.contains("mkdir -p"));
     assert!(smoke.contains("cargo test --test bootstrap"));
@@ -76,13 +100,14 @@ fn bootstrap_assets_define_idempotent_setup_and_real_hardware_gates() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn windows_controller_install_requires_every_public_runtime_argument_before_building() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = root.join("scripts/setup-windows.ps1");
     let data = tempfile::tempdir().unwrap();
-    let identity = data.path().join("identity");
-    let logs = data.path().join("logs");
+    let identity = data.path().join("identity dir's");
+    let logs = data.path().join("log dir's");
     let required = [
         ("--agent-peer", "mac-agent-1"),
         ("--controller-listen", "127.0.0.1:7443"),
@@ -112,6 +137,34 @@ fn windows_controller_install_requires_every_public_runtime_argument_before_buil
         assert!(
             stderr.contains(&format!("requires explicit {missing}")),
             "unexpected error for missing {missing}: {stderr}"
+        );
+    }
+
+    for port in ["0", "65536"] {
+        let listen = format!("127.0.0.1:{port}");
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&script)
+            .args([
+                "--controller-install",
+                "--agent-peer",
+                "mac-agent-1",
+                "--controller-listen",
+                &listen,
+                "--controller-identity",
+                identity.to_str().unwrap(),
+                "--controller-log-dir",
+                logs.to_str().unwrap(),
+            ])
+            .env("LOCALAPPDATA", data.path())
+            .env("PATH", "")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "install accepted port {port}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("port must be between 1 and 65535"),
+            "unexpected error for port {port}: {stderr}"
         );
     }
 }
