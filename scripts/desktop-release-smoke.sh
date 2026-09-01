@@ -79,7 +79,12 @@ if [ "${1:-}" = --exercise-lifecycle ]; then
   Linux)
    appimage=$(resolve_one "$DEVICELANE_DESKTOP_ARTIFACT" '*.AppImage'); deb=$(resolve_one "$DEVICELANE_DESKTOP_ARTIFACT" '*.deb'); appimage_root="$DEVICELANE_SMOKE_ROOT/appimage"; deb_root="$DEVICELANE_SMOKE_ROOT/deb"; mkdir -p "$appimage_root" "$deb_root"
    (cd "$appimage_root" && chmod 700 "$appimage" && "$appimage" --appimage-extract >/dev/null); dpkg-deb -x "$deb" "$deb_root"; probe_linux_layout "$appimage_root/squashfs-root" appimage; probe_linux_layout "$deb_root" deb
-   if [ "${DEVICELANE_ALLOW_DPKG_SMOKE:-0}" = 1 ]; then deb_package=$(dpkg-deb -f "$deb" Package); sudo dpkg -i "$deb"; deb_installed=true; dpkg-query -W "$deb_package" >/dev/null; sudo dpkg -r "$deb_package"; deb_installed=false; fi ;;
+   if [ "${DEVICELANE_ALLOW_DPKG_SMOKE:-0}" = 1 ]; then
+    [ "${DEVICELANE_HOSTED_CI:-0}" = 1 ] && [ "${GITHUB_ACTIONS:-false}" = true ] || { echo "dpkg smoke is restricted to hosted CI" >&2; exit 1; }
+    deb_package=$(dpkg-deb -f "$deb" Package)
+    if dpkg-query -W "$deb_package" >/dev/null 2>&1; then echo "refusing dpkg smoke because package is already installed" >&2; exit 1; fi
+    deb_installed=true; sudo dpkg -i "$deb"; dpkg-query -W "$deb_package" >/dev/null; sudo dpkg -r "$deb_package"; deb_installed=false
+   fi ;;
   *) echo "unsupported smoke platform" >&2; exit 1 ;; esac
 fi
 echo "DeviceLane native DMG/AppImage/deb install/launch/status/repair/logs/autostart/uninstall identity smoke passed."

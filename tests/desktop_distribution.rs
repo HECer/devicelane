@@ -417,3 +417,77 @@ fn linux_lifecycle_adapter_self_test_executes() {
             .contains("Linux lifecycle adapter self-test passed")
     );
 }
+
+#[test]
+fn apple_secrets_follow_a_complete_unsigned_app_build_and_only_wrap_native_tools() {
+    let workflow = read(".github/workflows/desktop-release.yml");
+    let mac = workflow
+        .split("production-macos:")
+        .nth(1)
+        .unwrap()
+        .split("production-linux:")
+        .next()
+        .unwrap();
+    let unsigned = mac.find("Unsigned complete Tauri app build").unwrap();
+    let validation = mac.find("Validate unsigned app payload").unwrap();
+    let first_secret = mac.find("secrets.APPLE_").unwrap();
+    assert!(unsigned < validation && validation < first_secret);
+    let credential_step = mac
+        .split("Native Apple signing, DMG, and notarization")
+        .nth(1)
+        .unwrap()
+        .split("Validate notarized native artifact")
+        .next()
+        .unwrap();
+    for forbidden in ["npm ", "cargo ", "cargo install", "beforeBuildCommand"] {
+        assert!(
+            !credential_step.contains(forbidden),
+            "credential step runs build hook: {}",
+            forbidden
+        );
+    }
+    for required in [
+        "codesign",
+        "hdiutil create",
+        "notarytool submit",
+        "stapler staple",
+    ] {
+        assert!(
+            credential_step.contains(required),
+            "missing isolated Apple command: {}",
+            required
+        );
+    }
+    assert!(credential_step.contains("original_keychains"));
+    assert!(credential_step.contains("security delete-keychain"));
+    assert!(credential_step.contains("rm -f \"$p12\""));
+    assert!(credential_step.contains("trap cleanup EXIT"));
+}
+
+#[test]
+fn oidc_is_confined_to_a_hook_free_attestation_job() {
+    let workflow = read(".github/workflows/desktop-release.yml");
+    assert!(workflow.contains("permissions: { contents: read, id-token: none }"));
+    let attest = workflow.split("production-attest:").nth(1).unwrap();
+    assert!(attest.contains("id-token: write"));
+    for forbidden in ["npm ", "cargo ", "tauri build", "run: sh scripts/"] {
+        assert!(
+            !attest.contains(forbidden),
+            "attestation job contains build hook: {}",
+            forbidden
+        );
+    }
+    let before_attest = workflow.split("production-attest:").next().unwrap();
+    assert!(!before_attest.contains("id-token: write"));
+}
+
+#[test]
+fn xattrs_are_root_relative_and_dpkg_is_hosted_and_non_destructive() {
+    let comparison = read("scripts/compare-native-payloads.sh");
+    let smoke = read("scripts/desktop-release-smoke.sh");
+    assert!(!comparison.contains("--absolute-names"));
+    assert!(comparison.contains("(cd \"$tree\""));
+    assert!(smoke.contains("DEVICELANE_HOSTED_CI"));
+    assert!(smoke.contains("GITHUB_ACTIONS"));
+    assert!(smoke.contains("refusing dpkg smoke because package is already installed"));
+}

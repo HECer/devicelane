@@ -135,6 +135,14 @@ temporary certificate and PFX. Linux package smoke tests exercise the packaged l
 an isolated home/runtime with a process-backed systemd adapter and perform real `dpkg` install and
 uninstall transactions on the hosted runner.
 
+On macOS, the complete Tauri application and all build hooks finish without Apple credentials. The
+validated `.app` is then processed only by native `codesign`, `hdiutil`, `notarytool`, and `stapler`
+commands. Its temporary keychain is removed and the prior keychain search list restored before any
+smoke or SBOM step. Build jobs have no OIDC token permission; a separate protected attestation job
+receives only the already checked artifact digests and holds the minimal short-lived OIDC grant.
+Real deb transactions additionally require the hosted-CI gate and refuse to alter an already
+installed package.
+
 ### Build from source
 
 The examples use port `7443` for normal mutual-TLS traffic and temporary ports `7444`/`7445` for initial pairing. Replace `CONTROLLER_HOST` with a private DNS name or LAN/VPN address reachable from the other host.

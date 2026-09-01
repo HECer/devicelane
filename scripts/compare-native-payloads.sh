@@ -50,7 +50,7 @@ manifest() {
     if [ "$(uname -s)" = Darwin ]; then
       mode=$(stat -f '%Lp' "$path"); xattr=$(xattr -l "$path" 2>/dev/null | shasum -a 256 | cut -d' ' -f1)
     else
-      mode=$(stat -c '%a' "$path"); xattr=$(getfattr -d -m- --absolute-names "$path" 2>/dev/null | sha256sum | cut -d' ' -f1)
+      mode=$(stat -c '%a' "$path"); xattr=$(getfattr -d -m- "$path" 2>/dev/null | sha256sum | cut -d' ' -f1)
     fi
     printf '%s type=%s mode=%s link=%s xattr=%s hash=%s\n' "$path" "$type" "$mode" "$link" "$xattr" "$hash"
   done) > "$output"

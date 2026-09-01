@@ -19,6 +19,9 @@
 - Isolated production credentials per platform and signing step, bound Windows signing to the
   approved certificate identity, extended reproducibility checks to file-system security metadata,
   and replaced simulated Linux lifecycle markers with packaged-script and real deb transactions.
+- Split Apple packaging into a credential-free Tauri build and isolated native signing/notarization
+  phase, confined OIDC to a hook-free digest-attestation job, and made xattr/deb smoke handling
+  root-relative and non-destructive.
 
 ## 0.1.0 — 2026-07-31
 

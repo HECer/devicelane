@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       production: { description: Build signed production artifacts, required: true, type: boolean, default: false }
-permissions: { contents: read, id-token: write }
+permissions: { contents: read, id-token: none }
 
 env:
   CARGO_INCREMENTAL: '0'
@@ -69,7 +69,7 @@ jobs:
       - name: Native artifact first-run smoke
         if: runner.os != 'Windows'
         shell: bash
-        env: { DEVICELANE_ALLOW_DPKG_SMOKE: '1' }
+        env: { DEVICELANE_ALLOW_DPKG_SMOKE: '1', DEVICELANE_HOSTED_CI: '1' }
         run: DEVICELANE_DESKTOP_ARTIFACT="$RUNNER_TEMP/repro-build-b/release/bundle" sh scripts/desktop-release-smoke.sh --exercise-lifecycle
       - name: Build evidence, SBOM, and checksums
         shell: bash
@@ -101,7 +101,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 22.20.0, cache: npm, cache-dependency-path: desktop/package-lock.json }
-      - uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
       - name: Linux prerequisites
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y attr libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
@@ -232,7 +231,6 @@ jobs:
           find . -name '*.cdx.json' -type f -print0 | while IFS= read -r -d '' file; do rel=${file#./}; dest="desktop-dist/SBOM/$rel"; test ! -e "$dest" || { echo 'artifact path collision' >&2; exit 1; }; mkdir -p "$(dirname "$dest")"; cp "$file" "$dest"; done
           (cd target/release/bundle && find . -type f -print0 | while IFS= read -r -d '' file; do test ! -e "$GITHUB_WORKSPACE/desktop-dist/artifacts/$file" || { echo 'artifact path collision' >&2; exit 1; }; cp --parents "$file" "$GITHUB_WORKSPACE/desktop-dist/artifacts"; done)
           cd desktop-dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
-          cosign sign-blob --yes --bundle SHA256SUMS.sigstore SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: 'production-${{ runner.os }}', path: desktop-dist, if-no-files-found: error }
 
@@ -251,7 +249,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 22.20.0, cache: npm, cache-dependency-path: desktop/package-lock.json }
-      - uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
       - name: Locked dependencies and native clients
         run: npm ci --prefix desktop && cargo build --release --locked --workspace
       - name: Verify pinned production environment
@@ -262,37 +259,54 @@ jobs:
           test "$actual_xcode" = "$DEVICELANE_EXPECTED_XCODE" && test "$actual_sdk" = "$DEVICELANE_EXPECTED_APPLE_SDK"
           printf 'ImageOS=%s\nImageVersion=%s\nXcode=%s\nAppleSDK=%s\n' "$ImageOS" "$ImageVersion" "$actual_xcode" "$actual_sdk" > "$RUNNER_TEMP/devicelane-native-inputs.txt"
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
-      - name: Import Apple identity
+      - name: Unsigned complete Tauri app build
+        working-directory: desktop
+        run: npm exec tauri build -- --no-sign --bundles app -- --locked
+      - name: Validate unsigned app payload
+        shell: bash
+        run: |
+          mapfile -t apps < <(find target/release/bundle/macos -maxdepth 1 -type d -name '*.app' -print)
+          [ "${#apps[@]}" -eq 1 ] || { echo "expected exactly one unsigned app" >&2; exit 1; }; app=${apps[0]}
+          test -x "$app/Contents/MacOS/devicelane-desktop"; test -x "$app/Contents/MacOS/devicelane-service"; test -x "$app/Contents/MacOS/devicelane"
+          test -f "$app/Contents/Resources/scripts/setup-mac.sh"
+          (cd "$app" && find . -type f -print0 | sort -z | xargs -0 shasum -a 256) > "$RUNNER_TEMP/unsigned-app-payload.sha256"
+      - name: Native Apple signing, DMG, and notarization
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          test -n "$APPLE_CERTIFICATE" || { echo "Refusing production release without signing and notarization inputs" >&2; exit 1; }
-          keychain="$RUNNER_TEMP/devicelane-signing.keychain-db"; printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/apple-signing.p12"
-          security create-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$keychain"; security unlock-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$keychain"
-          security import "$RUNNER_TEMP/apple-signing.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_CERTIFICATE_PASSWORD" "$keychain"; security list-keychains -d user -s "$keychain" login.keychain-db
-      - name: Signed and notarized native installer
-        working-directory: desktop
-        env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npm exec tauri build -- --bundles dmg -- --locked
-      - name: Validate notarization
+        run: |
+          test -n "$APPLE_CERTIFICATE" && test -n "$APPLE_CERTIFICATE_PASSWORD" && test -n "$APPLE_SIGNING_IDENTITY" && test -n "$APPLE_ID" && test -n "$APPLE_PASSWORD" && test -n "$APPLE_TEAM_ID" || { echo "Refusing production release without signing and notarization inputs" >&2; exit 1; }
+          mapfile -t apps < <(find target/release/bundle/macos -maxdepth 1 -type d -name '*.app' -print); [ "${#apps[@]}" -eq 1 ]; app=${apps[0]}
+          keychain="$RUNNER_TEMP/devicelane-signing.keychain-db"; p12="$RUNNER_TEMP/apple-signing.p12"; keychain_password=$(openssl rand -hex 32)
+          mapfile -t original_keychains < <(security list-keychains -d user | sed 's/^[[:space:]]*"//;s/"[[:space:]]*$//')
+          cleanup() {
+            cleanup_status=0
+            security list-keychains -d user -s "${original_keychains[@]}" || cleanup_status=1
+            security delete-keychain "$keychain" >/dev/null 2>&1 || cleanup_status=1
+            rm -f "$p12" || cleanup_status=1
+            return "$cleanup_status"
+          }
+          trap cleanup EXIT
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$p12"; security create-keychain -p "$keychain_password" "$keychain"; security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign; security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"; security list-keychains -d user -s "$keychain" "${original_keychains[@]}"
+          codesign --force --deep --strict --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$app"; codesign --verify --deep --strict "$app"
+          mkdir -p target/release/bundle/dmg; dmg=target/release/bundle/dmg/DeviceLane.dmg; hdiutil create -volname DeviceLane -srcfolder "$app" -ov -format UDZO "$dmg"
+          xcrun notarytool submit "$dmg" --wait --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" | tee desktop-notary-submit.txt
+          xcrun stapler staple "$dmg"; xcrun stapler validate "$dmg"
+          xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" > desktop-notary-history.txt
+          cleanup; trap - EXIT
+      - name: Validate notarized native artifact
         shell: bash
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           mapfile -t dmgs < <(find target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print); [ "${#dmgs[@]}" -eq 1 ]; dmg=${dmgs[0]}
           mount=$(mktemp -d "$RUNNER_TEMP/notary-verify.XXXXXX"); trap 'hdiutil detach "$mount" >/dev/null 2>&1 || true; rm -rf "$mount"' EXIT
           hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount" >/dev/null; app=$(find "$mount" -maxdepth 1 -type d -name '*.app' -print)
           codesign --verify --deep --strict "$app"; spctl --assess --type execute "$app"; hdiutil detach "$mount"; spctl --assess --type open "$dmg"; xcrun stapler validate "$dmg"
-          xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" > desktop-notary-history.txt
       - name: Native artifact first-run smoke
         run: DEVICELANE_DESKTOP_ARTIFACT="$PWD/target/release/bundle" sh scripts/desktop-release-smoke.sh --exercise-lifecycle
       - name: Collect production artifacts preserving relative paths
@@ -307,7 +321,7 @@ jobs:
           cp desktop-notary-history.txt desktop-dist/
           cargo install cargo-cyclonedx --version 0.5.7 --locked; cargo cyclonedx --all --format json
           mkdir -p desktop-dist/SBOM; find . -name '*.cdx.json' -type f -print0 | while IFS= read -r -d '' file; do rel=${file#./}; dest="desktop-dist/SBOM/$rel"; test ! -e "$dest" || { echo 'artifact path collision' >&2; exit 1; }; mkdir -p "$(dirname "$dest")"; cp "$file" "$dest"; done
-          (cd desktop-dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS && cosign sign-blob --yes --bundle SHA256SUMS.sigstore SHA256SUMS)
+          (cd desktop-dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: production-macOS, path: desktop-dist, if-no-files-found: error }
 
@@ -325,7 +339,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 22.20.0, cache: npm, cache-dependency-path: desktop/package-lock.json }
-      - uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
       - name: Linux prerequisites
         run: sudo apt-get update && sudo apt-get install -y attr libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - name: Locked dependencies and native clients
@@ -341,7 +354,7 @@ jobs:
         working-directory: desktop
         run: npm exec tauri build -- --no-sign --bundles appimage,deb -- --locked
       - name: Native artifact first-run smoke
-        env: { DEVICELANE_ALLOW_DPKG_SMOKE: '1' }
+        env: { DEVICELANE_ALLOW_DPKG_SMOKE: '1', DEVICELANE_HOSTED_CI: '1' }
         run: DEVICELANE_DESKTOP_ARTIFACT="$PWD/target/release/bundle" sh scripts/desktop-release-smoke.sh --exercise-lifecycle
       - name: Collect production artifacts preserving relative paths
         shell: bash
@@ -354,6 +367,26 @@ jobs:
           { cat "$RUNNER_TEMP/devicelane-native-inputs.txt"; rustc -vV; cargo -V; node -v; npm -v; printf 'SOURCE_DATE_EPOCH=%s\n' "$SOURCE_DATE_EPOCH"; sha256sum Cargo.lock desktop/package-lock.json rust-toolchain.toml .github/workflows/desktop-release.yml; } > desktop-dist/BUILD-INPUTS.txt
           cargo install cargo-cyclonedx --version 0.5.7 --locked; cargo cyclonedx --all --format json
           mkdir -p desktop-dist/SBOM; find . -name '*.cdx.json' -type f -print0 | while IFS= read -r -d '' file; do rel=${file#./}; dest="desktop-dist/SBOM/$rel"; test ! -e "$dest" || { echo 'artifact path collision' >&2; exit 1; }; mkdir -p "$(dirname "$dest")"; cp "$file" "$dest"; done
-          (cd desktop-dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS && cosign sign-blob --yes --bundle SHA256SUMS.sigstore SHA256SUMS)
+          (cd desktop-dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: production-Linux, path: desktop-dist, if-no-files-found: error }
+
+  production-attest:
+    needs: [production-windows, production-macos, production-linux]
+    environment: production-release
+    runs-on: ubuntu-24.04
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { pattern: production-*, path: attest-input }
+      - uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+      - name: Verify precomputed digests and attest
+        shell: bash
+        run: |
+          find attest-input -name SHA256SUMS -type f -print0 | while IFS= read -r -d '' sums; do
+            directory=$(dirname "$sums"); (cd "$directory" && sha256sum --check SHA256SUMS)
+            cosign sign-blob --yes --bundle "$sums.sigstore" "$sums"
+          done
+          test "$(find attest-input -name SHA256SUMS.sigstore -type f | wc -l | tr -d ' ')" -eq 3
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: production-attestations, path: attest-input/**/SHA256SUMS.sigstore, if-no-files-found: error }
