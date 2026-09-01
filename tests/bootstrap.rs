@@ -36,6 +36,19 @@ fn bootstrap_assets_define_idempotent_setup_and_real_hardware_gates() {
 
     assert!(windows.contains("New-Item -ItemType Directory -Force"));
     assert!(windows.matches("$LASTEXITCODE").count() >= 2);
+    for option in [
+        "--controller-install",
+        "--controller-status",
+        "--controller-uninstall",
+    ] {
+        assert!(windows.contains(option));
+        assert!(readme.contains(option));
+    }
+    assert!(windows.contains("Register-ScheduledTask"));
+    assert!(windows.contains("--agent-peer"));
+    assert!(windows.contains("$env:LOCALAPPDATA"));
+    assert!(windows.contains("DeviceLane\\registry\\identity"));
+    assert!(windows.contains("DeviceLane\\registry\\logs"));
     assert!(mac.contains("mkdir -p"));
     assert!(smoke.contains("cargo test --test bootstrap"));
     assert!(readme.contains("Windows"));

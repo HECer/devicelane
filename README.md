@@ -135,6 +135,26 @@ Run the `NEXT_CONTROLLER_COMMAND` printed by the Mac installer. It has this form
 
 Allow TCP `7443` only from trusted clients and agents on your LAN or private VPN.
 
+For a persistent per-user Windows controller, install or repair a Scheduled Task with the
+explicit agent peer ID printed by the Mac installer:
+
+```powershell
+.\scripts\setup-windows.ps1 --controller-install --agent-peer MAC_AGENT_ID
+.\scripts\setup-windows.ps1 --controller-status
+.\scripts\setup-windows.ps1 --controller-uninstall
+```
+
+Installation and repair use `%LOCALAPPDATA%\DeviceLane\registry\identity` and
+`%LOCALAPPDATA%\DeviceLane\registry\logs` by default. Override public runtime settings with
+`--controller-listen`, `--controller-identity-dir`, and `--controller-log-dir`. The Scheduled
+Task contains only the registry executable and public runtime arguments; private keys and
+pairing secrets remain in the identity directory. Re-running `--controller-install` repairs
+the task idempotently. Uninstall removes only the task and preserves identity and logs.
+
+Do not expose the registry to the public Internet. Permit inbound TCP `7443` in Windows
+Firewall only from trusted private LAN subnets or VPN peers; keep the firewall rule disabled
+until pairing is complete and remove temporary pairing-port rules immediately afterward.
+
 ### 4. Verify the mesh
 
 ```powershell
