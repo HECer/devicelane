@@ -5,6 +5,27 @@ use device_development_mesh::local_ipc::{
     send_local_request, send_raw_local_frame, validate_state_paths, windows_pipe_security_sddl,
     write_frame,
 };
+
+#[test]
+fn unix_transport_does_not_swallow_timeout_or_arbitrary_socket_probe_errors() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/local_ipc.rs"),
+    )
+    .unwrap();
+    assert!(!source.contains("let _ = stream.set_read_timeout"));
+    assert!(!source.contains("let _ = stream.set_write_timeout"));
+    assert!(source.contains("Some(libc::ECONNREFUSED)"));
+}
+
+#[test]
+fn production_service_routes_autostart_requests_to_platform_lifecycle() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ipc = std::fs::read_to_string(root.join("src/local_ipc.rs")).unwrap();
+    let service = std::fs::read_to_string(root.join("src/bin/devicelane-service.rs")).unwrap();
+    assert!(service.contains("DaemonState::new_with_platform_lifecycle"));
+    assert!(ipc.contains("set_platform_autostart(enabled)?"));
+    assert!(service.contains("platform_autostart_enabled()"));
+}
 use std::io::Write;
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
@@ -200,6 +221,25 @@ fn service_rejects_relative_state_paths_before_binding() {
         .status()
         .unwrap();
     assert!(!status.success());
+}
+
+#[test]
+fn workstation_service_does_not_require_remote_mesh_configuration() {
+    let output = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+        .args([
+            "--identity",
+            "relative",
+            "--runtime-dir",
+            "relative",
+            "--role",
+            "workstation",
+            "--log-dir",
+            "relative",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("state paths must be absolute"));
 }
 
 #[test]

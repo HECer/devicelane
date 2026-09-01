@@ -13,12 +13,24 @@ $AgentPeer = $null
 $ListenAddress = $null
 $IdentityDir = $null
 $LogDir = $null
+$ServiceTaskName = "DeviceLane Service-$CurrentUserSid"
+$ServiceDeployDir = Join-Path $env:LOCALAPPDATA "DeviceLane\service\bin"
+$ServiceIdentityDir = Join-Path $env:LOCALAPPDATA "DeviceLane\service\identity"
+$ServiceRuntimeDir = Join-Path $env:LOCALAPPDATA "DeviceLane\service\runtime"
+$ServiceLogDir = Join-Path $env:LOCALAPPDATA "DeviceLane\service\logs"
 
 for ($Index = 0; $Index -lt $args.Count; $Index++) {
     switch ($args[$Index]) {
         "--controller-install" { $Mode = "install" }
         "--controller-status" { $Mode = "status" }
         "--controller-uninstall" { $Mode = "uninstall" }
+        "--service-install" { $Mode = "service-install" }
+        "--service-repair" { $Mode = "service-install" }
+        "--service-status" { $Mode = "service-status" }
+        "--service-autostart-enable" { $Mode = "service-autostart-enable" }
+        "--service-autostart-disable" { $Mode = "service-autostart-disable" }
+        "--service-logs" { $Mode = "service-logs" }
+        "--service-uninstall" { $Mode = "service-uninstall" }
         "--agent-peer" {
             $Index++
             if ($Index -ge $args.Count) { throw "--agent-peer requires a value" }
@@ -41,6 +53,43 @@ for ($Index = 0; $Index -lt $args.Count; $Index++) {
         }
         default { throw "unknown option: $($args[$Index])" }
     }
+}
+
+if ($Mode -eq "service-status") {
+    $ServiceTask = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
+    if ($null -eq $ServiceTask) { Write-Output "DeviceLane service is not installed."; exit 1 }
+    [pscustomobject]@{ Installed = $true; Running = $ServiceTask.State -eq "Running"; Autostart = $ServiceTask.State -ne "Disabled"; Logs = $ServiceLogDir } | Format-List
+    exit 0
+}
+if ($Mode -eq "service-autostart-enable") { Enable-ScheduledTask -TaskName $ServiceTaskName | Out-Null; Start-ScheduledTask -TaskName $ServiceTaskName; exit 0 }
+if ($Mode -eq "service-autostart-disable") { Stop-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue; Disable-ScheduledTask -TaskName $ServiceTaskName | Out-Null; exit 0 }
+if ($Mode -eq "service-logs") { Write-Output $ServiceLogDir; exit 0 }
+if ($Mode -eq "service-uninstall") {
+    Stop-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $ServiceTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $ServiceDeployDir -Filter "devicelane-service-*.exe" -ErrorAction SilentlyContinue | Remove-Item -Force
+    Write-Output "DeviceLane service removed. Identity and logs were preserved."
+    exit 0
+}
+if ($Mode -eq "service-install") {
+    Set-Location $Root
+    cargo build --release --bin devicelane-service
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    New-Item -ItemType Directory -Force -Path $ServiceDeployDir, $ServiceIdentityDir, $ServiceRuntimeDir, $ServiceLogDir | Out-Null
+    $ExistingServiceTask = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
+    if ($null -ne $ExistingServiceTask) { Stop-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue }
+    $ServiceBuildId = [guid]::NewGuid().ToString("N")
+    $ServiceExe = Join-Path $ServiceDeployDir "devicelane-service-$ServiceBuildId.exe"
+    Copy-Item -LiteralPath (Resolve-Path ".\target\release\devicelane-service.exe").Path -Destination $ServiceExe
+    $ServiceArguments = "--identity `"$ServiceIdentityDir`" --runtime-dir `"$ServiceRuntimeDir`" --log-dir `"$ServiceLogDir`" --role workstation --foreground"
+    $ServiceAction = New-ScheduledTaskAction -Execute $ServiceExe -Argument $ServiceArguments
+    $ServiceTrigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
+    $ServicePrincipal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
+    $ServiceSettings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName $ServiceTaskName -Action $ServiceAction -Trigger $ServiceTrigger -Principal $ServicePrincipal -Settings $ServiceSettings -Description "Per-user DeviceLane service" -Force | Out-Null
+    Start-ScheduledTask -TaskName $ServiceTaskName
+    Write-Output "DeviceLane service installed or repaired for $UserId."
+    exit 0
 }
 
 if ($Mode -eq "install") {

@@ -183,6 +183,26 @@ sh ./scripts/setup-mac.sh --controller CONTROLLER_HOST --upgrade   # rebuild and
 sh ./scripts/setup-mac.sh --controller CONTROLLER_HOST --uninstall # remove installed binaries/service
 ```
 
+The per-user DeviceLane daemon has an independent lifecycle and keeps its identity and logs when
+uninstalled:
+
+```sh
+sh ./scripts/setup-mac.sh --install
+sh ./scripts/setup-mac.sh --status
+sh ./scripts/setup-mac.sh --autostart-disable
+sh ./scripts/setup-mac.sh --autostart-enable
+sh ./scripts/setup-mac.sh --logs
+sh ./scripts/setup-mac.sh --uninstall
+```
+
+On Linux the equivalent commands use `scripts/setup-linux.sh`. The adapter installs a hardened
+`systemd --user` unit. Where a user systemd session is unavailable, the script prints the exact
+`devicelane-service --foreground` command for a session supervisor or terminal.
+
+On Windows use `setup-windows.ps1` with `--service-install`, `--service-repair`,
+`--service-status`, `--service-autostart-enable`, `--service-autostart-disable`, `--service-logs`,
+or `--service-uninstall`. All three adapters use per-user state and log directories.
+
 Diagnostics are written below `~/Library/Logs/DeviceDevelopmentMesh/diagnostics`. Identity and trust material remain below `~/Library/Application Support/DeviceDevelopmentMesh` and must never be shared.
 
 ## Security model

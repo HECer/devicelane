@@ -252,6 +252,7 @@ impl Authorizer for SameUserAuthorizer {
 pub struct DaemonState {
     snapshot: DaemonSnapshot,
     diagnostics: Vec<DiagnosticItem>,
+    manage_platform_autostart: bool,
 }
 
 impl DaemonState {
@@ -259,6 +260,18 @@ impl DaemonState {
         Self {
             snapshot,
             diagnostics,
+            manage_platform_autostart: false,
+        }
+    }
+
+    pub fn new_with_platform_lifecycle(
+        snapshot: DaemonSnapshot,
+        diagnostics: Vec<DiagnosticItem>,
+    ) -> Self {
+        Self {
+            snapshot,
+            diagnostics,
+            manage_platform_autostart: true,
         }
     }
 
@@ -279,6 +292,9 @@ impl DaemonState {
                 Ok(LocalResponse::Acknowledged)
             }
             LocalRequest::SetAutostart { enabled, .. } => {
+                if self.manage_platform_autostart {
+                    set_platform_autostart(enabled)?;
+                }
                 self.snapshot.autostart = enabled;
                 Ok(LocalResponse::Acknowledged)
             }
@@ -287,6 +303,73 @@ impl DaemonState {
             }
         }
     }
+}
+
+fn set_platform_autostart(enabled: bool) -> Result<(), LocalProtocolError> {
+    #[cfg(target_os = "linux")]
+    let status = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            if enabled { "enable" } else { "disable" },
+            "--now",
+            "devicelane.service",
+        ])
+        .status();
+    #[cfg(target_os = "macos")]
+    let status = std::process::Command::new("launchctl")
+        .args([
+            if enabled { "enable" } else { "disable" },
+            &format!("gui/{}/dev.devicelane.service", unsafe { libc::geteuid() }),
+        ])
+        .status();
+    #[cfg(windows)]
+    let status = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            if enabled {
+                "$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Enable-ScheduledTask -TaskName \"DeviceLane Service-$sid\" | Out-Null; Start-ScheduledTask -TaskName \"DeviceLane Service-$sid\""
+            } else {
+                "$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Stop-ScheduledTask -TaskName \"DeviceLane Service-$sid\" -ErrorAction SilentlyContinue; Disable-ScheduledTask -TaskName \"DeviceLane Service-$sid\" | Out-Null"
+            },
+        ])
+        .status();
+    status
+        .map_err(|_| LocalProtocolError::Io)?
+        .success()
+        .then_some(())
+        .ok_or(LocalProtocolError::Io)
+}
+
+pub fn platform_autostart_enabled() -> bool {
+    #[cfg(target_os = "linux")]
+    return std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "--quiet", "devicelane.service"])
+        .status()
+        .is_ok_and(|status| status.success());
+    #[cfg(target_os = "macos")]
+    return std::process::Command::new("launchctl")
+        .args([
+            "print-disabled",
+            &format!("gui/{}", unsafe { libc::geteuid() }),
+        ])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && !String::from_utf8_lossy(&output.stdout)
+                    .contains("\"dev.devicelane.service\" => true")
+        });
+    #[cfg(windows)]
+    return std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $task=Get-ScheduledTask -TaskName \"DeviceLane Service-$sid\" -ErrorAction SilentlyContinue; if ($null -ne $task -and $task.State -ne 'Disabled') { exit 0 } else { exit 1 }",
+        ])
+        .status()
+        .is_ok_and(|status| status.success());
 }
 
 pub fn validate_state_paths<'a>(
@@ -487,8 +570,10 @@ mod platform {
             if !metadata.file_type().is_socket() {
                 return Err(LocalProtocolError::InvalidLocalEndpoint);
             }
-            if PlatformStream::connect(path).is_ok() {
-                return Err(LocalProtocolError::InvalidLocalEndpoint);
+            match PlatformStream::connect(path) {
+                Ok(_) => return Err(LocalProtocolError::InvalidLocalEndpoint),
+                Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {}
+                Err(_) => return Err(LocalProtocolError::InvalidLocalEndpoint),
             }
             std::fs::remove_file(path).map_err(|_| LocalProtocolError::Io)?;
         }
@@ -505,8 +590,15 @@ mod platform {
             let Ok(peer) = peer_credentials(&stream) else {
                 continue;
             };
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+            if stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .is_err()
+                || stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                    .is_err()
+            {
+                continue;
+            }
             let state = Arc::clone(&state);
             let authorizer = SameUserAuthorizer::unix(unsafe { libc::geteuid() });
             std::thread::spawn(move || {

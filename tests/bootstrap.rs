@@ -64,7 +64,7 @@ fn bootstrap_assets_define_idempotent_setup_and_real_hardware_gates() {
     assert!(windows.contains("$StagedRegistryExe"));
     assert!(windows.contains("Copy-Item"));
     assert!(windows.contains("Register-ScheduledTask") && windows.contains("-Force"));
-    assert_eq!(windows.matches("Unregister-ScheduledTask").count(), 2);
+    assert_eq!(windows.matches("Unregister-ScheduledTask").count(), 3);
     assert!(windows.contains("-lt 1") && windows.contains("-gt 65535"));
     assert!(windows.contains("new DeviceLane controller task did not remain running"));
     assert!(windows.contains("$Value.Replace(\"'\", \"''\")"));
@@ -97,6 +97,34 @@ fn bootstrap_assets_define_idempotent_setup_and_real_hardware_gates() {
             .lines()
             .any(|line| line.starts_with("mesh-registry "))
     );
+}
+
+#[test]
+fn windows_user_service_has_complete_lifecycle() {
+    let setup = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-windows.ps1"),
+    )
+    .unwrap();
+
+    for required in [
+        "--service-install",
+        "--service-repair",
+        "--service-status",
+        "--service-autostart-enable",
+        "--service-autostart-disable",
+        "--service-logs",
+        "--service-uninstall",
+        "devicelane-service.exe",
+        "DeviceLane Service-$CurrentUserSid",
+    ] {
+        assert!(
+            setup.contains(required),
+            "missing Windows daemon lifecycle: {required}"
+        );
+    }
+    assert!(setup.contains("Identity and logs were preserved"));
+    assert!(setup.contains("devicelane-service-$ServiceBuildId.exe"));
+    assert!(setup.contains("Stop-ScheduledTask -TaskName $ServiceTaskName"));
 }
 
 #[cfg(windows)]

@@ -262,3 +262,35 @@ fn uninstall_preserves_identity_and_audit_by_default() {
     assert!(!setup.contains("rm -rf \"$IDENTITY_DIR\""));
     assert!(!setup.contains("rm -rf \"$AUDIT_DIR\""));
 }
+
+#[test]
+fn mac_daemon_launch_agent_has_complete_lifecycle() {
+    let setup = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-mac.sh"),
+    )
+    .unwrap();
+
+    for required in [
+        "--repair",
+        "--autostart-enable",
+        "--autostart-disable",
+        "--logs",
+        "devicelane-service",
+        "dev.devicelane.service",
+        "<key>KeepAlive</key>",
+        "<key>RunAtLoad</key>",
+    ] {
+        assert!(
+            setup.contains(required),
+            "missing macOS daemon lifecycle: {required}"
+        );
+    }
+    assert!(setup.contains("Identity and logs were preserved"));
+    assert!(setup.contains(
+        "DAEMON_PLIST_PROGRAM_PATH=$(printf '%s' \"$DAEMON_PROGRAM_PATH\" | xml_escape)"
+    ));
+    assert!(setup.contains("Installed="));
+    assert!(setup.contains("Autostart="));
+    assert!(setup.contains("Logs=%s"));
+    assert!(setup.contains("\"$DAEMON_LOG_DIR\""));
+}

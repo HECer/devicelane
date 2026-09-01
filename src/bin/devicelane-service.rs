@@ -1,6 +1,6 @@
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, DiagnosticItem, LocalProtocolVersion,
-    local_endpoint, serve_local, validate_state_paths,
+    local_endpoint, platform_autostart_enabled, serve_local, validate_state_paths,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -39,8 +39,12 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(format!("unknown argument: {flag}")),
         }
     }
-    if parsed.role.is_empty() || parsed.registry.is_empty() || parsed.agent_peer.is_empty() {
-        return Err("--role, --registry, and --agent-peer are required".into());
+    if parsed.role.is_empty() {
+        return Err("--role is required".into());
+    }
+    if parsed.role != "workstation" && (parsed.registry.is_empty() || parsed.agent_peer.is_empty())
+    {
+        return Err("--registry and --agent-peer are required for remote roles".into());
     }
     validate_state_paths([
         parsed.identity.as_path(),
@@ -68,7 +72,7 @@ fn run() -> Result<(), String> {
         .and_then(|name| name.to_str())
         .unwrap_or("devicelane")
         .to_owned();
-    let state = Arc::new(Mutex::new(DaemonState::new(
+    let state = Arc::new(Mutex::new(DaemonState::new_with_platform_lifecycle(
         DaemonSnapshot {
             public_identity,
             role,
@@ -78,7 +82,7 @@ fn run() -> Result<(), String> {
             remote_protocol: "1.0".into(),
             warnings: Vec::new(),
             remote_access_paused: false,
-            autostart: false,
+            autostart: platform_autostart_enabled(),
         },
         vec![DiagnosticItem {
             code: "ready".into(),
