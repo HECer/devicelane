@@ -139,17 +139,20 @@ For a persistent per-user Windows controller, install or repair a Scheduled Task
 explicit agent peer ID printed by the Mac installer:
 
 ```powershell
-.\scripts\setup-windows.ps1 --controller-install --agent-peer MAC_AGENT_ID
+.\scripts\setup-windows.ps1 --controller-install `
+  --agent-peer MAC_AGENT_ID `
+  --controller-listen 0.0.0.0:7443 `
+  --controller-identity "$env:LOCALAPPDATA\DeviceLane\registry\identity" `
+  --controller-log-dir "$env:LOCALAPPDATA\DeviceLane\registry\logs"
 .\scripts\setup-windows.ps1 --controller-status
 .\scripts\setup-windows.ps1 --controller-uninstall
 ```
 
-Installation and repair use `%LOCALAPPDATA%\DeviceLane\registry\identity` and
-`%LOCALAPPDATA%\DeviceLane\registry\logs` by default. Override public runtime settings with
-`--controller-listen`, `--controller-identity-dir`, and `--controller-log-dir`. The Scheduled
-Task contains only the registry executable and public runtime arguments; private keys and
-pairing secrets remain in the identity directory. Re-running `--controller-install` repairs
-the task idempotently. Uninstall removes only the task and preserves identity and logs.
+Installation and repair require explicit `--agent-peer`, `--controller-listen`,
+`--controller-identity`, and `--controller-log-dir` values. The Scheduled Task contains only
+the registry executable and public runtime arguments; private keys and pairing secrets remain
+in the identity directory. Re-running `--controller-install` repairs the current user's task
+idempotently. Uninstall removes only that user's task and preserves identity and logs.
 
 Do not expose the registry to the public Internet. Permit inbound TCP `7443` in Windows
 Firewall only from trusted private LAN subnets or VPN peers; keep the firewall rule disabled

@@ -1,11 +1,14 @@
 $ErrorActionPreference = "Stop"
 
-$TaskName = "DeviceLane Registry"
+$CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$CurrentUserSid = $CurrentIdentity.User.Value
+$UserId = $CurrentIdentity.Name
+$TaskName = "DeviceLane Registry-$CurrentUserSid"
 $Mode = "bootstrap"
 $AgentPeer = $null
-$ListenAddress = "0.0.0.0:7443"
-$IdentityDir = Join-Path $env:LOCALAPPDATA "DeviceLane\registry\identity"
-$LogDir = Join-Path $env:LOCALAPPDATA "DeviceLane\registry\logs"
+$ListenAddress = $null
+$IdentityDir = $null
+$LogDir = $null
 
 for ($Index = 0; $Index -lt $args.Count; $Index++) {
     switch ($args[$Index]) {
@@ -22,9 +25,9 @@ for ($Index = 0; $Index -lt $args.Count; $Index++) {
             if ($Index -ge $args.Count) { throw "--controller-listen requires a value" }
             $ListenAddress = $args[$Index]
         }
-        "--controller-identity-dir" {
+        "--controller-identity" {
             $Index++
-            if ($Index -ge $args.Count) { throw "--controller-identity-dir requires a value" }
+            if ($Index -ge $args.Count) { throw "--controller-identity requires a value" }
             $IdentityDir = [System.IO.Path]::GetFullPath($args[$Index])
         }
         "--controller-log-dir" {
@@ -33,6 +36,19 @@ for ($Index = 0; $Index -lt $args.Count; $Index++) {
             $LogDir = [System.IO.Path]::GetFullPath($args[$Index])
         }
         default { throw "unknown option: $($args[$Index])" }
+    }
+}
+
+if ($Mode -eq "install") {
+    foreach ($RequiredOption in @(
+        @{ Name = "--agent-peer"; Value = $AgentPeer },
+        @{ Name = "--controller-listen"; Value = $ListenAddress },
+        @{ Name = "--controller-identity"; Value = $IdentityDir },
+        @{ Name = "--controller-log-dir"; Value = $LogDir }
+    )) {
+        if ([string]::IsNullOrWhiteSpace($RequiredOption.Value)) {
+            throw "--controller-install requires explicit $($RequiredOption.Name)"
+        }
     }
 }
 
@@ -73,7 +89,6 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 if ($Mode -ne "install") { exit 0 }
-if ([string]::IsNullOrWhiteSpace($AgentPeer)) { throw "--controller-install requires --agent-peer AGENT_PEER_ID" }
 if ($AgentPeer -notmatch "^[A-Za-z0-9._:-]+$") { throw "invalid --agent-peer value" }
 if ($ListenAddress -notmatch "^[A-Za-z0-9.:[\]-]+:[0-9]+$") { throw "invalid --controller-listen value" }
 
@@ -87,7 +102,6 @@ function ConvertTo-PowerShellLiteral([string]$Value) {
 
 $RegistryCommand = "& $(ConvertTo-PowerShellLiteral $RegistryExe) --listen $(ConvertTo-PowerShellLiteral $ListenAddress) --identity $(ConvertTo-PowerShellLiteral $IdentityDir) --offline-after-ms 5000 --agent-peer $(ConvertTo-PowerShellLiteral $AgentPeer) *>> $(ConvertTo-PowerShellLiteral $RegistryLog)"
 $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -Command `"$RegistryCommand`""
-$UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
 $Principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
 $Settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
