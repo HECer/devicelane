@@ -1,10 +1,10 @@
 use device_development_mesh::dashboard::{
     ActivityEvent, ActivityId, ActivityState, ActivitySummary, ApprovalDecision, ApprovalId,
-    ApprovalRequest, AuditRecord, AuditResult, Authorization, ConnectionPath, DashboardDevice,
-    DashboardHost, DashboardScope, DashboardSnapshot, DashboardWarning, DeviceId, EventCursor,
-    Freshness, HostId, MetricSnapshot, MetricValue, OperationId, PolicyEffect, PolicyOrigin,
-    PolicyRule, Presence, PrincipalId, ResourceClass, ResourceOccupancy, RuleId, TrustState,
-    ValidatedId,
+    ApprovalRequest, AuditRecord, AuditResult, Authorization, ConnectionPath, CursorPage,
+    DashboardDevice, DashboardHost, DashboardScope, DashboardSnapshot, DashboardWarning, DeviceId,
+    EventCursor, Freshness, HostId, MetricSnapshot, MetricValue, OperationId, PolicyEffect,
+    PolicyOrigin, PolicyRule, Presence, PrincipalId, RedactedText, ResourceClass,
+    ResourceOccupancy, RuleId, TrustState, ValidatedId,
 };
 use serde_json::json;
 
@@ -70,7 +70,7 @@ fn sample_event() -> ActivityEvent {
             approval_id: None,
         },
         state: ActivityState::Running,
-        message: Some("build started [redacted]".into()),
+        message: Some(RedactedText::parse("build started [redacted]").unwrap()),
         metrics: MetricSnapshot {
             current_memory_bytes: MetricValue::Available { value: 512 },
             peak_memory_bytes: MetricValue::Available { value: 1024 },
@@ -108,7 +108,7 @@ fn representative_contracts_round_trip() {
         }],
         warnings: vec![DashboardWarning {
             code: "stale_registry".into(),
-            message: "Registry observation is stale".into(),
+            message: RedactedText::parse("Registry observation is stale").unwrap(),
             host_id: Some(host_id("mac-studio")),
         }],
     };
@@ -180,7 +180,7 @@ fn every_representative_struct_rejects_unknown_fields() {
             resources: vec![ResourceClass::WorkspaceRead],
             decision: PolicyEffect::Allow,
             result: AuditResult::Succeeded,
-            redacted_message: Some("ok".into()),
+            redacted_message: Some(RedactedText::parse("ok").unwrap()),
         })
         .unwrap(),
     ];
@@ -326,4 +326,259 @@ fn contract_contains_no_forbidden_sensitive_fields() {
             "serialized contract leaked field {forbidden}"
         );
     }
+}
+
+#[test]
+fn deserialization_cannot_bypass_semantic_validation() {
+    let mut event = serde_json::to_value(sample_event()).unwrap();
+    event["resources"] = json!(["workspace_read", "workspace_read"]);
+    assert!(serde_json::from_value::<ActivityEvent>(event).is_err());
+
+    let mut event = serde_json::to_value(sample_event()).unwrap();
+    event["metrics"]["current_memory_bytes"] = json!({"available":{"value":1024}});
+    event["metrics"]["peak_memory_bytes"] = json!({"available":{"value":512}});
+    assert!(serde_json::from_value::<ActivityEvent>(event).is_err());
+
+    let mut event = serde_json::to_value(sample_event()).unwrap();
+    event["state"] = json!("succeeded");
+    assert!(serde_json::from_value::<ActivityEvent>(event).is_err());
+
+    let mut snapshot = serde_json::to_value(DashboardSnapshot {
+        revision: 1,
+        generated_at_ms: 10,
+        scope: DashboardScope::Local,
+        hosts: vec![sample_host()],
+        activities: vec![],
+        pending_approvals: vec![],
+        warnings: vec![],
+    })
+    .unwrap();
+    snapshot["hosts"][0]["presence"] = json!("offline");
+    snapshot["hosts"][0]["freshness"] = json!("unknown");
+    assert!(serde_json::from_value::<DashboardSnapshot>(snapshot).is_err());
+
+    let metrics = json!({
+        "current_memory_bytes":{"available":{"value":2}},
+        "peak_memory_bytes":{"available":{"value":1}},
+        "cpu_time_ms":{"unavailable":{"reason":"observer_failed"}},
+        "process_count":{"available":{"value":1}}
+    });
+    assert!(serde_json::from_value::<MetricSnapshot>(metrics).is_err());
+
+    let mut rule = serde_json::to_value(PolicyRule {
+        id: RuleId::parse("rule").unwrap(),
+        revision: 1,
+        effect: PolicyEffect::Deny,
+        principal_id: None,
+        source_host_id: None,
+        target_host_id: None,
+        device_id: None,
+        operation: None,
+        resources: vec![ResourceClass::Signing],
+        expires_at_ms: None,
+        require_user_presence: true,
+        enabled: true,
+        origin: PolicyOrigin::User,
+    })
+    .unwrap();
+    rule["resources"] = json!(["signing", "signing"]);
+    assert!(serde_json::from_value::<PolicyRule>(rule).is_err());
+
+    let mut audit = serde_json::to_value(AuditRecord {
+        sequence: 1,
+        occurred_at_ms: 1,
+        activity_id: None,
+        principal_id: principal_id("principal"),
+        source_host_id: host_id("source"),
+        target_host_id: host_id("target"),
+        device_id: None,
+        operation: operation_id("build"),
+        resources: vec![ResourceClass::WorkspaceRead],
+        decision: PolicyEffect::Allow,
+        result: AuditResult::Succeeded,
+        redacted_message: None,
+    })
+    .unwrap();
+    audit["resources"] = json!(["workspace_read", "workspace_read"]);
+    assert!(serde_json::from_value::<AuditRecord>(audit).is_err());
+}
+
+#[test]
+fn nested_enum_struct_variants_reject_unknown_fields() {
+    assert!(
+        serde_json::from_value::<Freshness>(json!({
+            "stale": {"last_seen_at_ms": 10, "token": "secret"}
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<MetricValue>(json!({
+            "available": {"value": 7, "environment": "secret"}
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<MetricValue>(json!({
+            "unavailable": {"reason": "observer_failed", "workspace_content": "secret"}
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn event_and_summary_share_lifecycle_invariants() {
+    let mut event = serde_json::to_value(sample_event()).unwrap();
+    event["state"] = json!("running");
+    event["started_at_ms"] = json!(null);
+    assert!(serde_json::from_value::<ActivityEvent>(event).is_err());
+
+    let mut summary = serde_json::to_value(ActivitySummary::from(&sample_event())).unwrap();
+    summary["state"] = json!("queued");
+    summary["started_at_ms"] = json!(10);
+    assert!(serde_json::from_value::<ActivitySummary>(summary).is_err());
+
+    let mut summary = serde_json::to_value(ActivitySummary::from(&sample_event())).unwrap();
+    summary["state"] = json!("succeeded");
+    summary["finished_at_ms"] = json!(null);
+    assert!(serde_json::from_value::<ActivitySummary>(summary).is_err());
+}
+
+#[test]
+fn activity_and_approval_times_are_monotonic_at_boundaries() {
+    let mut event = serde_json::to_value(sample_event()).unwrap();
+    event["occurred_at_ms"] = json!(9);
+    event["started_at_ms"] = json!(10);
+    assert!(serde_json::from_value::<ActivityEvent>(event).is_err());
+
+    let mut event = serde_json::to_value(sample_event()).unwrap();
+    event["state"] = json!("succeeded");
+    event["started_at_ms"] = json!(u64::MAX - 1);
+    event["occurred_at_ms"] = json!(u64::MAX);
+    event["finished_at_ms"] = json!(u64::MAX);
+    assert!(serde_json::from_value::<ActivityEvent>(event).is_ok());
+
+    let approval = json!({
+        "id":"approval-1", "activity_id":"activity-1", "principal_id":"principal-1",
+        "source_host_id":"source", "target_host_id":"target", "device_id":null,
+        "operation":"build", "resources":["workspace_read"], "requested_at_ms":u64::MAX,
+        "expires_at_ms":u64::MAX - 1, "risk":"normal"
+    });
+    assert!(serde_json::from_value::<ApprovalRequest>(approval).is_err());
+}
+
+#[test]
+fn ids_text_and_vectors_have_explicit_bounds() {
+    assert!(HostId::parse("x".repeat(256)).is_ok());
+    assert_eq!(
+        HostId::parse("x".repeat(257)).unwrap_err().code(),
+        "id_too_long"
+    );
+    assert!(RedactedText::parse("x".repeat(4096)).is_ok());
+    assert_eq!(
+        RedactedText::parse("x".repeat(4097)).unwrap_err().code(),
+        "text_too_long"
+    );
+
+    let mut event = serde_json::to_value(sample_event()).unwrap();
+    event["resources"] = json!(vec!["workspace_read"; 129]);
+    assert!(serde_json::from_value::<ActivityEvent>(event).is_err());
+
+    let mut host = serde_json::to_value(sample_host()).unwrap();
+    host["capabilities"] = json!(vec!["x"; 129]);
+    assert!(serde_json::from_value::<DashboardHost>(host).is_err());
+
+    let page = json!({"items": vec![1_u64; 257], "next_cursor": null});
+    assert!(serde_json::from_value::<CursorPage<u64>>(page).is_err());
+    let page = json!({"items": vec![1_u64; 256], "next_cursor": null});
+    assert!(serde_json::from_value::<CursorPage<u64>>(page).is_ok());
+
+    let mut warning = serde_json::to_value(DashboardWarning {
+        code: "warning".into(),
+        message: RedactedText::parse("safe").unwrap(),
+        host_id: None,
+    })
+    .unwrap();
+    warning["message"] = json!("x".repeat(4097));
+    assert!(serde_json::from_value::<DashboardWarning>(warning).is_err());
+}
+
+#[test]
+fn direct_deserialization_rejects_each_nested_model_invariant() {
+    assert!(
+        serde_json::from_value::<MetricValue>(json!({
+            "unavailable":{"reason":""}
+        }))
+        .is_err()
+    );
+
+    let mut device = serde_json::to_value(sample_host().devices[0].clone()).unwrap();
+    device["presence"] = json!("offline");
+    device["freshness"] = json!("unknown");
+    assert!(serde_json::from_value::<DashboardDevice>(device).is_err());
+
+    let mut host = serde_json::to_value(sample_host()).unwrap();
+    host["devices"][0]["host_id"] = json!("different-host");
+    assert!(serde_json::from_value::<DashboardHost>(host).is_err());
+
+    let mut event = serde_json::to_value(sample_event()).unwrap();
+    event["state"] = json!("succeeded");
+    event["finished_at_ms"] = json!(event["occurred_at_ms"].as_u64().unwrap() - 1);
+    assert!(serde_json::from_value::<ActivityEvent>(event).is_err());
+
+    let approval = json!({
+        "id":"approval", "activity_id":"activity", "principal_id":"principal",
+        "source_host_id":"source", "target_host_id":"target", "device_id":null,
+        "operation":"build", "resources":["workspace_read", "workspace_read"],
+        "requested_at_ms":1, "expires_at_ms":1, "risk":"normal"
+    });
+    assert!(serde_json::from_value::<ApprovalRequest>(approval).is_err());
+
+    let warning = json!({"code":"", "message":"safe", "host_id":null});
+    assert!(serde_json::from_value::<DashboardWarning>(warning).is_err());
+}
+
+#[test]
+fn sensitive_message_values_are_rejected_before_serialization() {
+    for sensitive in [
+        "Authorization: Bearer top-secret",
+        "token=top-secret",
+        "PRIVATE_KEY=top-secret",
+        "environment: SECRET=value",
+        "workspace_content=customer source",
+    ] {
+        let mut event = serde_json::to_value(sample_event()).unwrap();
+        event["message"] = json!(sensitive);
+        assert!(
+            serde_json::from_value::<ActivityEvent>(event).is_err(),
+            "accepted {sensitive}"
+        );
+
+        let audit = json!({
+            "sequence":1, "occurred_at_ms":10, "activity_id":null,
+            "principal_id":"principal", "source_host_id":"source", "target_host_id":"target",
+            "device_id":null, "operation":"build", "resources":["workspace_read"],
+            "decision":"allow", "result":"succeeded", "redacted_message":sensitive
+        });
+        assert!(
+            serde_json::from_value::<AuditRecord>(audit).is_err(),
+            "accepted {sensitive}"
+        );
+
+        let warning = json!({"code":"warning", "message":sensitive, "host_id":null});
+        assert!(
+            serde_json::from_value::<DashboardWarning>(warning).is_err(),
+            "accepted warning {sensitive}"
+        );
+        assert!(RedactedText::parse(sensitive).is_err());
+    }
+}
+
+#[test]
+fn validation_errors_include_stable_location_context() {
+    let mut event = sample_event();
+    event.resources.push(ResourceClass::WorkspaceRead);
+    let error = event.validate().unwrap_err();
+    assert_eq!(error.code(), "duplicate_resource_class");
+    assert_eq!(error.path(), "resources");
+    assert_eq!(error.index(), Some(2));
 }
