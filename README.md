@@ -85,6 +85,22 @@ This provides `devicelane` (the client), `devicelane-agent`, and
 `devicelane-registry`. Native archives and checksums are also available directly
 from [GitHub Releases](https://github.com/HECer/devicelane/releases).
 
+### Desktop installers
+
+The desktop release produces a Windows MSI, a hardened and notarized macOS DMG, and Linux
+AppImage and deb packages. Pull-request artifacts are explicitly named `unsigned-ci-*`; they are
+short-lived test outputs and must not be redistributed as production builds. A production
+candidate is emitted only by the protected manual workflow after native platform signing,
+Apple notarization inputs, SHA-256 manifests, a CycloneDX SBOM, and a signed checksum bundle are
+available.
+
+Install production packages only into the platform installer's administrator-owned location.
+DeviceLane checks the staged sidecar hash during packaging, but a hash check does not eliminate
+time-of-check/time-of-use races in a writable install directory. The signed, non-user-writable
+installation root is the security boundary. The per-user lifecycle tools preserve identity and
+logs during repair and normal uninstall; delete those directories separately only when rotating
+the device identity intentionally.
+
 ### Build from source
 
 The examples use port `7443` for normal mutual-TLS traffic and temporary ports `7444`/`7445` for initial pairing. Replace `CONTROLLER_HOST` with a private DNS name or LAN/VPN address reachable from the other host.

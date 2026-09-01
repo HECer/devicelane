@@ -7,7 +7,7 @@ const desktopDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryDir = resolve(desktopDir, "..");
 const debug = process.argv.includes("--debug");
 const buildDescription = "cargo build --release --bin devicelane-service";
-const cargoArguments = ["build", ...(debug ? [] : ["--release"]), "--bin", "devicelane-service", "--message-format=json"];
+const cargoArguments = ["build", ...(debug ? [] : ["--release"]), "--locked", "--bin", "devicelane-service", "--message-format=json"];
 
 function checked(program, args) {
   const result = spawnSync(program, args, { cwd: repositoryDir, encoding: "utf8", shell: false });

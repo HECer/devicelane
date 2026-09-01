@@ -18,6 +18,12 @@
     "active": true,
     "targets": "all",
     "icon": [],
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "signingIdentity": null,
+      "hardenedRuntime": true,
+      "entitlements": null
+    },
     "externalBin": ["binaries/devicelane-service"],
     "resources": {
       "../../scripts/setup-windows.ps1": "scripts/setup-windows.ps1",
