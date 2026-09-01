@@ -44,19 +44,31 @@ validate_systemd_path() {
 }
 
 rollback_linux_service() {
-    systemctl --user stop devicelane.service >/dev/null 2>&1 || true
-    if [ "$HAD_BINARY" = true ]; then cp -p "$BINARY_BACKUP" "$SERVICE_PATH"; else rm -f "$SERVICE_PATH"; fi
-    if [ "$HAD_UNIT" = true ]; then cp -p "$UNIT_BACKUP" "$UNIT_PATH"; else rm -f "$UNIT_PATH"; fi
-    systemctl --user daemon-reload
-    if [ "$WAS_ENABLED" = true ]; then systemctl --user enable devicelane.service; else systemctl --user disable devicelane.service; fi
+    ROLLBACK_FAILED=false
+    if ! systemctl --user stop devicelane.service >/dev/null 2>&1; then echo "rollback error: stop replacement" >&2; ROLLBACK_FAILED=true; fi
+    if [ "$HAD_BINARY" = true ]; then
+        if ! cp -p "$BINARY_BACKUP" "$SERVICE_PATH"; then echo "rollback error: restore binary" >&2; ROLLBACK_FAILED=true; fi
+    elif ! rm -f "$SERVICE_PATH"; then echo "rollback error: remove replacement binary" >&2; ROLLBACK_FAILED=true; fi
+    if [ "$HAD_UNIT" = true ]; then
+        if ! cp -p "$UNIT_BACKUP" "$UNIT_PATH"; then echo "rollback error: restore unit" >&2; ROLLBACK_FAILED=true; fi
+    elif ! rm -f "$UNIT_PATH"; then echo "rollback error: remove replacement unit" >&2; ROLLBACK_FAILED=true; fi
+    if ! systemctl --user daemon-reload; then echo "rollback error: daemon-reload" >&2; ROLLBACK_FAILED=true; fi
+    if [ "$WAS_ENABLED" = true ]; then
+        if ! systemctl --user enable devicelane.service; then echo "rollback error: restore autostart" >&2; ROLLBACK_FAILED=true; fi
+    elif ! systemctl --user disable devicelane.service; then echo "rollback error: restore autostart" >&2; ROLLBACK_FAILED=true; fi
     if [ "$WAS_ACTIVE" = true ]; then
-        systemctl --user restart devicelane.service &&
-        systemctl --user is-active --quiet devicelane.service
+        if ! systemctl --user restart devicelane.service; then echo "rollback error: restart" >&2; ROLLBACK_FAILED=true; fi
+        if ! systemctl --user is-active --quiet devicelane.service; then echo "rollback error: health verification" >&2; ROLLBACK_FAILED=true; fi
     fi
+    [ "$ROLLBACK_FAILED" = false ]
 }
 
 activate_linux_service() {
     HAD_BINARY=false; HAD_UNIT=false; WAS_ACTIVE=false; WAS_ENABLED=false
+    if [ -e "$BINARY_BACKUP" ] || [ -e "$UNIT_BACKUP" ]; then
+        echo "refusing to overwrite existing DeviceLane recovery artifacts" >&2
+        return 1
+    fi
     [ -f "$SERVICE_PATH" ] && { cp -p "$SERVICE_PATH" "$BINARY_BACKUP"; HAD_BINARY=true; }
     [ -f "$UNIT_PATH" ] && { cp -p "$UNIT_PATH" "$UNIT_BACKUP"; HAD_UNIT=true; }
     systemctl --user is-active --quiet devicelane.service && WAS_ACTIVE=true || true
@@ -78,7 +90,10 @@ activate_linux_service() {
         rm -f "$BINARY_STAGE" "$UNIT_STAGE"
         return 1
     fi
-    rm -f "$BINARY_BACKUP" "$UNIT_BACKUP"
+    if ! rm -f "$BINARY_BACKUP" "$UNIT_BACKUP"; then
+        echo "cleanup error: recovery artifacts were retained" >&2
+        return 1
+    fi
 }
 
 if [ "${DEVICELANE_LIFECYCLE_SOURCE_ONLY:-0}" = 1 ]; then return 0; fi

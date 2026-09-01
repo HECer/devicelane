@@ -18,4 +18,5 @@ fn unix_lifecycle_fake_operations_restore_previous_service() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("transaction rollback verified"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("failure matrix verified"));
 }

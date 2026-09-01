@@ -104,28 +104,45 @@ xml_escape() {
 }
 
 rollback_mac_service() {
-    launchctl bootout "$DAEMON_SERVICE" >/dev/null 2>&1 || true
-    if [ "$HAD_DAEMON_PROGRAM" = true ]; then cp -p "$DAEMON_PROGRAM_BACKUP" "$DAEMON_PROGRAM_PATH"; else rm -f "$DAEMON_PROGRAM_PATH"; fi
-    if [ "$HAD_DAEMON_PLIST" = true ]; then cp -p "$DAEMON_PLIST_BACKUP" "$DAEMON_PLIST_PATH"; else rm -f "$DAEMON_PLIST_PATH"; fi
+    ROLLBACK_FAILED=false
+    if ! launchctl bootout "$DAEMON_SERVICE" >/dev/null 2>&1; then echo "rollback error: stop replacement" >&2; ROLLBACK_FAILED=true; fi
+    if [ "$HAD_DAEMON_PROGRAM" = true ]; then
+        if ! cp -p "$DAEMON_PROGRAM_BACKUP" "$DAEMON_PROGRAM_PATH"; then echo "rollback error: restore daemon binary" >&2; ROLLBACK_FAILED=true; fi
+    elif ! rm -f "$DAEMON_PROGRAM_PATH"; then echo "rollback error: remove replacement daemon" >&2; ROLLBACK_FAILED=true; fi
+    if [ "$HAD_DAEMON_PLIST" = true ]; then
+        if ! cp -p "$DAEMON_PLIST_BACKUP" "$DAEMON_PLIST_PATH"; then echo "rollback error: restore LaunchAgent" >&2; ROLLBACK_FAILED=true; fi
+    elif ! rm -f "$DAEMON_PLIST_PATH"; then echo "rollback error: remove replacement LaunchAgent" >&2; ROLLBACK_FAILED=true; fi
     if [ "$WAS_DAEMON_LOADED" = true ]; then
-        launchctl bootstrap "gui/$(id -u)" "$DAEMON_PLIST_PATH" &&
-        launchctl kickstart -k "$DAEMON_SERVICE" &&
-        launchctl print "$DAEMON_SERVICE" >/dev/null
+        if ! launchctl enable "$DAEMON_SERVICE"; then echo "rollback error: enable restored service" >&2; ROLLBACK_FAILED=true; fi
+        if ! launchctl bootstrap "gui/$(id -u)" "$DAEMON_PLIST_PATH"; then echo "rollback error: bootstrap restored service" >&2; ROLLBACK_FAILED=true; fi
+        if ! launchctl kickstart -k "$DAEMON_SERVICE"; then echo "rollback error: restart" >&2; ROLLBACK_FAILED=true; fi
+        if ! launchctl print "$DAEMON_SERVICE" >/dev/null; then echo "rollback error: health verification" >&2; ROLLBACK_FAILED=true; fi
     fi
+    if [ "$WAS_DAEMON_DISABLED" = true ]; then
+        if ! launchctl disable "$DAEMON_SERVICE"; then echo "rollback error: restore launchd override" >&2; ROLLBACK_FAILED=true; fi
+    elif ! launchctl enable "$DAEMON_SERVICE"; then echo "rollback error: restore launchd override" >&2; ROLLBACK_FAILED=true; fi
+    [ "$ROLLBACK_FAILED" = false ]
 }
 
 activate_mac_service() {
-    HAD_DAEMON_PROGRAM=false; HAD_DAEMON_PLIST=false; WAS_DAEMON_LOADED=false
+    HAD_DAEMON_PROGRAM=false; HAD_DAEMON_PLIST=false; WAS_DAEMON_LOADED=false; WAS_DAEMON_DISABLED=false
+    if [ -e "$DAEMON_PROGRAM_BACKUP" ] || [ -e "$DAEMON_PLIST_BACKUP" ]; then
+        echo "refusing to overwrite existing DeviceLane recovery artifacts" >&2
+        return 1
+    fi
     [ -f "$DAEMON_PROGRAM_PATH" ] && { cp -p "$DAEMON_PROGRAM_PATH" "$DAEMON_PROGRAM_BACKUP"; HAD_DAEMON_PROGRAM=true; }
     [ -f "$DAEMON_PLIST_PATH" ] && { cp -p "$DAEMON_PLIST_PATH" "$DAEMON_PLIST_BACKUP"; HAD_DAEMON_PLIST=true; }
     launchctl print "$DAEMON_SERVICE" >/dev/null 2>&1 && WAS_DAEMON_LOADED=true || true
+    launchctl print-disabled "gui/$(id -u)" 2>/dev/null | grep -q '"dev.devicelane.service" => true' && WAS_DAEMON_DISABLED=true || true
     if ! (
         { [ "$WAS_DAEMON_LOADED" = false ] || launchctl bootout "$DAEMON_SERVICE"; } &&
         mv -f "$DAEMON_PROGRAM_STAGE" "$DAEMON_PROGRAM_PATH" &&
         mv -f "$DAEMON_PLIST_STAGE" "$DAEMON_PLIST_PATH" &&
+        launchctl enable "$DAEMON_SERVICE" &&
         launchctl bootstrap "gui/$(id -u)" "$DAEMON_PLIST_PATH" &&
         launchctl kickstart -k "$DAEMON_SERVICE" &&
-        launchctl print "$DAEMON_SERVICE" >/dev/null
+        launchctl print "$DAEMON_SERVICE" >/dev/null &&
+        { if [ "$HAD_DAEMON_PLIST" = true ] && [ "$WAS_DAEMON_DISABLED" = true ]; then launchctl disable "$DAEMON_SERVICE"; else launchctl enable "$DAEMON_SERVICE"; fi; }
     ); then
         if rollback_mac_service; then
             rm -f "$DAEMON_PROGRAM_BACKUP" "$DAEMON_PLIST_BACKUP"
@@ -135,7 +152,10 @@ activate_mac_service() {
         rm -f "$DAEMON_PROGRAM_STAGE" "$DAEMON_PLIST_STAGE"
         return 1
     fi
-    rm -f "$DAEMON_PROGRAM_BACKUP" "$DAEMON_PLIST_BACKUP"
+    if ! rm -f "$DAEMON_PROGRAM_BACKUP" "$DAEMON_PLIST_BACKUP"; then
+        echo "cleanup error: recovery artifacts were retained" >&2
+        return 1
+    fi
 }
 
 mac_service_status() {

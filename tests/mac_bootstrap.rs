@@ -310,6 +310,14 @@ fn mac_repair_is_transactional_and_absent_status_is_explicit() {
         "already loaded",
         "Installed=false",
         "Autostart=unavailable",
+        "WAS_DAEMON_DISABLED",
+        "launchctl enable \"$DAEMON_SERVICE\"",
+        "launchctl disable \"$DAEMON_SERVICE\"",
+        "refusing to overwrite existing DeviceLane recovery artifacts",
+        "rollback error: restore daemon binary",
+        "rollback error: restore LaunchAgent",
+        "rollback error: restore launchd override",
+        "rollback error: health verification",
     ] {
         assert!(
             setup.contains(required),

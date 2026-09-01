@@ -69,6 +69,14 @@ fn linux_repair_is_transactional_and_rejects_unsafe_systemd_paths() {
         "systemctl --user is-active --quiet devicelane.service",
         "rollback_linux_service",
         "WAS_ENABLED",
+        "ROLLBACK_FAILED",
+        "refusing to overwrite existing DeviceLane recovery artifacts",
+        "rollback error: restore binary",
+        "rollback error: restore unit",
+        "rollback error: daemon-reload",
+        "rollback error: restore autostart",
+        "rollback error: restart",
+        "rollback error: health verification",
         "validate_systemd_path",
     ] {
         assert!(
