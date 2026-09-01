@@ -51,3 +51,35 @@ fn linux_service_uses_per_user_state_and_documents_foreground_fallback() {
     assert!(readme.contains("--foreground"));
     assert!(setup.contains("ExecStart=\"$SERVICE_PATH\""));
 }
+
+#[test]
+fn linux_repair_is_transactional_and_rejects_unsafe_systemd_paths() {
+    let setup = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-linux.sh"),
+    )
+    .unwrap();
+    for required in [
+        "activate_linux_service",
+        "BINARY_STAGE",
+        "UNIT_STAGE",
+        "BINARY_BACKUP",
+        "UNIT_BACKUP",
+        "systemctl --user daemon-reload",
+        "systemctl --user restart devicelane.service",
+        "systemctl --user is-active --quiet devicelane.service",
+        "rollback_linux_service",
+        "WAS_ENABLED",
+        "validate_systemd_path",
+    ] {
+        assert!(
+            setup.contains(required),
+            "missing transactional Linux repair: {required}"
+        );
+    }
+    for unsafe_byte in ["newline", "double quote", "backslash", "percent"] {
+        assert!(
+            setup.contains(unsafe_byte),
+            "missing rejection for {unsafe_byte}"
+        );
+    }
+}

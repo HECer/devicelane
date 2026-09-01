@@ -64,7 +64,7 @@ fn bootstrap_assets_define_idempotent_setup_and_real_hardware_gates() {
     assert!(windows.contains("$StagedRegistryExe"));
     assert!(windows.contains("Copy-Item"));
     assert!(windows.contains("Register-ScheduledTask") && windows.contains("-Force"));
-    assert_eq!(windows.matches("Unregister-ScheduledTask").count(), 3);
+    assert_eq!(windows.matches("Unregister-ScheduledTask").count(), 4);
     assert!(windows.contains("-lt 1") && windows.contains("-gt 65535"));
     assert!(windows.contains("new DeviceLane controller task did not remain running"));
     assert!(windows.contains("$Value.Replace(\"'\", \"''\")"));
@@ -125,6 +125,67 @@ fn windows_user_service_has_complete_lifecycle() {
     assert!(setup.contains("Identity and logs were preserved"));
     assert!(setup.contains("devicelane-service-$ServiceBuildId.exe"));
     assert!(setup.contains("Stop-ScheduledTask -TaskName $ServiceTaskName"));
+}
+
+#[test]
+fn windows_service_repair_has_activation_health_and_rollback_operations() {
+    let setup = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-windows.ps1"),
+    )
+    .unwrap();
+    for required in [
+        "Invoke-ServiceActivation",
+        "StageBinary",
+        "StopOld",
+        "RegisterNew",
+        "StartNew",
+        "GetState",
+        "RestoreOld",
+        "StartOld",
+        "CleanupFailedVersion",
+        "new DeviceLane service task did not remain running",
+    ] {
+        assert!(
+            setup.contains(required),
+            "missing transactional Windows repair: {required}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_service_partial_registration_is_unregistered_before_restore() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-windows.ps1");
+    let harness = r#"
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:DEVICELANE_SETUP_SCRIPT, [ref]$null, [ref]$null)
+$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-ServiceActivation' }, $true)
+Invoke-Expression $definition.Extent.Text
+$script:events = [System.Collections.Generic.List[string]]::new()
+$script:state = 'Running'
+$old = [pscustomobject]@{ Definition = 'old' }
+$ops = @{
+ StageBinary={ $script:events.Add('stage') }; StopOld={ $script:events.Add('stop-old') }; ActivateBinary={ $script:events.Add('activate') }
+ RegisterNew={ $script:events.Add('register-partial'); throw 'partial registration' }; StartNew={ throw 'unexpected' }; GetState={ $script:state }
+ StopFailedNew={ $script:events.Add('stop-new') }; UnregisterFailedNew={ $script:events.Add('unregister-new') }
+ VerifyAbsent={ throw 'unexpected' }; RestoreOld={ param($task); $script:events.Add('restore-old') }; StartOld={ $script:events.Add('start-old') }
+ CleanupStage={ $script:events.Add('cleanup-stage') }; CleanupFailedVersion={ $script:events.Add('cleanup-version') }
+}
+try { Invoke-ServiceActivation -ExistingTask $old -Operations $ops } catch {}
+$expected='stage,stop-old,activate,register-partial,stop-new,unregister-new,restore-old,start-old,cleanup-stage,cleanup-version'
+if (($script:events -join ',') -ne $expected) { throw "unexpected rollback: $($script:events -join ',')" }
+"service rollback verified"
+"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", harness])
+        .env("DEVICELANE_SETUP_SCRIPT", script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(windows)]

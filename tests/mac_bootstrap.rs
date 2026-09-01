@@ -294,3 +294,29 @@ fn mac_daemon_launch_agent_has_complete_lifecycle() {
     assert!(setup.contains("Logs=%s"));
     assert!(setup.contains("\"$DAEMON_LOG_DIR\""));
 }
+
+#[test]
+fn mac_repair_is_transactional_and_absent_status_is_explicit() {
+    let setup = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-mac.sh"),
+    )
+    .unwrap();
+    for required in [
+        "activate_mac_service",
+        "DAEMON_PROGRAM_BACKUP",
+        "DAEMON_PLIST_BACKUP",
+        "rollback_mac_service",
+        "launchctl print \"$DAEMON_SERVICE\"",
+        "already loaded",
+        "Installed=false",
+        "Autostart=unavailable",
+    ] {
+        assert!(
+            setup.contains(required),
+            "missing transactional macOS repair: {required}"
+        );
+    }
+    assert!(!setup.contains(
+        "launchctl bootstrap \"gui/$(id -u)\" \"$DAEMON_PLIST_PATH\" 2>/dev/null || true"
+    ));
+}

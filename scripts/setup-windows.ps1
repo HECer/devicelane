@@ -55,6 +55,41 @@ for ($Index = 0; $Index -lt $args.Count; $Index++) {
     }
 }
 
+function Invoke-ServiceActivation($ExistingTask, $Operations) {
+    $NewRegistered = $false
+    try {
+        & ($Operations["StageBinary"])
+        if ($null -ne $ExistingTask) { & ($Operations["StopOld"]) }
+        & ($Operations["ActivateBinary"])
+        $NewRegistered = $true
+        & ($Operations["RegisterNew"])
+        & ($Operations["StartNew"])
+        if ((& ($Operations["GetState"])) -ne "Running") {
+            throw "new DeviceLane service task did not remain running"
+        }
+    } catch {
+        $ActivationError = $_
+        $RollbackErrors = [System.Collections.Generic.List[string]]::new()
+        if ($NewRegistered) {
+            try { & ($Operations["StopFailedNew"]) } catch { $RollbackErrors.Add("stop failed task: $_") }
+            try { & ($Operations["UnregisterFailedNew"]) } catch { $RollbackErrors.Add("unregister failed task: $_") }
+        }
+        if ($null -ne $ExistingTask) {
+            try { & ($Operations["RestoreOld"]) $ExistingTask } catch { $RollbackErrors.Add("restore previous definition: $_") }
+            try { & ($Operations["StartOld"]) } catch { $RollbackErrors.Add("restart previous task: $_") }
+            try {
+                if ((& ($Operations["GetState"])) -ne "Running") { $RollbackErrors.Add("previous service task did not return to Running") }
+            } catch { $RollbackErrors.Add("verify previous task: $_") }
+        } else {
+            try { & ($Operations["VerifyAbsent"]) } catch { $RollbackErrors.Add("verify failed task removal: $_") }
+        }
+        try { & ($Operations["CleanupStage"]) } catch { $RollbackErrors.Add("clean staged binary: $_") }
+        try { & ($Operations["CleanupFailedVersion"]) } catch { $RollbackErrors.Add("clean failed binary: $_") }
+        if ($RollbackErrors.Count -gt 0) { Write-Warning "service activation failed; rollback issues: $($RollbackErrors -join '; ')" }
+        throw $ActivationError
+    }
+}
+
 if ($Mode -eq "service-status") {
     $ServiceTask = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
     if ($null -eq $ServiceTask) { Write-Output "DeviceLane service is not installed."; exit 1 }
@@ -77,17 +112,31 @@ if ($Mode -eq "service-install") {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     New-Item -ItemType Directory -Force -Path $ServiceDeployDir, $ServiceIdentityDir, $ServiceRuntimeDir, $ServiceLogDir | Out-Null
     $ExistingServiceTask = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
-    if ($null -ne $ExistingServiceTask) { Stop-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue }
     $ServiceBuildId = [guid]::NewGuid().ToString("N")
     $ServiceExe = Join-Path $ServiceDeployDir "devicelane-service-$ServiceBuildId.exe"
-    Copy-Item -LiteralPath (Resolve-Path ".\target\release\devicelane-service.exe").Path -Destination $ServiceExe
+    $ServiceStage = "$ServiceExe.stage"
+    $BuiltServiceExe = (Resolve-Path ".\target\release\devicelane-service.exe").Path
     $ServiceArguments = "--identity `"$ServiceIdentityDir`" --runtime-dir `"$ServiceRuntimeDir`" --log-dir `"$ServiceLogDir`" --role workstation --foreground"
     $ServiceAction = New-ScheduledTaskAction -Execute $ServiceExe -Argument $ServiceArguments
     $ServiceTrigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
     $ServicePrincipal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
     $ServiceSettings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
-    Register-ScheduledTask -TaskName $ServiceTaskName -Action $ServiceAction -Trigger $ServiceTrigger -Principal $ServicePrincipal -Settings $ServiceSettings -Description "Per-user DeviceLane service" -Force | Out-Null
-    Start-ScheduledTask -TaskName $ServiceTaskName
+    $ServiceOperations = @{
+        StageBinary = { Copy-Item -LiteralPath $BuiltServiceExe -Destination $ServiceStage }
+        StopOld = { Stop-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop }
+        ActivateBinary = { Move-Item -LiteralPath $ServiceStage -Destination $ServiceExe }
+        RegisterNew = { Register-ScheduledTask -TaskName $ServiceTaskName -Action $ServiceAction -Trigger $ServiceTrigger -Principal $ServicePrincipal -Settings $ServiceSettings -Description "Per-user DeviceLane service" -Force | Out-Null }
+        StartNew = { Start-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop; Start-Sleep -Milliseconds 500 }
+        GetState = { (Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop).State.ToString() }
+        StopFailedNew = { Stop-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop }
+        UnregisterFailedNew = { Unregister-ScheduledTask -TaskName $ServiceTaskName -Confirm:$false -ErrorAction Stop }
+        VerifyAbsent = { if ($null -ne (Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue)) { throw "failed DeviceLane service task remains registered" } }
+        RestoreOld = { param($OldTask); Register-ScheduledTask -InputObject $OldTask -TaskName $ServiceTaskName -Force | Out-Null }
+        StartOld = { Start-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop; Start-Sleep -Milliseconds 500 }
+        CleanupStage = { if (Test-Path -LiteralPath $ServiceStage) { Remove-Item -LiteralPath $ServiceStage -Force } }
+        CleanupFailedVersion = { if (Test-Path -LiteralPath $ServiceExe) { Remove-Item -LiteralPath $ServiceExe -Force } }
+    }
+    Invoke-ServiceActivation -ExistingTask $ExistingServiceTask -Operations $ServiceOperations
     Write-Output "DeviceLane service installed or repaired for $UserId."
     exit 0
 }

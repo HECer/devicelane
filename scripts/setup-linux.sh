@@ -30,6 +30,58 @@ require_systemd() {
         exit 1
     fi
 }
+
+validate_systemd_path() {
+    value=$1
+    newline='
+'
+    case "$value" in
+        *"$newline"*) echo "systemd path contains newline" >&2; return 1 ;;
+        *'"'*) echo "systemd path contains double quote" >&2; return 1 ;;
+        *'\'*) echo "systemd path contains backslash" >&2; return 1 ;;
+        *'%'*) echo "systemd path contains percent" >&2; return 1 ;;
+    esac
+}
+
+rollback_linux_service() {
+    systemctl --user stop devicelane.service >/dev/null 2>&1 || true
+    if [ "$HAD_BINARY" = true ]; then cp -p "$BINARY_BACKUP" "$SERVICE_PATH"; else rm -f "$SERVICE_PATH"; fi
+    if [ "$HAD_UNIT" = true ]; then cp -p "$UNIT_BACKUP" "$UNIT_PATH"; else rm -f "$UNIT_PATH"; fi
+    systemctl --user daemon-reload
+    if [ "$WAS_ENABLED" = true ]; then systemctl --user enable devicelane.service; else systemctl --user disable devicelane.service; fi
+    if [ "$WAS_ACTIVE" = true ]; then
+        systemctl --user restart devicelane.service &&
+        systemctl --user is-active --quiet devicelane.service
+    fi
+}
+
+activate_linux_service() {
+    HAD_BINARY=false; HAD_UNIT=false; WAS_ACTIVE=false; WAS_ENABLED=false
+    [ -f "$SERVICE_PATH" ] && { cp -p "$SERVICE_PATH" "$BINARY_BACKUP"; HAD_BINARY=true; }
+    [ -f "$UNIT_PATH" ] && { cp -p "$UNIT_PATH" "$UNIT_BACKUP"; HAD_UNIT=true; }
+    systemctl --user is-active --quiet devicelane.service && WAS_ACTIVE=true || true
+    systemctl --user is-enabled --quiet devicelane.service && WAS_ENABLED=true || true
+    if ! (
+        { [ "$WAS_ACTIVE" = false ] || systemctl --user stop devicelane.service; } &&
+        mv -f "$BINARY_STAGE" "$SERVICE_PATH" &&
+        mv -f "$UNIT_STAGE" "$UNIT_PATH" &&
+        systemctl --user daemon-reload &&
+        systemctl --user restart devicelane.service &&
+        { if [ "$HAD_UNIT" = false ] || [ "$WAS_ENABLED" = true ]; then systemctl --user enable devicelane.service; else systemctl --user disable devicelane.service; fi; } &&
+        systemctl --user is-active --quiet devicelane.service
+    ); then
+        if rollback_linux_service; then
+            rm -f "$BINARY_BACKUP" "$UNIT_BACKUP"
+        else
+            echo "DeviceLane rollback could not restore a healthy service; backups were retained" >&2
+        fi
+        rm -f "$BINARY_STAGE" "$UNIT_STAGE"
+        return 1
+    fi
+    rm -f "$BINARY_BACKUP" "$UNIT_BACKUP"
+}
+
+if [ "${DEVICELANE_LIFECYCLE_SOURCE_ONLY:-0}" = 1 ]; then return 0; fi
 case "$MODE" in
     status)
         require_systemd
@@ -49,13 +101,21 @@ case "$MODE" in
         exit ;;
 esac
 require_systemd
+validate_systemd_path "$PROGRAM_DIR"
+validate_systemd_path "$IDENTITY_DIR"
+validate_systemd_path "$RUNTIME_DIR"
+validate_systemd_path "$LOG_DIR"
+validate_systemd_path "$UNIT_PATH"
 mkdir -p "$PROGRAM_DIR" "$IDENTITY_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$UNIT_DIR"
 chmod 700 "$PROGRAM_DIR" "$IDENTITY_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$UNIT_DIR"
 cd "$ROOT"
 cargo build --release --bin devicelane-service
-install -m 700 target/release/devicelane-service "$SERVICE_PATH"
+BINARY_STAGE="$SERVICE_PATH.next"
+BINARY_BACKUP="$SERVICE_PATH.previous"
 UNIT_STAGE="$UNIT_PATH.next"
-trap 'rm -f "$UNIT_STAGE"' EXIT HUP INT TERM
+UNIT_BACKUP="$UNIT_PATH.previous"
+install -m 700 target/release/devicelane-service "$BINARY_STAGE"
+trap 'rm -f "$BINARY_STAGE" "$UNIT_STAGE"' EXIT HUP INT TERM
 cat >"$UNIT_STAGE" <<EOF
 [Unit]
 Description=DeviceLane per-user daemon
@@ -71,10 +131,8 @@ PrivateTmp=true
 WantedBy=default.target
 EOF
 chmod 600 "$UNIT_STAGE"
-mv "$UNIT_STAGE" "$UNIT_PATH"
+activate_linux_service
 trap - EXIT HUP INT TERM
-systemctl --user daemon-reload
-systemctl --user enable --now devicelane.service
 echo "DeviceLane service installed or repaired."
 echo "Identity: $IDENTITY_DIR"
 echo "Logs: $LOG_DIR"

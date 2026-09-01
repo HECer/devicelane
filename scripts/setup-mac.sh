@@ -103,6 +103,65 @@ xml_escape() {
     sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
+rollback_mac_service() {
+    launchctl bootout "$DAEMON_SERVICE" >/dev/null 2>&1 || true
+    if [ "$HAD_DAEMON_PROGRAM" = true ]; then cp -p "$DAEMON_PROGRAM_BACKUP" "$DAEMON_PROGRAM_PATH"; else rm -f "$DAEMON_PROGRAM_PATH"; fi
+    if [ "$HAD_DAEMON_PLIST" = true ]; then cp -p "$DAEMON_PLIST_BACKUP" "$DAEMON_PLIST_PATH"; else rm -f "$DAEMON_PLIST_PATH"; fi
+    if [ "$WAS_DAEMON_LOADED" = true ]; then
+        launchctl bootstrap "gui/$(id -u)" "$DAEMON_PLIST_PATH" &&
+        launchctl kickstart -k "$DAEMON_SERVICE" &&
+        launchctl print "$DAEMON_SERVICE" >/dev/null
+    fi
+}
+
+activate_mac_service() {
+    HAD_DAEMON_PROGRAM=false; HAD_DAEMON_PLIST=false; WAS_DAEMON_LOADED=false
+    [ -f "$DAEMON_PROGRAM_PATH" ] && { cp -p "$DAEMON_PROGRAM_PATH" "$DAEMON_PROGRAM_BACKUP"; HAD_DAEMON_PROGRAM=true; }
+    [ -f "$DAEMON_PLIST_PATH" ] && { cp -p "$DAEMON_PLIST_PATH" "$DAEMON_PLIST_BACKUP"; HAD_DAEMON_PLIST=true; }
+    launchctl print "$DAEMON_SERVICE" >/dev/null 2>&1 && WAS_DAEMON_LOADED=true || true
+    if ! (
+        { [ "$WAS_DAEMON_LOADED" = false ] || launchctl bootout "$DAEMON_SERVICE"; } &&
+        mv -f "$DAEMON_PROGRAM_STAGE" "$DAEMON_PROGRAM_PATH" &&
+        mv -f "$DAEMON_PLIST_STAGE" "$DAEMON_PLIST_PATH" &&
+        launchctl bootstrap "gui/$(id -u)" "$DAEMON_PLIST_PATH" &&
+        launchctl kickstart -k "$DAEMON_SERVICE" &&
+        launchctl print "$DAEMON_SERVICE" >/dev/null
+    ); then
+        if rollback_mac_service; then
+            rm -f "$DAEMON_PROGRAM_BACKUP" "$DAEMON_PLIST_BACKUP"
+        else
+            echo "DeviceLane rollback could not restore a healthy service; backups were retained" >&2
+        fi
+        rm -f "$DAEMON_PROGRAM_STAGE" "$DAEMON_PLIST_STAGE"
+        return 1
+    fi
+    rm -f "$DAEMON_PROGRAM_BACKUP" "$DAEMON_PLIST_BACKUP"
+}
+
+mac_service_status() {
+    if [ ! -f "$DAEMON_PLIST_PATH" ]; then
+        printf 'Installed=false\nRunning=false\nAutostart=unavailable\nLogs=%s\n' "$DAEMON_LOG_DIR"
+        return 1
+    fi
+    launchctl print "$DAEMON_SERVICE" >/dev/null 2>&1 && RUNNING=true || RUNNING=false
+    if launchctl print-disabled "gui/$(id -u)" | grep -q '"dev.devicelane.service" => true'; then AUTOSTART=disabled; else AUTOSTART=enabled; fi
+    printf 'Installed=true\nRunning=%s\nAutostart=%s\nLogs=%s\n' "$RUNNING" "$AUTOSTART" "$DAEMON_LOG_DIR"
+}
+
+mac_enable_autostart() {
+    [ -f "$DAEMON_PLIST_PATH" ] || { echo "DeviceLane service is not installed" >&2; return 1; }
+    launchctl enable "$DAEMON_SERVICE"
+    if launchctl print "$DAEMON_SERVICE" >/dev/null 2>&1; then
+        : "already loaded"
+    else
+        launchctl bootstrap "gui/$(id -u)" "$DAEMON_PLIST_PATH"
+    fi
+    launchctl kickstart -k "$DAEMON_SERVICE"
+    launchctl print "$DAEMON_SERVICE" >/dev/null
+}
+
+if [ "${DEVICELANE_LIFECYCLE_SOURCE_ONLY:-0}" = 1 ]; then return 0; fi
+
 if [ "$DRY_RUN" = true ]; then
     printf 'NEXT_CONTROLLER_COMMAND=%s\n' "$PAIR_COMMAND"
     printf 'DIAGNOSTIC_BUNDLE=%s\n' "$DIAGNOSTIC_BUNDLE"
@@ -112,12 +171,9 @@ fi
 if [ -n "$DAEMON_MODE" ]; then
     case "$DAEMON_MODE" in
         status)
-            [ -f "$DAEMON_PLIST_PATH" ] && INSTALLED=true || INSTALLED=false
-            launchctl print "$DAEMON_SERVICE" >/dev/null 2>&1 && RUNNING=true || RUNNING=false
-            if launchctl print-disabled "gui/$(id -u)" | grep -q '"dev.devicelane.service" => true'; then AUTOSTART=disabled; else AUTOSTART=enabled; fi
-            printf 'Installed=%s\nRunning=%s\nAutostart=%s\nLogs=%s\n' "$INSTALLED" "$RUNNING" "$AUTOSTART" "$DAEMON_LOG_DIR"
-            exit ;;
-        autostart-enable) launchctl enable "$DAEMON_SERVICE"; launchctl bootstrap "gui/$(id -u)" "$DAEMON_PLIST_PATH" 2>/dev/null || true; launchctl kickstart -k "$DAEMON_SERVICE"; exit ;;
+            mac_service_status; exit ;;
+        autostart-enable)
+            mac_enable_autostart; exit ;;
         autostart-disable) launchctl bootout "$DAEMON_SERVICE" >/dev/null 2>&1 || true; launchctl disable "$DAEMON_SERVICE"; exit ;;
         logs) printf '%s\n' "$DAEMON_LOG_DIR"; exit ;;
     esac
@@ -125,13 +181,16 @@ if [ -n "$DAEMON_MODE" ]; then
     chmod 700 "$DAEMON_PROGRAM_DIR" "$DAEMON_IDENTITY_DIR" "$DAEMON_STATE_DIR" "$DAEMON_RUNTIME_DIR" "$DAEMON_LOG_DIR"
     cd "$ROOT"
     cargo build --release --bin devicelane-service >/dev/null
-    install -m 700 target/release/devicelane-service "$DAEMON_PROGRAM_PATH"
+    DAEMON_PROGRAM_STAGE="$DAEMON_PROGRAM_PATH.next"
+    DAEMON_PROGRAM_BACKUP="$DAEMON_PROGRAM_PATH.previous"
+    DAEMON_PLIST_BACKUP="$DAEMON_PLIST_PATH.previous"
+    install -m 700 target/release/devicelane-service "$DAEMON_PROGRAM_STAGE"
     DAEMON_PLIST_STAGE="$DAEMON_PLIST_PATH.next"
     DAEMON_PLIST_PROGRAM_PATH=$(printf '%s' "$DAEMON_PROGRAM_PATH" | xml_escape)
     DAEMON_PLIST_IDENTITY_DIR=$(printf '%s' "$DAEMON_IDENTITY_DIR" | xml_escape)
     DAEMON_PLIST_RUNTIME_DIR=$(printf '%s' "$DAEMON_RUNTIME_DIR" | xml_escape)
     DAEMON_PLIST_LOG_DIR=$(printf '%s' "$DAEMON_LOG_DIR" | xml_escape)
-    trap 'rm -f "$DAEMON_PLIST_STAGE"' EXIT HUP INT TERM
+    trap 'rm -f "$DAEMON_PROGRAM_STAGE" "$DAEMON_PLIST_STAGE"' EXIT HUP INT TERM
     cat >"$DAEMON_PLIST_STAGE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -150,11 +209,8 @@ if [ -n "$DAEMON_MODE" ]; then
 EOF
     chmod 600 "$DAEMON_PLIST_STAGE"
     "$PLUTIL" -lint "$DAEMON_PLIST_STAGE" >/dev/null
-    mv "$DAEMON_PLIST_STAGE" "$DAEMON_PLIST_PATH"
+    activate_mac_service
     trap - EXIT HUP INT TERM
-    launchctl bootout "$DAEMON_SERVICE" >/dev/null 2>&1 || true
-    launchctl bootstrap "gui/$(id -u)" "$DAEMON_PLIST_PATH"
-    launchctl kickstart -k "$DAEMON_SERVICE"
     exit
 fi
 
