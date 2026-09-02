@@ -12,7 +12,8 @@ The first invocation downloads the matching native binary from the corresponding
 the published SHA-256 manifest, and stores it in the user's cache directory. No
 package lifecycle scripts run during installation.
 
-Commands: `devicelane` (unified client), `devicelane-service`,
+Commands: `devicelane` (unified client with `mesh`, `activities`, `approvals`, `policy`, and
+`audit` authenticated local dashboard commands), `devicelane-service`,
 `devicelane-agent`, and `devicelane-registry`. The legacy `mesh-cli`,
 `mesh-agent`, and `mesh-registry` command names remain available.
 

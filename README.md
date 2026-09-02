@@ -241,6 +241,13 @@ sh ./scripts/setup-mac.sh --controller CONTROLLER_HOST --upgrade   # rebuild and
 sh ./scripts/setup-mac.sh --controller CONTROLLER_HOST --uninstall # remove installed binaries/service
 ```
 
+The unified `devicelane` client exposes the dashboard over authenticated local IPC. Commands include
+`mesh status|watch`, `activities list|watch|cancel`, `approvals list|request|decide`,
+`policy list|put|delete`, and `audit list|export`. Every daemon request requires `--local`;
+`--json` returns stable JSON and activity watch returns NDJSON. Events are acknowledged only after
+stdout accepts and flushes them. Administrative changes use typed approval and access flags; raw
+shell commands and raw IPC JSON are not accepted.
+
 The per-user DeviceLane daemon has an independent lifecycle and keeps its identity and logs when
 uninstalled:
 
