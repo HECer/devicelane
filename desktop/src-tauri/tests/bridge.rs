@@ -175,7 +175,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     );
 
     let registry_address = free_address();
-    let _registry = spawn(
+    let mut registry = spawn(
         &workspace_binary("mesh-registry"),
         &[
             "--listen",
@@ -193,7 +193,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     let marker = root.path().join("agent-tool.log");
     let xcodebuild = fake_apple_tool(root.path(), "xcodebuild", &marker, 0);
     let devicectl = fake_apple_tool(root.path(), "devicectl", &marker, 0);
-    let simctl = fake_apple_tool(root.path(), "simctl", &marker, 1_500);
+    let simctl = fake_apple_tool(root.path(), "simctl", &marker, 4_000);
     let _agent = spawn(
         &workspace_binary("mesh-agent"),
         &[
@@ -258,6 +258,76 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     );
     wait_for_daemon(&endpoint);
 
+    let denied_activity_id = "real-windows-to-mac-denied";
+    let denied_access = AccessRequest {
+        activity_id: ActivityId::parse(denied_activity_id).unwrap(),
+        principal_id: PrincipalId::parse("windows-principal").unwrap(),
+        source_host_id: HostId::parse("windows-client").unwrap(),
+        target_host_id: HostId::parse("mac-agent").unwrap(),
+        device_id: Some(device_development_mesh::dashboard::DeviceId::parse("iphone-1").unwrap()),
+        operation: OperationId::parse("workspace.read").unwrap(),
+        resources: vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease],
+        physical_device: true,
+        user_present: true,
+    };
+    let (client_pid, denied_created) = devicelane_cli_process(
+        &endpoint_text(&endpoint),
+        &[
+            "approvals",
+            "request",
+            "--local",
+            "--json",
+            "--activity-id",
+            denied_activity_id,
+            "--principal-id",
+            "windows-principal",
+            "--source-host-id",
+            "windows-client",
+            "--target-host-id",
+            "mac-agent",
+            "--device-id",
+            "iphone-1",
+            "--operation",
+            "workspace.read",
+            "--resource",
+            "workspace_read",
+            "--resource",
+            "device_lease",
+            "--physical-device",
+            "--user-present",
+        ],
+    );
+    assert!(
+        client_pid > 0,
+        "the Windows client must be a genuine child process"
+    );
+    assert!(
+        denied_created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&denied_created.stderr)
+    );
+    let LocalResponse::ApprovalCreated { nonce, .. } =
+        serde_json::from_slice(&denied_created.stdout).unwrap()
+    else {
+        panic!("first approval request did not return a challenge")
+    };
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::DecideApproval {
+                version: LocalProtocolVersion::CURRENT,
+                nonce,
+                access: denied_access,
+                decision: ApprovalDecision::DenyOnce,
+            }
+        )
+        .unwrap(),
+        LocalResponse::ApprovalDecided {
+            decision: ApprovalDecision::DenyOnce,
+            ..
+        }
+    ));
+
     let activity_id = "real-windows-to-mac-activity";
     let access = AccessRequest {
         activity_id: ActivityId::parse(activity_id).unwrap(),
@@ -270,7 +340,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
         physical_device: true,
         user_present: true,
     };
-    let created = devicelane_cli(
+    let (resubmitted_pid, created) = devicelane_cli_process(
         &endpoint_text(&endpoint),
         &[
             "approvals",
@@ -296,6 +366,10 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
             "--physical-device",
             "--user-present",
         ],
+    );
+    assert_ne!(
+        client_pid, resubmitted_pid,
+        "resubmission must execute a new client process"
     );
     assert!(
         created.status.success(),
@@ -350,6 +424,20 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     assert_eq!(
         activity.resources,
         vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease]
+    );
+    let occupancy_edges: std::collections::BTreeSet<_> = activity
+        .resources
+        .iter()
+        .cloned()
+        .map(|resource| (activity.activity_id.clone(), resource))
+        .collect();
+    assert_eq!(
+        occupancy_edges,
+        std::collections::BTreeSet::from([
+            (activity.activity_id.clone(), ResourceClass::WorkspaceRead),
+            (activity.activity_id.clone(), ResourceClass::DeviceLease),
+        ]),
+        "the running operation must expose one explicit activity-to-resource occupancy edge per resource"
     );
 
     let cursor = device_development_mesh::dashboard::EventCursor {
@@ -408,6 +496,43 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
         );
     }
 
+    let EventRead::Events {
+        next_cursor: resume_cursor,
+        ..
+    } = direct
+    else {
+        unreachable!()
+    };
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::AcknowledgeEvents {
+                version: LocalProtocolVersion::CURRENT,
+                subscriber_id: SubscriberId::parse("desktop-e2e-client").unwrap(),
+                cursor: resume_cursor,
+            }
+        )
+        .unwrap(),
+        LocalResponse::Acknowledged
+    ));
+    registry.kill().unwrap();
+    registry.wait().unwrap();
+    wait_for_activity(&bridge, activity_id, "reconnecting");
+    registry = spawn(
+        &workspace_binary("mesh-registry"),
+        &[
+            "--listen",
+            &registry_address,
+            "--identity",
+            registry_identity.to_str().unwrap(),
+            "--offline-after-ms",
+            "500",
+            "--agent-peer",
+            "mac-agent",
+        ],
+    );
+    wait_for_mesh_host(&registry_address, &service_identity, "mac-agent");
+
     let terminal = wait_for_activity(&bridge, activity_id, "succeeded");
     assert_eq!(
         terminal
@@ -417,6 +542,32 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
             .count(),
         1
     );
+    let resumed = bridge
+        .activity_events(DashboardScope::Local, resume_cursor, 256)
+        .unwrap();
+    let EventRead::Events {
+        events: resumed_events,
+        next_cursor,
+        ..
+    } = resumed
+    else {
+        panic!("cursor resume unexpectedly required a snapshot resync")
+    };
+    assert!(next_cursor.sequence > resume_cursor.sequence);
+    assert!(resumed_events.iter().any(|event| {
+        event.activity_id.as_str() == activity_id
+            && event.state == device_development_mesh::dashboard::ActivityState::Reconnecting
+    }));
+    assert!(resumed_events.iter().any(|event| {
+        event.activity_id.as_str() == activity_id
+            && event.state == device_development_mesh::dashboard::ActivityState::Running
+    }));
+    assert!(
+        resumed_events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+    drop(registry);
 
     let direct_audit = send_local_request(
         &endpoint,
@@ -508,7 +659,7 @@ fn wait_for_activity(
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {expected}"
+            "timed out waiting for {expected}; last snapshot: {snapshot:?}"
         );
         thread::sleep(Duration::from_millis(25));
     }
@@ -627,11 +778,19 @@ fn endpoint_text(endpoint: &LocalEndpoint) -> String {
 }
 
 fn devicelane_cli(endpoint: &str, args: &[&str]) -> Output {
-    Command::new(workspace_binary("devicelane"))
+    devicelane_cli_process(endpoint, args).1
+}
+
+fn devicelane_cli_process(endpoint: &str, args: &[&str]) -> (u32, Output) {
+    let child = Command::new(workspace_binary("devicelane"))
         .args(args)
         .args(["--endpoint", endpoint])
-        .output()
-        .unwrap()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let process_id = child.id();
+    (process_id, child.wait_with_output().unwrap())
 }
 
 fn fake_apple_tool(root: &Path, name: &str, marker: &Path, delay_ms: u64) -> PathBuf {
