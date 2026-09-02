@@ -238,6 +238,27 @@ describe("DeviceLane desktop foundation", () => {
     expect(screen.queryByText(/erneut eine Synchronisierung/)).not.toBeInTheDocument();
   }, 4_000);
 
+  it("resyncs the same snapshot revision again when the daemon epoch changes directly", async () => {
+    const activityEvents = vi.fn()
+      .mockResolvedValueOnce({
+        result: "resync_required",
+        oldest_available: { epoch: "2", sequence: "0" },
+        snapshot_revision: "8"
+      })
+      .mockResolvedValueOnce({
+        result: "resync_required",
+        oldest_available: { epoch: "3", sequence: "0" },
+        snapshot_revision: "8"
+      })
+      .mockImplementation(() => new Promise<never>(() => undefined));
+    const client = fakeClient({ activityEvents });
+
+    render(<App client={client} />);
+
+    await waitFor(() => expect(client.dashboardSnapshot).toHaveBeenCalledTimes(3));
+    expect(screen.queryByText(/erneut eine Synchronisierung/)).not.toBeInTheDocument();
+  });
+
   it("accepts a lower snapshot revision after the activity stream enters a new epoch", async () => {
     const oldEpoch = {
       ...dashboard,

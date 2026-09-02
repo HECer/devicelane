@@ -695,6 +695,24 @@ fn watch_activity(
                     }
                 }
             }
+            LocalResponse::ActivityEvents(EventRead::CursorAhead { .. }) => {
+                return Err(WatchFailure::Daemon {
+                    code: "cursor_ahead".into(),
+                    message: "activity cursor is ahead of the available stream".into(),
+                });
+            }
+            LocalResponse::ActivityEvents(EventRead::ResyncRequired { .. }) => {
+                return Err(WatchFailure::Daemon {
+                    code: "resync_required".into(),
+                    message: "activity cursor requires a fresh snapshot".into(),
+                });
+            }
+            LocalResponse::ActivityEvents(EventRead::LimitExceeded) => {
+                return Err(WatchFailure::Daemon {
+                    code: "limit_exceeded".into(),
+                    message: "activity page exceeds the safe size limit".into(),
+                });
+            }
             LocalResponse::Error { code, message } => {
                 return Err(WatchFailure::Daemon { code, message });
             }

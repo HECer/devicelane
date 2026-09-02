@@ -150,7 +150,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
     let timer: number | undefined;
     let cursor: EventCursor = { epoch: "0", sequence: "0" };
     let reconnectAttempt = 0;
-    let lastResyncRevision: string | undefined;
+    let lastResyncKey: string | undefined;
     let cursorAheadRecovered = false;
 
     const schedule = (callback: () => void, delay: number) => {
@@ -163,7 +163,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
         if (controller.signal.aborted) return;
         switch (page.result) {
           case "events":
-            lastResyncRevision = undefined;
+            lastResyncKey = undefined;
             setEvents((current) => mergeActivityEvents(current, page.events));
             await client.acknowledgeEvents(subscriberId.current, page.next_cursor, controller.signal);
             cursor = page.next_cursor;
@@ -174,12 +174,13 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
             schedule(() => void pump(), page.events.length === 100 ? 0 : 1_000);
             return;
           case "resync_required": {
-            if (lastResyncRevision === page.snapshot_revision) {
+            const resyncKey = `${page.oldest_available.epoch}:${page.snapshot_revision}`;
+            if (lastResyncKey === resyncKey) {
               setStreamReconnecting(false);
               setStreamError("Aktivitätsstream benötigt erneut eine Synchronisierung");
               return;
             }
-            lastResyncRevision = page.snapshot_revision;
+            lastResyncKey = resyncKey;
             const freshSnapshot = await client.dashboardSnapshot(scope, controller.signal);
             if (controller.signal.aborted) return;
             dashboardEpoch.current = page.oldest_available.epoch;
