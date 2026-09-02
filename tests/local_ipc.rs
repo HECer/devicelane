@@ -613,6 +613,42 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
             }
         )
     ));
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::ActivityEvents {
+                version: LocalProtocolVersion::CURRENT,
+                cursor: EventCursor {
+                    epoch: 1,
+                    sequence: u64::MAX,
+                },
+                limit: 32,
+            }
+        )
+        .unwrap(),
+        LocalResponse::ActivityEvents(
+            device_development_mesh::dashboard::event_log::EventRead::CursorAhead {
+                newest_available: EventCursor { epoch: 1, .. }
+            }
+        )
+    ));
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::ActivityEvents {
+                version: LocalProtocolVersion::CURRENT,
+                cursor: EventCursor {
+                    epoch: 1,
+                    sequence: 0,
+                },
+                limit: 0,
+            }
+        )
+        .unwrap(),
+        LocalResponse::ActivityEvents(
+            device_development_mesh::dashboard::event_log::EventRead::LimitExceeded
+        )
+    ));
     let events = send_eventually(
         &endpoint,
         &LocalRequest::ActivityEvents {

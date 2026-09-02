@@ -646,15 +646,7 @@ impl DaemonState {
                     .dashboard
                     .as_ref()
                     .ok_or(LocalProtocolError::FeatureUnavailable)?;
-                let read = service.events(cursor, limit);
-                match read {
-                    EventRead::CursorAhead { .. } => Err(LocalProtocolError::CursorAhead),
-                    resync @ EventRead::ResyncRequired { .. } => {
-                        Ok(LocalResponse::ActivityEvents(resync))
-                    }
-                    EventRead::LimitExceeded => Err(LocalProtocolError::LimitExceeded),
-                    events => Ok(LocalResponse::ActivityEvents(events)),
-                }
+                Ok(LocalResponse::ActivityEvents(service.events(cursor, limit)))
             }
             LocalRequest::AcknowledgeEvents {
                 subscriber_id,

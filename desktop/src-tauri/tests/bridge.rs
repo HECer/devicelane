@@ -251,6 +251,25 @@ fn javascript_dashboard_wire_serializes_every_u64_as_an_exact_decimal_string() {
 }
 
 #[test]
+fn javascript_dashboard_wire_keeps_cursor_and_limit_recovery_variants_structured() {
+    let cursor_ahead = serde_json::to_value(JavaScriptWire(EventRead::CursorAhead {
+        newest_available: EventCursor {
+            epoch: u64::MAX,
+            sequence: u64::MAX - 1,
+        },
+    }))
+    .unwrap();
+    let limit = serde_json::to_value(JavaScriptWire(EventRead::LimitExceeded)).unwrap();
+
+    assert_eq!(cursor_ahead["result"], "cursor_ahead");
+    assert_eq!(
+        cursor_ahead["newest_available"]["epoch"],
+        u64::MAX.to_string()
+    );
+    assert_eq!(limit["result"], "limit_exceeded");
+}
+
+#[test]
 fn repair_uses_only_fixed_platform_programs_and_arguments() {
     let root = Path::new("/trusted/resources");
     let linux_binary = Path::new("/trusted/bin/devicelane-service");
