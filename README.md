@@ -317,6 +317,14 @@ health unavailable, and rejects subsequent auditable mutations until the service
 store. Registry event resync remains distinct from transport reconnect, and daemon restart recovery
 terminates interrupted work without inventing a replacement activity.
 
+Windows-origin approval requests use the separately paired Windows identity and the registry mTLS
+path. Invoke `devicelane approvals request --local --json` with `--mesh-registry` and
+`--mesh-identity`, and omit `--principal-id` and `--source-host-id`. DeviceLane derives the Windows
+SID with the native OS token API and the source host from the certificate identity, signs the exact
+access request, and accepts the target approval only after the registry and target verify the full
+signature chain. Free or mismatched remote principal/source values fail with
+`mesh_identity_mismatch` before an approval is created.
+
 The normal CI matrix runs the locked Rust workspace, the Tauri bridge, the React dashboard tests,
 type checking, production frontend build, and lifecycle contract/smoke checks on Windows, macOS,
 and Linux. That deterministic fixture coverage does not prove a physical Mac pass. A production

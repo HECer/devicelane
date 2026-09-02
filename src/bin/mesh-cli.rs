@@ -61,7 +61,9 @@ fn main() {
         return;
     }
     if a.first().map(String::as_str) == Some("pair") {
-        let mut identity = SecureTransport::load_or_create(value(&a, "--identity"), "cli").unwrap();
+        let peer_id = optional_value(&a, "--peer-id").unwrap_or_else(|| "cli".into());
+        let mut identity =
+            SecureTransport::load_or_create(value(&a, "--identity"), peer_id).unwrap();
         let mut reader = BufReader::new(connect(&value(&a, "--address")));
         let mut challenge = String::new();
         reader.read_line(&mut challenge).unwrap();
@@ -75,7 +77,8 @@ fn main() {
         identity.trust("registry", &certificate).unwrap();
         return;
     }
-    let transport = SecureTransport::load_or_create(value(&a, "--identity"), "cli").unwrap();
+    let peer_id = optional_value(&a, "--peer-id").unwrap_or_else(|| "cli".into());
+    let transport = SecureTransport::load_or_create(value(&a, "--identity"), peer_id).unwrap();
     let address = value(&a, "--registry");
     if a.iter().any(|item| item == "hardware-gate") {
         run_hardware_gate(&a, &address, &transport);

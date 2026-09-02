@@ -1,9 +1,9 @@
 pub mod controller_session {
+    use crate::dashboard::model::{HostId, PrincipalId};
+    use crate::dashboard::policy::AccessRequest;
     use crate::secure_transport::{SecureTransport, TransportError};
     use rand::{RngCore, rngs::OsRng};
     use serde::{Deserialize, Serialize};
-    #[cfg(windows)]
-    use std::process::Command;
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(deny_unknown_fields)]
@@ -46,6 +46,135 @@ pub mod controller_session {
         Expired,
     }
 
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct MeshApprovalPayload {
+        pub access: AccessRequest,
+        pub registry_peer_id: String,
+        pub controller_peer_id: String,
+        pub os_principal_id: String,
+        pub session_id: String,
+        pub issued_at_ms: u64,
+        pub expires_at_ms: u64,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct MeshApprovalAssertion {
+        pub payload: MeshApprovalPayload,
+        pub signature: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct MeshAccessClaim {
+        pub access: AccessRequest,
+        pub controller_peer_id: String,
+        pub os_principal_id: String,
+    }
+
+    pub fn sign_mesh_access_claim(
+        controller: &SecureTransport,
+        mut access: AccessRequest,
+    ) -> Result<(MeshAccessClaim, Vec<u8>), ControllerSessionError> {
+        let controller_peer_id = controller
+            .identity_id()
+            .map_err(|_| ControllerSessionError::InvalidInput)?;
+        let os_principal_id = current_os_principal()?;
+        access.principal_id = PrincipalId::parse(os_principal_id.clone())
+            .map_err(|_| ControllerSessionError::InvalidInput)?;
+        access.source_host_id = HostId::parse(controller_peer_id.clone())
+            .map_err(|_| ControllerSessionError::InvalidInput)?;
+        let claim = MeshAccessClaim {
+            access,
+            controller_peer_id,
+            os_principal_id,
+        };
+        let signature = controller
+            .sign(&serde_json::to_vec(&claim).map_err(|_| ControllerSessionError::InvalidInput)?)
+            .map_err(map_signature)?;
+        Ok((claim, signature))
+    }
+
+    pub fn issue_mesh_approval(
+        registry: &SecureTransport,
+        authenticated_controller_peer: &str,
+        claim: MeshAccessClaim,
+        client_signature: &[u8],
+        issued_at_ms: u64,
+        lifetime_ms: u64,
+    ) -> Result<MeshApprovalAssertion, ControllerSessionError> {
+        if lifetime_ms == 0 || lifetime_ms > 60_000 {
+            return Err(ControllerSessionError::InvalidInput);
+        }
+        let controller = authenticated_controller_peer.to_owned();
+        if claim.controller_peer_id != controller
+            || claim.access.source_host_id.as_str() != controller
+            || claim.access.principal_id.as_str() != claim.os_principal_id
+            || claim.os_principal_id.is_empty()
+        {
+            return Err(ControllerSessionError::InvalidInput);
+        }
+        registry
+            .verify_peer_signature(
+                authenticated_controller_peer,
+                &serde_json::to_vec(&claim).map_err(|_| ControllerSessionError::InvalidInput)?,
+                client_signature,
+            )
+            .map_err(map_signature)?;
+        let registry_peer_id = registry
+            .identity_id()
+            .map_err(|_| ControllerSessionError::InvalidInput)?;
+        let mut random = [0_u8; 32];
+        OsRng.fill_bytes(&mut random);
+        let payload = MeshApprovalPayload {
+            access: claim.access,
+            registry_peer_id,
+            controller_peer_id: controller,
+            os_principal_id: claim.os_principal_id,
+            session_id: random.iter().map(|byte| format!("{byte:02x}")).collect(),
+            issued_at_ms,
+            expires_at_ms: issued_at_ms
+                .checked_add(lifetime_ms)
+                .ok_or(ControllerSessionError::InvalidInput)?,
+        };
+        let signature = registry
+            .sign(&serde_json::to_vec(&payload).map_err(|_| ControllerSessionError::InvalidInput)?)
+            .map_err(map_signature)?;
+        Ok(MeshApprovalAssertion { payload, signature })
+    }
+
+    pub fn verify_mesh_approval(
+        verifier: &SecureTransport,
+        assertion: &MeshApprovalAssertion,
+        expected_registry_peer: &str,
+        expected_target_host: &HostId,
+        now_ms: u64,
+    ) -> Result<AccessRequest, ControllerSessionError> {
+        let payload = &assertion.payload;
+        if payload.registry_peer_id != expected_registry_peer {
+            return Err(ControllerSessionError::ControllerPeerMismatch);
+        }
+        if payload.access.target_host_id != *expected_target_host
+            || payload.access.principal_id.as_str() != payload.os_principal_id
+            || payload.access.source_host_id.as_str() != payload.controller_peer_id
+            || payload.os_principal_id.is_empty()
+        {
+            return Err(ControllerSessionError::InvalidInput);
+        }
+        if now_ms < payload.issued_at_ms || now_ms > payload.expires_at_ms {
+            return Err(ControllerSessionError::Expired);
+        }
+        verifier
+            .verify_peer_signature(
+                expected_registry_peer,
+                &serde_json::to_vec(payload).map_err(|_| ControllerSessionError::InvalidInput)?,
+                &assertion.signature,
+            )
+            .map_err(map_signature)?;
+        Ok(payload.access.clone())
+    }
+
     fn canonical(payload: &ControllerSessionPayload) -> Result<Vec<u8>, ControllerSessionError> {
         serde_json::to_vec(payload).map_err(|_| ControllerSessionError::InvalidInput)
     }
@@ -56,28 +185,13 @@ pub mod controller_session {
     }
 
     #[cfg(windows)]
-    fn os_principal() -> Result<String, ControllerSessionError> {
-        let output = Command::new("whoami")
-            .args(["/user", "/fo", "csv", "/nh"])
-            .output()
-            .map_err(|_| ControllerSessionError::PrincipalUnavailable)?;
-        if !output.status.success() {
-            return Err(ControllerSessionError::PrincipalUnavailable);
-        }
-        let sid = String::from_utf8_lossy(&output.stdout)
-            .split(',')
-            .nth(1)
-            .unwrap_or_default()
-            .trim()
-            .trim_matches('"')
-            .to_ascii_lowercase();
-        (!sid.is_empty())
-            .then_some(sid)
-            .ok_or(ControllerSessionError::PrincipalUnavailable)
+    pub fn current_os_principal() -> Result<String, ControllerSessionError> {
+        crate::local_ipc::current_process_principal()
+            .map_err(|_| ControllerSessionError::PrincipalUnavailable)
     }
 
     #[cfg(unix)]
-    fn os_principal() -> Result<String, ControllerSessionError> {
+    pub fn current_os_principal() -> Result<String, ControllerSessionError> {
         Ok(format!("uid-{}", unsafe { libc::geteuid() }))
     }
 
@@ -104,7 +218,7 @@ pub mod controller_session {
         let payload = ControllerSessionPayload {
             controller_endpoint: controller_endpoint.to_owned(),
             controller_peer_id: controller_peer_id.clone(),
-            principal_id: os_principal()?,
+            principal_id: current_os_principal()?,
             source_host_id: controller_peer_id,
             session_id,
             challenge: challenge.to_owned(),
@@ -3354,6 +3468,10 @@ pub mod network_processes {
             events: Vec<NetworkEvent>,
         },
         List,
+        AuthenticateDashboardAccess {
+            claim: crate::controller_session::MeshAccessClaim,
+            client_signature: Vec<u8>,
+        },
         Run {
             operation: RunRequest,
         },

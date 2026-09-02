@@ -1,3 +1,4 @@
+use crate::controller_session::{MeshApprovalAssertion, verify_mesh_approval};
 use crate::dashboard::audit::{AuditDeletionScope, AuditExport, AuditFilter, ExportManifest};
 use crate::dashboard::event_log::EventRead;
 use crate::dashboard::model::{
@@ -56,6 +57,11 @@ compile_error!("local IPC peer credentials are supported only on Linux and macOS
 pub const MAX_FRAME_BYTES: usize = 512 * 1024;
 pub const MAX_LOCAL_WORKERS: usize = 8;
 
+#[cfg(windows)]
+pub(crate) fn current_process_principal() -> Result<String, LocalProtocolError> {
+    platform::current_user_sid().map(|sid| sid.to_ascii_lowercase())
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalProtocolVersion {
@@ -93,6 +99,11 @@ pub enum LocalRequest {
     RequestApproval {
         version: LocalProtocolVersion,
         access: AccessRequest,
+        lifetime_ms: u64,
+    },
+    RequestAuthenticatedApproval {
+        version: LocalProtocolVersion,
+        assertion: MeshApprovalAssertion,
         lifetime_ms: u64,
     },
     RequestAdminMutationApproval {
@@ -195,6 +206,7 @@ impl LocalRequest {
             | Self::SetAutostart { version, .. }
             | Self::Diagnostics { version }
             | Self::RequestApproval { version, .. }
+            | Self::RequestAuthenticatedApproval { version, .. }
             | Self::RequestAdminMutationApproval { version, .. }
             | Self::DecideApproval { version, .. }
             | Self::DecidePendingApproval { version, .. }
@@ -350,6 +362,7 @@ pub enum LocalProtocolError {
     LimitExceeded,
     RevisionConflict,
     TargetOffline,
+    MeshIdentityMismatch,
     RemoteUnavailable,
 }
 
@@ -376,6 +389,9 @@ impl fmt::Display for LocalProtocolError {
                 Self::RevisionConflict => "dashboard revision conflict",
                 Self::TargetOffline => {
                     "target is offline; reconnect the paired target before requesting approval"
+                }
+                Self::MeshIdentityMismatch => {
+                    "mesh identity does not match the signed authenticated session"
                 }
                 Self::RemoteUnavailable => {
                     "remote execution unavailable; verify paired registry and agent connectivity"
@@ -768,6 +784,7 @@ impl DaemonState {
                 Ok(LocalResponse::Diagnostics(self.diagnostics.clone()))
             }
             LocalRequest::RequestApproval { .. }
+            | LocalRequest::RequestAuthenticatedApproval { .. }
             | LocalRequest::DecideApproval { .. }
             | LocalRequest::DecidePendingApproval { .. }
             | LocalRequest::DashboardSnapshot { .. }
@@ -811,6 +828,20 @@ impl DaemonState {
                 let requires_remote_target =
                     access.resources.contains(&ResourceClass::WorkspaceRead)
                         && access.resources.contains(&ResourceClass::DeviceLease);
+                let production_mesh_identity =
+                    self.remote_execution.as_ref().is_some_and(|config| {
+                        config.identity_path.join("certificate.der").is_file()
+                            && config.identity_path.join("private-key.der").is_file()
+                    });
+                if requires_remote_target
+                    && production_mesh_identity
+                    && self
+                        .dashboard
+                        .as_ref()
+                        .is_some_and(|service| access.source_host_id != *service.local_host_id())
+                {
+                    return Err(LocalProtocolError::MeshIdentityMismatch);
+                }
                 if requires_remote_target {
                     let online = self
                         .remote_execution
@@ -871,6 +902,73 @@ impl DaemonState {
                 Ok(LocalResponse::ApprovalCreated {
                     nonce: approval.nonce,
                     expires_at_ms: approval.expires_at_ms,
+                })
+            }
+            LocalRequest::RequestAuthenticatedApproval {
+                assertion,
+                lifetime_ms,
+                ..
+            } => {
+                let config = self
+                    .remote_execution
+                    .as_ref()
+                    .ok_or(LocalProtocolError::MeshIdentityMismatch)?;
+                let verifier = SecureTransport::load_or_create(
+                    &config.identity_path,
+                    config.client_id.clone(),
+                )
+                .map_err(|_| LocalProtocolError::MeshIdentityMismatch)?;
+                let local_host = self
+                    .dashboard
+                    .as_ref()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .local_host_id()
+                    .clone();
+                let access = verify_mesh_approval(
+                    &verifier,
+                    &assertion,
+                    &config.registry_peer_id,
+                    &local_host,
+                    now_ms,
+                )
+                .map_err(|_| LocalProtocolError::MeshIdentityMismatch)?;
+                if session.local_host_id() != &local_host {
+                    return Err(LocalProtocolError::MeshIdentityMismatch);
+                }
+                let online = self
+                    .remote_execution_boundary
+                    .as_ref()
+                    .and_then(|boundary| boundary.call(config, &MeshRequest::List).ok())
+                    .is_some_and(|response| {
+                        response.accepted
+                            && response.hosts.iter().any(|host| {
+                                host.id == access.target_host_id.as_str()
+                                    && host.status == "online"
+                                    && access.device_id.as_ref().is_none_or(|device_id| {
+                                        host.devices.iter().any(|device| {
+                                            device.id == device_id.as_str()
+                                                && device.state == "connected"
+                                        })
+                                    })
+                            })
+                    });
+                if !online {
+                    self.dashboard
+                        .as_mut()
+                        .ok_or(LocalProtocolError::FeatureUnavailable)?
+                        .record_preapproval_target_offline(&access, now_ms)
+                        .map_err(map_dashboard_error)?;
+                    return Err(LocalProtocolError::TargetOffline);
+                }
+                let (nonce, expires_at_ms) = self
+                    .dashboard
+                    .as_mut()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .request_approval(access, lifetime_ms, now_ms)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::ApprovalCreated {
+                    nonce,
+                    expires_at_ms,
                 })
             }
             LocalRequest::RequestAdminMutationApproval {
@@ -1719,6 +1817,7 @@ fn dispatch_connection(
                     if matches!(
                         request,
                         LocalRequest::RequestApproval { .. }
+                            | LocalRequest::RequestAuthenticatedApproval { .. }
                             | LocalRequest::RequestAdminMutationApproval { .. }
                             | LocalRequest::DecideApproval { .. }
                             | LocalRequest::DecidePendingApproval { .. }
@@ -1793,6 +1892,7 @@ fn error_response(error: LocalProtocolError) -> LocalResponse {
             LocalProtocolError::LimitExceeded => "limit_exceeded",
             LocalProtocolError::RevisionConflict => "revision_conflict",
             LocalProtocolError::TargetOffline => "target_offline",
+            LocalProtocolError::MeshIdentityMismatch => "mesh_identity_mismatch",
             LocalProtocolError::RemoteUnavailable => "remote_unavailable",
             _ => "invalid_request",
         }
@@ -2108,7 +2208,7 @@ mod platform {
         })
     }
 
-    fn current_user_sid() -> Result<String, LocalProtocolError> {
+    pub(super) fn current_user_sid() -> Result<String, LocalProtocolError> {
         let mut token = std::ptr::null_mut();
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
             return Err(LocalProtocolError::Unauthorized);

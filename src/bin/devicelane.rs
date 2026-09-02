@@ -1,5 +1,6 @@
 use device_development_mesh::controller_session::{
-    ControllerSessionAssertion, issue_controller_session, verify_controller_session,
+    ControllerSessionAssertion, MeshApprovalAssertion, issue_controller_session,
+    sign_mesh_access_claim, verify_controller_session,
 };
 use device_development_mesh::dashboard::{
     audit::AuditFilter, event_log::EventRead, policy::AccessRequest, service::AdminMutation, *,
@@ -8,11 +9,15 @@ use device_development_mesh::local_ipc::{
     LocalEndpoint, LocalProtocolVersion, LocalRequest, LocalResponse, local_endpoint,
     send_local_request,
 };
+use device_development_mesh::network_processes::{
+    Request as MeshRequest, Response as MeshResponse,
+};
 use device_development_mesh::secure_transport::SecureTransport;
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Write},
+    net::TcpStream,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -891,6 +896,16 @@ fn run() -> Result<(), String> {
 }
 fn main() {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args
+        .iter()
+        .any(|argument| argument == "--mesh-registry")
+    {
+        if let Err(error) = mesh_approval_command(&raw_args) {
+            eprintln!("devicelane: {error}");
+            std::process::exit(2)
+        }
+        return;
+    }
     if raw_args.first().map(String::as_str) == Some("controller-session") {
         if let Err(error) = controller_session_command(&raw_args) {
             eprintln!("devicelane: {error}");
@@ -902,6 +917,95 @@ fn main() {
         eprintln!("devicelane: {e}");
         std::process::exit(2)
     }
+}
+
+fn mesh_approval_command(args: &[String]) -> Result<(), String> {
+    let parsed = raw(args)?;
+    if parsed.pos != ["approvals", "request"] || !parsed.local || !parsed.json {
+        return Err("mesh approval requires `approvals request --local --json`".into());
+    }
+    if parsed.f.contains_key("--principal-id") || parsed.f.contains_key("--source-host-id") {
+        return Err(
+            "mesh_identity_mismatch: principal and source are derived from the authenticated mesh peer"
+                .into(),
+        );
+    }
+    let identity_path = PathBuf::from(req(&parsed, "--mesh-identity")?);
+    if !identity_path.join("certificate.der").is_file()
+        || !identity_path.join("private-key.der").is_file()
+    {
+        return Err("mesh_identity_missing: use an existing paired Windows identity".into());
+    }
+    let transport = SecureTransport::load_or_create(&identity_path, "windows-client")
+        .map_err(|_| "mesh_identity_invalid".to_owned())?;
+    let peer_id = transport
+        .identity_id()
+        .map_err(|_| "mesh_identity_invalid".to_owned())?;
+    let access = AccessRequest {
+        activity_id: id(req(&parsed, "--activity-id")?, ActivityId::parse)?,
+        principal_id: id(&peer_id, PrincipalId::parse)?,
+        source_host_id: id(&peer_id, HostId::parse)?,
+        target_host_id: id(req(&parsed, "--target-host-id")?, HostId::parse)?,
+        device_id: one(&parsed, "--device-id")?
+            .map(|value| id(value, DeviceId::parse))
+            .transpose()?,
+        operation: id(req(&parsed, "--operation")?, OperationId::parse)?,
+        resources: resources(&parsed)?,
+        physical_device: parsed.f.contains_key("--physical-device"),
+        user_present: parsed.f.contains_key("--user-present"),
+    };
+    let (claim, client_signature) = sign_mesh_access_claim(&transport, access)
+        .map_err(|_| "mesh_identity_invalid".to_owned())?;
+    let registry = req(&parsed, "--mesh-registry")?;
+    let stream =
+        TcpStream::connect(registry).map_err(|_| "mesh_registry_unavailable".to_owned())?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    let mut stream = transport
+        .connect_tls(stream, "registry")
+        .map_err(|_| "mesh_authentication_failed".to_owned())?;
+    serde_json::to_writer(
+        &mut stream,
+        &MeshRequest::AuthenticateDashboardAccess {
+            claim,
+            client_signature,
+        },
+    )
+    .map_err(|_| "mesh_protocol_failed".to_owned())?;
+    stream
+        .write_all(b"\n")
+        .map_err(|_| "mesh_protocol_failed".to_owned())?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|_| "mesh_protocol_failed".to_owned())?;
+    let response: MeshResponse =
+        serde_json::from_str(&line).map_err(|_| "mesh_protocol_failed".to_owned())?;
+    if !response.accepted {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "mesh_identity_mismatch".into()));
+    }
+    let assertion: MeshApprovalAssertion = response
+        .events
+        .iter()
+        .find(|event| event.kind == "authenticated_dashboard_access")
+        .and_then(|event| serde_json::from_str(&event.payload).ok())
+        .ok_or_else(|| "mesh_session_assertion_missing".to_owned())?;
+    let response = send_local_request(
+        &endpoint(parsed.endpoint.as_deref())?,
+        &LocalRequest::RequestAuthenticatedApproval {
+            version: LocalProtocolVersion::CURRENT,
+            assertion,
+            lifetime_ms: num(&parsed, "--lifetime-ms", 300_000)?,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    json(&response).map_err(|error| error.to_string())?;
+    if let LocalResponse::Error { code, message } = response {
+        return Err(format!("daemon error ({code}): {message}"));
+    }
+    Ok(())
 }
 
 fn controller_session_value<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {

@@ -1,3 +1,4 @@
+use device_development_mesh::controller_session::issue_mesh_approval;
 use device_development_mesh::network_processes::{
     ArtifactChunk, AuditRecord, HostSnapshot, LeaseGrant, LeaseRequest, NetworkArtifactMetadata,
     NetworkEvent, Request, Response, RunRequest,
@@ -599,6 +600,33 @@ fn handle(
             Response {
                 hosts,
                 ..response()
+            }
+        }
+        Request::AuthenticateDashboardAccess {
+            claim,
+            client_signature,
+        } => {
+            if agent_peers.contains(&peer_id) {
+                return write_response(&mut stream, error_response("controller_identity_required"));
+            }
+            match issue_mesh_approval(
+                transport,
+                &peer_id,
+                claim,
+                &client_signature,
+                unix_time_ms(),
+                60_000,
+            ) {
+                Ok(assertion) => Response {
+                    accepted: true,
+                    events: vec![NetworkEvent {
+                        sequence: 1,
+                        kind: "authenticated_dashboard_access".into(),
+                        payload: serde_json::to_string(&assertion).unwrap(),
+                    }],
+                    ..response()
+                },
+                Err(_) => error_response("mesh_identity_mismatch"),
             }
         }
         Request::Run { operation } => {

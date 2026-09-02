@@ -1,3 +1,4 @@
+use device_development_mesh::controller_session::current_os_principal;
 use device_development_mesh::dashboard::audit::{AuditFilter, ExportManifest, ExportSignature};
 use device_development_mesh::dashboard::event_log::EventRead;
 use device_development_mesh::dashboard::policy::AccessRequest;
@@ -163,15 +164,23 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     let registry_identity = root.path().join("registry");
     let service_identity = root.path().join("service").join("mac-agent");
     let agent_identity = root.path().join("mesh-agent");
-    pair_process(
+    let windows_identity = root.path().join("windows-client");
+    pair_process_as(
         &workspace_binary("mesh-cli"),
         &registry_identity,
         &service_identity,
+        "mac-controller",
     );
     pair_process(
         &workspace_binary("mesh-agent"),
         &registry_identity,
         &agent_identity,
+    );
+    pair_process_as(
+        &workspace_binary("mesh-cli"),
+        &registry_identity,
+        &windows_identity,
+        "windows-client",
     );
 
     let registry_address = free_address();
@@ -258,10 +267,70 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     );
     wait_for_daemon(&endpoint);
 
+    let spoofed = devicelane_cli(
+        &endpoint_text(&endpoint),
+        &[
+            "approvals",
+            "request",
+            "--local",
+            "--json",
+            "--mesh-registry",
+            &registry_address,
+            "--mesh-identity",
+            windows_identity.to_str().unwrap(),
+            "--activity-id",
+            "spoofed-windows-origin",
+            "--principal-id",
+            "spoofed-principal",
+            "--source-host-id",
+            "spoofed-source",
+            "--target-host-id",
+            "mac-agent",
+            "--device-id",
+            "iphone-1",
+            "--operation",
+            "workspace.read",
+            "--resource",
+            "workspace_read",
+            "--resource",
+            "device_lease",
+            "--physical-device",
+            "--user-present",
+        ],
+    );
+    assert!(!spoofed.status.success());
+    assert!(String::from_utf8_lossy(&spoofed.stderr).contains("mesh_identity_mismatch"));
+    let direct_spoof = send_local_request(
+        &endpoint,
+        &LocalRequest::RequestApproval {
+            version: LocalProtocolVersion::CURRENT,
+            access: AccessRequest {
+                activity_id: ActivityId::parse("direct-spoofed-windows-origin").unwrap(),
+                principal_id: PrincipalId::parse("spoofed-principal").unwrap(),
+                source_host_id: HostId::parse("spoofed-source").unwrap(),
+                target_host_id: HostId::parse("mac-agent").unwrap(),
+                device_id: Some(
+                    device_development_mesh::dashboard::DeviceId::parse("iphone-1").unwrap(),
+                ),
+                operation: OperationId::parse("workspace.read").unwrap(),
+                resources: vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease],
+                physical_device: true,
+                user_present: true,
+            },
+            lifetime_ms: 60_000,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        direct_spoof,
+        LocalResponse::Error { code, .. } if code == "mesh_identity_mismatch"
+    ));
+    wait_for_mesh_host(&registry_address, &service_identity, "mac-agent");
+
     let denied_activity_id = "real-windows-to-mac-denied";
     let denied_access = AccessRequest {
         activity_id: ActivityId::parse(denied_activity_id).unwrap(),
-        principal_id: PrincipalId::parse("windows-principal").unwrap(),
+        principal_id: PrincipalId::parse(current_os_principal().unwrap()).unwrap(),
         source_host_id: HostId::parse("windows-client").unwrap(),
         target_host_id: HostId::parse("mac-agent").unwrap(),
         device_id: Some(device_development_mesh::dashboard::DeviceId::parse("iphone-1").unwrap()),
@@ -277,12 +346,12 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
             "request",
             "--local",
             "--json",
+            "--mesh-registry",
+            &registry_address,
+            "--mesh-identity",
+            windows_identity.to_str().unwrap(),
             "--activity-id",
             denied_activity_id,
-            "--principal-id",
-            "windows-principal",
-            "--source-host-id",
-            "windows-client",
             "--target-host-id",
             "mac-agent",
             "--device-id",
@@ -331,7 +400,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     let activity_id = "real-windows-to-mac-activity";
     let access = AccessRequest {
         activity_id: ActivityId::parse(activity_id).unwrap(),
-        principal_id: PrincipalId::parse("windows-principal").unwrap(),
+        principal_id: PrincipalId::parse(current_os_principal().unwrap()).unwrap(),
         source_host_id: HostId::parse("windows-client").unwrap(),
         target_host_id: HostId::parse("mac-agent").unwrap(),
         device_id: Some(device_development_mesh::dashboard::DeviceId::parse("iphone-1").unwrap()),
@@ -347,12 +416,12 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
             "request",
             "--local",
             "--json",
+            "--mesh-registry",
+            &registry_address,
+            "--mesh-identity",
+            windows_identity.to_str().unwrap(),
             "--activity-id",
             activity_id,
-            "--principal-id",
-            "windows-principal",
-            "--source-host-id",
-            "windows-client",
             "--target-host-id",
             "mac-agent",
             "--device-id",
@@ -619,7 +688,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
         "terminal": terminal_audit.result,
         "redaction": terminal_audit.redacted_message.clone(),
     });
-    assert_eq!(canonical["principal_id"], "windows-principal");
+    assert_eq!(canonical["principal_id"], current_os_principal().unwrap());
     assert_eq!(canonical["source_host_id"], "windows-client");
     assert_eq!(canonical["target_host_id"], "mac-agent");
     assert_eq!(canonical["operation"], "workspace.read");
@@ -683,6 +752,21 @@ fn workspace_binary(name: &str) -> PathBuf {
 }
 
 fn pair_process(binary: &Path, registry_identity: &Path, peer_identity: &Path) {
+    let peer_id = (binary.file_stem().and_then(|value| value.to_str()) == Some("mesh-agent"))
+        .then_some("mac-agent");
+    pair_process_optional(binary, registry_identity, peer_identity, peer_id);
+}
+
+fn pair_process_as(binary: &Path, registry_identity: &Path, peer_identity: &Path, peer_id: &str) {
+    pair_process_optional(binary, registry_identity, peer_identity, Some(peer_id));
+}
+
+fn pair_process_optional(
+    binary: &Path,
+    registry_identity: &Path,
+    peer_identity: &Path,
+    peer_id: Option<&str>,
+) {
     let address = free_address();
     let mut registry = spawn(
         &workspace_binary("mesh-registry"),
@@ -702,8 +786,8 @@ fn pair_process(binary: &Path, registry_identity: &Path, peer_identity: &Path) {
         "--identity",
         peer_identity.to_str().unwrap(),
     ]);
-    if binary.file_stem().and_then(|value| value.to_str()) == Some("mesh-agent") {
-        command.args(["--peer-id", "mac-agent"]);
+    if let Some(peer_id) = peer_id {
+        command.args(["--peer-id", peer_id]);
     }
     let output = command.output().unwrap();
     assert!(

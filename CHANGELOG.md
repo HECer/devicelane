@@ -12,6 +12,9 @@
 - Bound the hardware-gate controller endpoint, peer, Windows SID-derived principal, certificate-
   derived source host, fresh Mac challenge, and expiry into a short-lived signed controller-session
   assertion. The Mac verifies it against the paired trust store and rejects mismatched parameters.
+- Replaced free remote approval identity fields with a separately paired Windows client flow: the
+  Windows process signs the exact access request and native SID, the mTLS registry attests that
+  signature, and the target rejects unsigned or mismatched principal/source claims.
 - Added stable fail-closed dashboard outcomes for offline targets, authenticated disconnects,
   daemon restarts, observer loss, event resync, audit-store failure, expired approvals,
   deny-overrides, stale leases, cancellation races, and incompatible older agents. Every outcome
