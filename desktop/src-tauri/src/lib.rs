@@ -156,9 +156,15 @@ impl<T: DaemonTransport> DesktopBridge<T> {
         }
     }
 
-    pub fn activity_events(&self, cursor: EventCursor, limit: usize) -> Result<EventRead, String> {
+    pub fn activity_events(
+        &self,
+        scope: DashboardScope,
+        cursor: EventCursor,
+        limit: usize,
+    ) -> Result<EventRead, String> {
         match self.transport.send(LocalRequest::ActivityEvents {
             version: LocalProtocolVersion::CURRENT,
+            scope,
             cursor,
             limit,
         })? {
@@ -568,11 +574,12 @@ fn dashboard_snapshot(
 fn activity_events(
     app: AppHandle,
     bridge: State<'_, AppBridge>,
+    scope: DashboardScope,
     cursor: WireEventCursor,
     limit: usize,
 ) -> Result<JavaScriptWire<EventRead>, String> {
-    let result =
-        EventCursor::try_from(cursor).and_then(|cursor| bridge.activity_events(cursor, limit));
+    let result = EventCursor::try_from(cursor)
+        .and_then(|cursor| bridge.activity_events(scope, cursor, limit));
     report(&app, result.map(JavaScriptWire))
 }
 

@@ -37,6 +37,12 @@ fn protocol_1_0_keeps_foundation_requests_but_gates_dashboard_features() {
 }
 
 #[test]
+fn activity_event_request_carries_an_explicit_dashboard_scope() {
+    let request = r#"{"request":"activity_events","version":{"major":1,"minor":1},"scope":"local","cursor":{"epoch":1,"sequence":0},"limit":32}"#;
+    assert!(serde_json::from_str::<LocalRequest>(request).is_ok());
+}
+
+#[test]
 fn dashboard_contract_is_strict_and_bounded() {
     let unknown = br#"{"request":"dashboard_snapshot","version":{"major":1,"minor":1},"scope":"local","extra":true}\n"#;
     assert_eq!(
@@ -70,6 +76,7 @@ fn all_dashboard_requests_negotiate_the_minor_feature() {
     let requests = [
         LocalRequest::ActivityEvents {
             version,
+            scope: DashboardScope::Local,
             cursor: EventCursor {
                 epoch: 1,
                 sequence: 0,
@@ -126,6 +133,59 @@ fn event(state: ActivityState, sequence: u64, at: u64) -> ActivityEvent {
         started_at_ms: Some(10),
         finished_at_ms: None,
     }
+}
+
+#[test]
+fn local_snapshot_excludes_activities_between_other_hosts() {
+    let root = tempfile::tempdir().unwrap();
+    let audit = Arc::new(Mutex::new(
+        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+    ));
+    let mut service = DashboardService::new(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(1, 0),
+        audit,
+        PolicyEngine::new(),
+    );
+    let mut local = event(ActivityState::Running, 1, 10);
+    local.activity_id = ActivityId::parse("local-job").unwrap();
+    let mut remote = event(ActivityState::Running, 1, 11);
+    remote.activity_id = ActivityId::parse("remote-job").unwrap();
+    remote.source_host_id = HostId::parse("linux").unwrap();
+    remote.target_host_id = HostId::parse("cloud-mac").unwrap();
+    service.record_activity(remote, "remote").unwrap();
+    service.record_activity(local, "local").unwrap();
+
+    let snapshot = service.snapshot(DashboardScope::Local, 20);
+    assert_eq!(snapshot.activities.len(), 1);
+    assert_eq!(snapshot.activities[0].activity_id.as_str(), "local-job");
+
+    let local_events = service.events_in_scope(
+        DashboardScope::Local,
+        EventCursor {
+            epoch: 1,
+            sequence: 0,
+        },
+        1,
+    );
+    assert!(matches!(
+        local_events,
+        EventRead::Events { events, next_cursor }
+            if events.len() == 1
+                && events[0].activity_id.as_str() == "local-job"
+                && next_cursor.sequence == 2
+    ));
+
+    let mesh_events = service.events_in_scope(
+        DashboardScope::Mesh,
+        EventCursor {
+            epoch: 1,
+            sequence: 0,
+        },
+        2,
+    );
+    assert!(matches!(mesh_events, EventRead::Events { events, .. } if events.len() == 2));
 }
 
 fn access(activity: &str) -> AccessRequest {

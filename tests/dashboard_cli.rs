@@ -4,8 +4,9 @@ use device_development_mesh::dashboard::policy::PolicyEngine;
 use device_development_mesh::dashboard::service::DashboardService;
 use device_development_mesh::dashboard::topology::TopologyProjector;
 use device_development_mesh::dashboard::{
-    ActivityEvent, ActivityId, ActivityState, Authorization, HostId, MetricSnapshot, MetricValue,
-    OperationId, PolicyEffect, PrincipalId, ResourceClass, SafeCode, SubscriberId,
+    ActivityEvent, ActivityId, ActivityState, Authorization, DashboardScope, HostId,
+    MetricSnapshot, MetricValue, OperationId, PolicyEffect, PrincipalId, ResourceClass, SafeCode,
+    SubscriberId,
 };
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, LocalProtocolVersion, LocalRequest,
@@ -421,6 +422,7 @@ fn real_daemon_queries_match_direct_ipc_and_exact_grant_enables_mutation() {
             ],
             LocalRequest::ActivityEvents {
                 version,
+                scope: DashboardScope::Local,
                 cursor: device_development_mesh::dashboard::EventCursor {
                     epoch: 1,
                     sequence: 0,

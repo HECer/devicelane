@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -207,8 +207,8 @@ describe("DeviceLane desktop foundation", () => {
       expect.any(AbortSignal)
     ));
     expect(client.dashboardSnapshot).toHaveBeenCalledTimes(2);
-    expect(activityEvents).toHaveBeenNthCalledWith(1, { epoch: "0", sequence: "0" }, 100, expect.any(AbortSignal));
-    expect(activityEvents).toHaveBeenNthCalledWith(2, { epoch: "4", sequence: "8" }, 100, expect.any(AbortSignal));
+    expect(activityEvents).toHaveBeenNthCalledWith(1, "local", { epoch: "0", sequence: "0" }, 100, expect.any(AbortSignal));
+    expect(activityEvents).toHaveBeenNthCalledWith(2, "local", { epoch: "4", sequence: "8" }, 100, expect.any(AbortSignal));
   });
 
   it("allows the same resync revision again after a successful events page", async () => {
@@ -237,6 +237,34 @@ describe("DeviceLane desktop foundation", () => {
     await waitFor(() => expect(client.dashboardSnapshot).toHaveBeenCalledTimes(3));
     expect(screen.queryByText(/erneut eine Synchronisierung/)).not.toBeInTheDocument();
   }, 4_000);
+
+  it("accepts a lower snapshot revision after the activity stream enters a new epoch", async () => {
+    const oldEpoch = {
+      ...dashboard,
+      revision: "10",
+      hosts: [{ ...dashboard.hosts[0], display_name: "Host aus Epoche 1" }]
+    };
+    const newEpoch = {
+      ...dashboard,
+      revision: "1",
+      hosts: [{ ...dashboard.hosts[0], display_name: "Host aus Epoche 2" }]
+    };
+    const dashboardSnapshot = vi.fn()
+      .mockResolvedValueOnce(oldEpoch)
+      .mockResolvedValue(newEpoch);
+    const activityEvents = vi.fn()
+      .mockResolvedValueOnce({
+        result: "resync_required",
+        oldest_available: { epoch: "2", sequence: "0" },
+        snapshot_revision: "1"
+      })
+      .mockImplementation(() => new Promise<never>(() => undefined));
+
+    render(<App client={fakeClient({ dashboardSnapshot, activityEvents })} />);
+
+    expect(await screen.findByText("Host aus Epoche 2")).toBeVisible();
+    expect(screen.queryByText("Host aus Epoche 1")).not.toBeInTheDocument();
+  });
 
   it("shows a reconnect state and clears the transient error after the stream recovers", async () => {
     const activityEvents = vi.fn()
@@ -298,6 +326,32 @@ describe("DeviceLane desktop foundation", () => {
     expect(dashboardSnapshot).toHaveBeenNthCalledWith(2, "mesh", expect.any(AbortSignal));
     expect(maximumInFlight).toBe(1);
     unmount();
+  });
+
+  it("does not retain mesh activity when returning to the local scope", async () => {
+    const dashboardSnapshot = vi.fn((requestedScope: "local" | "mesh") => Promise.resolve({
+      ...dashboard,
+      revision: requestedScope === "mesh" ? "8" : "7",
+      scope: requestedScope
+    }));
+    let meshDelivered = false;
+    const activityEvents = vi.fn((requestedScope: "local" | "mesh") => Promise.resolve({
+      result: "events" as const,
+      events: requestedScope === "mesh" && !meshDelivered
+        ? (meshDelivered = true, [streamedEvent])
+        : [],
+      next_cursor: { epoch: "1", sequence: requestedScope === "mesh" ? "1" : "0" }
+    }));
+    render(<App client={fakeClient({ dashboardSnapshot, activityEvents })} />);
+    const user = userEvent.setup();
+
+    const meshTab = await screen.findByRole("tab", { name: "Alle autorisierten Geräte" });
+    await waitFor(() => expect(meshTab).toBeEnabled());
+    await user.click(meshTab);
+    expect(await screen.findByText("activity-streamed")).toBeVisible();
+
+    await user.click(screen.getByRole("tab", { name: "Dieser Computer" }));
+    await waitFor(() => expect(screen.queryByText("activity-streamed")).not.toBeInTheDocument());
   });
 
   it("does not overlap an authenticated probe when the user changes scope", async () => {
@@ -393,5 +447,8 @@ describe("DeviceLane desktop foundation", () => {
     expect(panel).toHaveAttribute("id", "mesh-dashboard-panel");
     expect(panel).toHaveAttribute("aria-labelledby", "scope-local-tab");
     expect(screen.getByText("1 aktiver Job")).toBeVisible();
+    const occupancy = screen.getByRole("region", { name: "Verwendete Ressourcen" });
+    expect(within(occupancy).getByText(/agent-codex → mac-agent/)).toBeVisible();
+    expect(within(occupancy).getByText("Arbeitsbereich lesen")).toBeVisible();
   });
 });

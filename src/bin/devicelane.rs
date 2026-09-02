@@ -363,6 +363,7 @@ fn parse() -> Result<Option<Args>, String> {
             (
                 LocalRequest::ActivityEvents {
                     version: z,
+                    scope: DashboardScope::Local,
                     cursor: c,
                     limit: l,
                 },
@@ -648,6 +649,7 @@ fn watch_activity(
             e,
             &LocalRequest::ActivityEvents {
                 version: z,
+                scope: DashboardScope::Local,
                 cursor: c,
                 limit: l,
             },

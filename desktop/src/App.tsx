@@ -33,17 +33,20 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   const [selectedHostId, setSelectedHostId] = useState<string>();
   const [streamReconnecting, setStreamReconnecting] = useState(false);
   const [meshAvailable, setMeshAvailable] = useState(false);
-  const dashboardRevision = useRef<string | undefined>(undefined);
+  const dashboardRevision = useRef<{ epoch: string; revision: string } | undefined>(undefined);
+  const dashboardEpoch = useRef("0");
   const subscriberId = useRef(`desktop-${globalThis.crypto?.randomUUID?.() ?? Date.now().toString(36)}`);
   usePretext();
-  const occupancies = useMemo(() => activeOccupancies(events), [events]);
+  const occupancies = useMemo(() => activeOccupancies(dashboard?.activities ?? [], events), [dashboard?.activities, events]);
   const activeJobCount = dashboard?.activities.filter(({ state }) =>
     state === "awaiting_approval" || state === "queued" || state === "running" || state === "reconnecting"
   ).length ?? 0;
 
-  const applyDashboard = (next: DashboardSnapshot) => {
-    if (dashboardRevision.current && compareU64(next.revision, dashboardRevision.current) < 0) return;
-    dashboardRevision.current = next.revision;
+  const applyDashboard = (next: DashboardSnapshot, epoch = dashboardEpoch.current, epochChanged = false) => {
+    const current = dashboardRevision.current;
+    if (!epochChanged && epoch !== dashboardEpoch.current) return;
+    if (current?.epoch === epoch && compareU64(next.revision, current.revision) < 0) return;
+    dashboardRevision.current = { epoch, revision: next.revision };
     setDashboard(next);
     setSelectedHostId((selected) => next.hosts.some((host) => host.id === selected)
       ? selected
@@ -81,6 +84,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
       }
       running = true;
       const selectedScope = scopeRef.current;
+      const requestEpoch = dashboardEpoch.current;
       try {
         const meshProbe = await client.dashboardSnapshot("mesh", controller.signal);
         if (controller.signal.aborted) return;
@@ -101,7 +105,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
         if (selectedScope === "local" && next.scope !== "local") {
           throw new Error("Lokale Dashboard-Antwort hat einen unerwarteten Bereich");
         }
-        applyDashboard(next);
+        applyDashboard(next, requestEpoch);
         if (selectedScope === "mesh" && next.scope !== "mesh") {
           scopeRef.current = next.scope;
           setScope(next.scope);
@@ -142,6 +146,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
 
   useEffect(() => {
     const controller = new AbortController();
+    setEvents([]);
     let timer: number | undefined;
     let cursor: EventCursor = { epoch: "0", sequence: "0" };
     let reconnectAttempt = 0;
@@ -154,7 +159,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
 
     const pump = async (): Promise<void> => {
       try {
-        const page = await client.activityEvents(cursor, 100, controller.signal);
+        const page = await client.activityEvents(scope, cursor, 100, controller.signal);
         if (controller.signal.aborted) return;
         switch (page.result) {
           case "events":
@@ -177,7 +182,8 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
             lastResyncRevision = page.snapshot_revision;
             const freshSnapshot = await client.dashboardSnapshot(scope, controller.signal);
             if (controller.signal.aborted) return;
-            applyDashboard(freshSnapshot);
+            dashboardEpoch.current = page.oldest_available.epoch;
+            applyDashboard(freshSnapshot, page.oldest_available.epoch, true);
             setScope(freshSnapshot.scope);
             cursor = page.oldest_available;
             await pump();

@@ -99,6 +99,8 @@ pub enum LocalRequest {
     },
     ActivityEvents {
         version: LocalProtocolVersion,
+        #[serde(default = "default_dashboard_scope")]
+        scope: DashboardScope,
         cursor: EventCursor,
         limit: usize,
     },
@@ -641,12 +643,19 @@ impl DaemonState {
                     service.snapshot(scope, now_ms),
                 ))
             }
-            LocalRequest::ActivityEvents { cursor, limit, .. } => {
+            LocalRequest::ActivityEvents {
+                scope,
+                cursor,
+                limit,
+                ..
+            } => {
                 let service = self
                     .dashboard
                     .as_ref()
                     .ok_or(LocalProtocolError::FeatureUnavailable)?;
-                Ok(LocalResponse::ActivityEvents(service.events(cursor, limit)))
+                Ok(LocalResponse::ActivityEvents(
+                    service.events_in_scope(scope, cursor, limit),
+                ))
             }
             LocalRequest::AcknowledgeEvents {
                 subscriber_id,
@@ -733,6 +742,10 @@ impl DaemonState {
             legacy => self.handle(legacy),
         }
     }
+}
+
+fn default_dashboard_scope() -> DashboardScope {
+    DashboardScope::Local
 }
 
 fn map_dashboard_error(

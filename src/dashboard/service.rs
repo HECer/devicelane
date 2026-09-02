@@ -236,17 +236,37 @@ impl DashboardService {
                 .retain(|lease| lease.owner_host_id == self.local_host_id);
         }
         snapshot.activities = self.activities.values().map(Into::into).collect();
+        if scope == DashboardScope::Local {
+            snapshot.activities.retain(|activity| {
+                activity.source_host_id == self.local_host_id
+                    || activity.target_host_id == self.local_host_id
+            });
+        }
         snapshot.pending_approvals = self.pending_approvals(now_ms);
         snapshot
     }
 
     pub fn events(&self, cursor: EventCursor, limit: usize) -> EventRead {
+        self.events_in_scope(DashboardScope::Local, cursor, limit)
+    }
+
+    pub fn events_in_scope(
+        &self,
+        scope: DashboardScope,
+        cursor: EventCursor,
+        limit: usize,
+    ) -> EventRead {
         self.events.expire_idle(now_ms());
-        self.events.read(
+        self.events.read_filtered(
             cursor,
             ReadLimit {
                 max_events: limit,
                 ..ReadLimit::default()
+            },
+            |event| {
+                scope == DashboardScope::Mesh
+                    || event.source_host_id == self.local_host_id
+                    || event.target_host_id == self.local_host_id
             },
         )
     }

@@ -597,6 +597,7 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         &endpoint,
         &LocalRequest::ActivityEvents {
             version: LocalProtocolVersion::CURRENT,
+            scope: DashboardScope::Local,
             cursor: EventCursor {
                 epoch: 0,
                 sequence: 0,
@@ -618,6 +619,7 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
             &endpoint,
             &LocalRequest::ActivityEvents {
                 version: LocalProtocolVersion::CURRENT,
+                scope: DashboardScope::Local,
                 cursor: EventCursor {
                     epoch: 1,
                     sequence: u64::MAX,
@@ -637,6 +639,7 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
             &endpoint,
             &LocalRequest::ActivityEvents {
                 version: LocalProtocolVersion::CURRENT,
+                scope: DashboardScope::Local,
                 cursor: EventCursor {
                     epoch: 1,
                     sequence: 0,
@@ -653,6 +656,7 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         &endpoint,
         &LocalRequest::ActivityEvents {
             version: LocalProtocolVersion::CURRENT,
+            scope: DashboardScope::Local,
             cursor: EventCursor {
                 epoch: 1,
                 sequence: 0,

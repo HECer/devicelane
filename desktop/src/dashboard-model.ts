@@ -1,6 +1,7 @@
 import type {
   ActivityEvent,
   ActivityState,
+  ActivitySummary,
   ConnectionPath,
   Freshness,
   LeaseState,
@@ -193,11 +194,11 @@ export function mergeActivityEvents(current: ActivityEvent[], incoming: Activity
     .slice(0, maximum);
 }
 
-export function activeOccupancies(events: ActivityEvent[]): ResourceOccupancy[] {
-  const newestByActivity = new Map<string, ActivityEvent>();
+export function activeOccupancies(activities: ActivitySummary[], events: ActivityEvent[]): ResourceOccupancy[] {
+  const newestByActivity = new Map<string, ActivitySummary | ActivityEvent>();
+  for (const activity of activities) newestByActivity.set(activity.activity_id, activity);
   for (const event of events) {
-    const previous = newestByActivity.get(event.activity_id);
-    if (!previous || compareU64(event.sequence, previous.sequence) > 0) newestByActivity.set(event.activity_id, event);
+    if (!newestByActivity.has(event.activity_id)) newestByActivity.set(event.activity_id, event);
   }
   return [...newestByActivity.values()]
     .filter((event) => event.state === "running" || event.state === "reconnecting")
@@ -207,7 +208,7 @@ export function activeOccupancies(events: ActivityEvent[]): ResourceOccupancy[] 
       target_host_id: event.target_host_id,
       device_id: event.device_id,
       resource,
-      acquired_at_ms: event.started_at_ms ?? event.occurred_at_ms
+      acquired_at_ms: event.started_at_ms ?? ("occurred_at_ms" in event ? event.occurred_at_ms : "0")
     })));
 }
 

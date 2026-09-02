@@ -203,7 +203,7 @@ export interface DaemonClient {
   diagnostics(): Promise<DiagnosticsResult>;
   repair(): Promise<void>;
   dashboardSnapshot(scope: DashboardScope, signal?: AbortSignal): Promise<DashboardSnapshot>;
-  activityEvents(cursor: EventCursor, limit: number, signal?: AbortSignal): Promise<EventRead>;
+  activityEvents(scope: DashboardScope, cursor: EventCursor, limit: number, signal?: AbortSignal): Promise<EventRead>;
   acknowledgeEvents(subscriberId: string, cursor: EventCursor, signal?: AbortSignal): Promise<void>;
 }
 
@@ -222,6 +222,6 @@ export const tauriDaemonClient: DaemonClient = {
   diagnostics: () => invoke<DiagnosticsResult>("create_diagnostics"),
   repair: () => invoke("repair_daemon"),
   dashboardSnapshot: (scope, signal) => invokeWithSignal("dashboard_snapshot", { scope }, signal),
-  activityEvents: (cursor, limit, signal) => invokeWithSignal("activity_events", { cursor, limit }, signal),
+  activityEvents: (scope, cursor, limit, signal) => invokeWithSignal("activity_events", { scope, cursor, limit }, signal),
   acknowledgeEvents: (subscriberId, cursor, signal) => invokeWithSignal("acknowledge_events", { subscriberId, cursor }, signal)
 };

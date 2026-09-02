@@ -149,6 +149,7 @@ fn dashboard_bridge_uses_typed_versioned_requests_and_preserves_resync_details()
 
     let response = bridge
         .activity_events(
+            DashboardScope::Local,
             EventCursor {
                 epoch: 0,
                 sequence: 0,
@@ -162,6 +163,7 @@ fn dashboard_bridge_uses_typed_versioned_requests_and_preserves_resync_details()
         *requests.lock().unwrap(),
         vec![LocalRequest::ActivityEvents {
             version: LocalProtocolVersion::CURRENT,
+            scope: DashboardScope::Local,
             cursor: EventCursor {
                 epoch: 0,
                 sequence: 0

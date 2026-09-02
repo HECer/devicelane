@@ -337,6 +337,13 @@ impl EventJournal {
     }
 
     pub fn read(&self, cursor: EventCursor, limit: ReadLimit) -> EventRead {
+        self.read_filtered(cursor, limit, |_| true)
+    }
+
+    pub fn read_filtered<F>(&self, cursor: EventCursor, limit: ReadLimit, include: F) -> EventRead
+    where
+        F: Fn(&ActivityEvent) -> bool,
+    {
         let inner = self.lock();
         let oldest_event = inner.events.front().map(|entry| entry.cursor_sequence);
         let newest = inner.next_cursor_sequence - 1;
@@ -378,8 +385,14 @@ impl EventJournal {
             .events
             .iter()
             .filter(|entry| entry.cursor_sequence > cursor.sequence)
-            .take(event_limit)
         {
+            if events.len() == event_limit {
+                break;
+            }
+            if !include(&entry.event) {
+                next = entry.cursor_sequence;
+                continue;
+            }
             let separator = usize::from(!events.is_empty());
             if page_bytes
                 .saturating_add(separator)
