@@ -1,17 +1,24 @@
 use crate::dashboard::audit::{AuditDeletionScope, AuditExport, AuditFilter, ExportManifest};
 use crate::dashboard::event_log::EventRead;
 use crate::dashboard::model::{
-    ActivityId, ActivityState, AuditRecord, CursorPage, DashboardScope, DashboardSnapshot,
-    DisplayMessage, EventCursor, HostId, MetricSnapshot, RuleId, SubscriberId,
+    ActivityEvent, ActivityId, ActivityState, AuditRecord, CursorPage, DashboardScope,
+    DashboardSnapshot, DisplayMessage, EventCursor, HostId, MessageCode, MetricSnapshot,
+    MetricValue, PolicyEffect, ResourceClass, RuleId, SafeCode, SubscriberId,
 };
 use crate::dashboard::model::{ApprovalDecision, ApprovalRequest, PolicyRule};
 use crate::dashboard::policy::{AccessRequest, PolicyEngine};
 use crate::dashboard::service::{AdminMutation, DashboardService, ExistingJobs};
+use crate::network_processes::{LeaseRequest, Request as MeshRequest, Response as MeshResponse};
+use crate::remote_apple_protocol::{AppleOperation, AppleRequest, RemoteProtocolVersion};
+use crate::secure_transport::SecureTransport;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashSet;
 use std::fmt;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Opaque proof issued only inside the authorized local IPC dispatch path.
 ///
@@ -40,7 +47,7 @@ pub(crate) fn authenticated_target_session_for_test(
     AuthenticatedTargetSession::issue(local_host_id)
 }
 #[cfg(unix)]
-use std::{io, path::PathBuf};
+use std::io;
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 compile_error!("local IPC peer credentials are supported only on Linux and macOS Unix targets");
@@ -169,6 +176,13 @@ pub enum LocalRequest {
         version: LocalProtocolVersion,
         existing_jobs: ExistingJobs,
     },
+    StartRemoteExecution {
+        version: LocalProtocolVersion,
+        activity_id: ActivityId,
+        workspace_path: String,
+        request_id: String,
+        app_path: String,
+    },
 }
 
 impl LocalRequest {
@@ -197,7 +211,8 @@ impl LocalRequest {
             | Self::AuditExportManifest { version, .. }
             | Self::AuditDelete { version, .. }
             | Self::CancelActivity { version, .. }
-            | Self::PauseRemoteAccessWithJobs { version, .. } => version,
+            | Self::PauseRemoteAccessWithJobs { version, .. }
+            | Self::StartRemoteExecution { version, .. } => version,
         }
     }
 
@@ -261,6 +276,9 @@ pub enum LocalResponse {
     },
     RuleDeleted {
         deleted: bool,
+    },
+    ExecutionStarted {
+        activity_id: ActivityId,
     },
     Error {
         code: String,
@@ -330,6 +348,7 @@ pub enum LocalProtocolError {
     ResyncRequired,
     LimitExceeded,
     RevisionConflict,
+    RemoteUnavailable,
 }
 
 impl fmt::Display for LocalProtocolError {
@@ -353,6 +372,9 @@ impl fmt::Display for LocalProtocolError {
                 Self::ResyncRequired => "dashboard resynchronization required",
                 Self::LimitExceeded => "dashboard limit exceeded",
                 Self::RevisionConflict => "dashboard revision conflict",
+                Self::RemoteUnavailable => {
+                    "remote execution unavailable; verify paired registry and agent connectivity"
+                }
             }
         )
     }
@@ -464,6 +486,25 @@ pub struct DaemonState {
     autostart_adapter: Option<Arc<dyn AutostartAdapter>>,
     dashboard_policy: Option<DashboardPolicyRuntime>,
     dashboard: Option<DashboardService>,
+    remote_execution: Option<RemoteExecutionConfig>,
+    inflight_executions: HashSet<ActivityId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteExecutionConfig {
+    pub registry_address: String,
+    pub registry_peer_id: String,
+    pub identity_path: PathBuf,
+    pub client_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteExecutionJob {
+    config: RemoteExecutionConfig,
+    activity: ActivityEvent,
+    workspace_path: String,
+    request_id: String,
+    app_path: String,
 }
 
 struct DashboardPolicyRuntime {
@@ -491,6 +532,8 @@ impl DaemonState {
             autostart_adapter: None,
             dashboard_policy: None,
             dashboard: None,
+            remote_execution: None,
+            inflight_executions: HashSet::new(),
         }
     }
 
@@ -504,6 +547,8 @@ impl DaemonState {
             autostart_adapter: Some(Arc::new(PlatformAutostartAdapter)),
             dashboard_policy: None,
             dashboard: None,
+            remote_execution: None,
+            inflight_executions: HashSet::new(),
         }
     }
 
@@ -518,6 +563,8 @@ impl DaemonState {
             autostart_adapter: Some(autostart_adapter),
             dashboard_policy: None,
             dashboard: None,
+            remote_execution: None,
+            inflight_executions: HashSet::new(),
         }
     }
 
@@ -536,21 +583,54 @@ impl DaemonState {
         self.dashboard = Some(service);
     }
 
-    /// Trusted execution adapters use this boundary after the local daemon has authorized an
-    /// activity. It cannot create jobs or alter their principal/resource authorization.
-    pub fn transition_dashboard_activity(
+    pub fn enable_remote_execution(&mut self, config: RemoteExecutionConfig) {
+        self.remote_execution = Some(config);
+    }
+
+    fn prepare_remote_execution(
         &mut self,
-        activity_id: &ActivityId,
-        state: ActivityState,
-        metrics: MetricSnapshot,
-        message: Option<DisplayMessage>,
-        now_ms: u64,
-    ) -> Result<bool, LocalProtocolError> {
-        self.dashboard
-            .as_mut()
+        activity_id: ActivityId,
+        workspace_path: String,
+        request_id: String,
+        app_path: String,
+        session: &AuthenticatedTargetSession,
+    ) -> Result<RemoteExecutionJob, LocalProtocolError> {
+        if !valid_remote_component(&workspace_path)
+            || !valid_remote_component(&app_path)
+            || !valid_remote_identifier(&request_id)
+        {
+            return Err(LocalProtocolError::InvalidFrame);
+        }
+        let config = self
+            .remote_execution
+            .clone()
+            .ok_or(LocalProtocolError::FeatureUnavailable)?;
+        let activity = self
+            .dashboard
+            .as_ref()
             .ok_or(LocalProtocolError::FeatureUnavailable)?
-            .transition_activity(activity_id, state, metrics, message, now_ms)
-            .map_err(map_dashboard_error)
+            .activity(&activity_id)
+            .cloned()
+            .ok_or(LocalProtocolError::PermissionDenied)?;
+        if activity.state != ActivityState::Queued
+            || activity.authorization.effect != PolicyEffect::Allow
+            || activity.target_host_id != *session.local_host_id()
+            || activity.device_id.is_none()
+            || !activity.resources.contains(&ResourceClass::WorkspaceRead)
+            || !activity.resources.contains(&ResourceClass::DeviceLease)
+        {
+            return Err(LocalProtocolError::PermissionDenied);
+        }
+        if !self.inflight_executions.insert(activity_id) {
+            return Err(LocalProtocolError::RevisionConflict);
+        }
+        Ok(RemoteExecutionJob {
+            config,
+            activity,
+            workspace_path,
+            request_id,
+            app_path,
+        })
     }
 
     fn local_policy_host_id(&self) -> Option<HostId> {
@@ -610,9 +690,8 @@ impl DaemonState {
             | LocalRequest::AuditExportManifest { .. }
             | LocalRequest::AuditDelete { .. }
             | LocalRequest::CancelActivity { .. }
-            | LocalRequest::PauseRemoteAccessWithJobs { .. } => {
-                Err(LocalProtocolError::Unauthorized)
-            }
+            | LocalRequest::PauseRemoteAccessWithJobs { .. }
+            | LocalRequest::StartRemoteExecution { .. } => Err(LocalProtocolError::Unauthorized),
             LocalRequest::RequestAdminMutationApproval { .. } => {
                 Err(LocalProtocolError::Unauthorized)
             }
@@ -877,8 +956,273 @@ impl DaemonState {
                 self.snapshot.remote_access_paused = true;
                 Ok(LocalResponse::Acknowledged)
             }
+            LocalRequest::StartRemoteExecution { .. } => {
+                Err(LocalProtocolError::FeatureUnavailable)
+            }
             legacy => self.handle(legacy),
         }
+    }
+}
+
+fn valid_remote_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_remote_component(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && value.len() <= 1024
+        && !path.is_absolute()
+        && !value.contains(['\r', '\n', '\0'])
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+}
+
+fn execution_metrics() -> MetricSnapshot {
+    let unavailable = || MetricValue::Unavailable {
+        reason: SafeCode::parse("observer_unavailable").expect("constant safe code"),
+    };
+    MetricSnapshot {
+        current_memory_bytes: unavailable(),
+        peak_memory_bytes: unavailable(),
+        cpu_time_ms: unavailable(),
+        process_count: unavailable(),
+    }
+}
+
+fn execution_message(code: MessageCode) -> DisplayMessage {
+    DisplayMessage::new(code, Vec::new()).expect("constant display message")
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn mesh_rpc(
+    config: &RemoteExecutionConfig,
+    transport: &SecureTransport,
+    request: &MeshRequest,
+) -> Result<MeshResponse, LocalProtocolError> {
+    let address = config
+        .registry_address
+        .to_socket_addrs()
+        .map_err(|_| LocalProtocolError::RemoteUnavailable)?
+        .next()
+        .ok_or(LocalProtocolError::RemoteUnavailable)?;
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+        .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
+    let mut stream = transport
+        .connect_tls(stream, &config.registry_peer_id)
+        .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
+    write_frame(&mut stream, request)?;
+    read_frame(&mut std::io::BufReader::new(stream))
+}
+
+fn transition_execution(
+    state: &Arc<Mutex<DaemonState>>,
+    activity_id: &ActivityId,
+    activity_state: ActivityState,
+    message: MessageCode,
+) -> Result<(), LocalProtocolError> {
+    let mut state = state.lock().map_err(|_| LocalProtocolError::Io)?;
+    state
+        .dashboard
+        .as_mut()
+        .ok_or(LocalProtocolError::FeatureUnavailable)?
+        .transition_activity(
+            activity_id,
+            activity_state,
+            execution_metrics(),
+            Some(execution_message(message)),
+            now_ms(),
+        )
+        .map_err(map_dashboard_error)?;
+    Ok(())
+}
+
+fn execute_remote_job(
+    state: &Arc<Mutex<DaemonState>>,
+    job: &RemoteExecutionJob,
+) -> Result<(), LocalProtocolError> {
+    let transport =
+        SecureTransport::load_or_create(&job.config.identity_path, &job.config.client_id)
+            .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
+    let device_id = job
+        .activity
+        .device_id
+        .as_ref()
+        .ok_or(LocalProtocolError::PermissionDenied)?
+        .as_str()
+        .to_owned();
+    let lease = mesh_rpc(
+        &job.config,
+        &transport,
+        &MeshRequest::Lease {
+            operation: LeaseRequest::Acquire {
+                device_id: device_id.clone(),
+                lifetime_ms: 30_000,
+            },
+        },
+    )?;
+    let grant = lease
+        .lease_grant
+        .ok_or(LocalProtocolError::RemoteUnavailable)?;
+    {
+        let mut daemon = state.lock().map_err(|_| LocalProtocolError::Io)?;
+        daemon
+            .dashboard
+            .as_mut()
+            .ok_or(LocalProtocolError::FeatureUnavailable)?
+            .observe_authenticated_controller(&job.config.registry_peer_id, now_ms())
+            .map_err(map_dashboard_error)?;
+        daemon.snapshot.connection = ConnectionState::Connected;
+    }
+    let accepted = mesh_rpc(
+        &job.config,
+        &transport,
+        &MeshRequest::AppleRun {
+            operation: AppleRequest {
+                version: RemoteProtocolVersion { major: 1, minor: 0 },
+                request_id: job.request_id.clone(),
+                idempotency_key: job.request_id.clone(),
+                capability: "apple.simulator@1".into(),
+                workspace_path: job.workspace_path.clone(),
+                device_id: Some(device_id),
+                lease_id: Some(grant.lease_id.clone()),
+                operation: AppleOperation::InstallApp {
+                    app_path: job.app_path.clone(),
+                },
+            },
+        },
+    )?;
+    let job_id = accepted
+        .accepted
+        .then_some(accepted.job_id)
+        .flatten()
+        .ok_or(LocalProtocolError::RemoteUnavailable)?;
+    transition_execution(
+        state,
+        &job.activity.activity_id,
+        ActivityState::Running,
+        MessageCode::ActivityStarted,
+    )?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut after = 0;
+    let mut reconnecting = false;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(LocalProtocolError::RemoteUnavailable);
+        }
+        match mesh_rpc(
+            &job.config,
+            &transport,
+            &MeshRequest::Events {
+                job_id: job_id.clone(),
+                after,
+            },
+        ) {
+            Ok(response) => {
+                if reconnecting {
+                    transition_execution(
+                        state,
+                        &job.activity.activity_id,
+                        ActivityState::Running,
+                        MessageCode::ActivityStarted,
+                    )?;
+                    reconnecting = false;
+                }
+                after = response
+                    .events
+                    .iter()
+                    .map(|event| event.sequence)
+                    .max()
+                    .unwrap_or(after)
+                    .max(after);
+                if let Some(terminal) = response.events.iter().rev().find(|event| {
+                    matches!(event.kind.as_str(), "completed" | "rejected" | "cancelled")
+                }) {
+                    let (terminal_state, message) = if terminal.kind == "completed" {
+                        (ActivityState::Succeeded, MessageCode::OperationSucceeded)
+                    } else {
+                        (ActivityState::Failed, MessageCode::OperationFailed)
+                    };
+                    transition_execution(
+                        state,
+                        &job.activity.activity_id,
+                        terminal_state,
+                        message,
+                    )?;
+                    let _ = mesh_rpc(
+                        &job.config,
+                        &transport,
+                        &MeshRequest::Lease {
+                            operation: LeaseRequest::Release {
+                                lease_id: grant.lease_id,
+                            },
+                        },
+                    );
+                    return Ok(());
+                }
+            }
+            Err(_) if !reconnecting => {
+                transition_execution(
+                    state,
+                    &job.activity.activity_id,
+                    ActivityState::Reconnecting,
+                    MessageCode::RegistryStale,
+                )?;
+                reconnecting = true;
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn run_remote_job(state: Arc<Mutex<DaemonState>>, job: RemoteExecutionJob) {
+    let activity_id = job.activity.activity_id.clone();
+    if execute_remote_job(&state, &job).is_err() {
+        let current = state
+            .lock()
+            .ok()
+            .and_then(|state| state.dashboard.as_ref()?.activity(&activity_id).cloned());
+        if let Some(current) = current {
+            if current.state == ActivityState::Queued {
+                let _ = transition_execution(
+                    &state,
+                    &activity_id,
+                    ActivityState::Reconnecting,
+                    MessageCode::RegistryStale,
+                );
+            }
+            let _ = transition_execution(
+                &state,
+                &activity_id,
+                ActivityState::Failed,
+                MessageCode::OperationFailed,
+            );
+        }
+    }
+    if let Ok(mut state) = state.lock() {
+        state.inflight_executions.remove(&activity_id);
     }
 }
 
@@ -1069,6 +1413,39 @@ fn dispatch_connection(
         }
     } else {
         match request {
+            Ok(LocalRequest::StartRemoteExecution {
+                activity_id,
+                workspace_path,
+                request_id,
+                app_path,
+                ..
+            }) => match state.lock() {
+                Ok(mut daemon) => match daemon.local_policy_host_id() {
+                    Some(local_host_id) => {
+                        let session = AuthenticatedTargetSession::issue(local_host_id);
+                        match daemon.prepare_remote_execution(
+                            activity_id.clone(),
+                            workspace_path,
+                            request_id,
+                            app_path,
+                            &session,
+                        ) {
+                            Ok(job) => {
+                                drop(daemon);
+                                let worker_state = Arc::clone(state);
+                                std::thread::spawn(move || run_remote_job(worker_state, job));
+                                LocalResponse::ExecutionStarted { activity_id }
+                            }
+                            Err(error) => error_response(error),
+                        }
+                    }
+                    None => error_response(LocalProtocolError::Unauthorized),
+                },
+                Err(_) => LocalResponse::Error {
+                    code: "internal_error".into(),
+                    message: "daemon state unavailable".into(),
+                },
+            },
             Ok(request) => match state.lock() {
                 Ok(mut state) => {
                     if matches!(
@@ -1092,6 +1469,7 @@ fn dispatch_connection(
                             | LocalRequest::AuditDelete { .. }
                             | LocalRequest::CancelActivity { .. }
                             | LocalRequest::PauseRemoteAccessWithJobs { .. }
+                            | LocalRequest::StartRemoteExecution { .. }
                     ) {
                         match state.local_policy_host_id() {
                             Some(local_host_id) => {
@@ -1146,6 +1524,7 @@ fn error_response(error: LocalProtocolError) -> LocalResponse {
             LocalProtocolError::ResyncRequired => "resync_required",
             LocalProtocolError::LimitExceeded => "limit_exceeded",
             LocalProtocolError::RevisionConflict => "revision_conflict",
+            LocalProtocolError::RemoteUnavailable => "remote_unavailable",
             _ => "invalid_request",
         }
         .into(),

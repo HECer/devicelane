@@ -6,13 +6,14 @@ use super::event_log::{
     AcknowledgeError, AppendTransactionError, EventJournal, EventRead, ReadLimit,
 };
 use super::policy::{AccessRequest, ApprovalError, PolicyDecision, PolicyEngine};
-use super::topology::TopologyProjector;
+use super::topology::{RegistryHost, TopologyProjector};
 use super::{
     ActivityEvent, ActivityId, ActivityState, ApprovalDecision, ApprovalId, ApprovalRequest,
-    AuditResult, Authorization, CursorPage, DashboardScope, DashboardSnapshot, EventCursor, HostId,
-    MetricSnapshot, MetricValue, OperationId, PolicyEffect, PolicyRule, PrincipalId, ResourceClass,
-    RuleId, SafeCode, SubscriberId,
+    AuditResult, Authorization, ConnectionPath, CursorPage, DashboardScope, DashboardSnapshot,
+    EventCursor, HostId, MetricSnapshot, MetricValue, OperationId, PolicyEffect, PolicyRule,
+    PrincipalId, ResourceClass, RuleId, SafeCode, SubscriberId, TrustState,
 };
+use crate::network_processes::HostSnapshot;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -347,6 +348,46 @@ impl DashboardService {
             .filter(|pending| pending.request.expires_at_ms > now_ms)
             .map(|pending| pending.request.clone())
             .collect()
+    }
+
+    /// Returns the daemon-owned lifecycle record used to bind an execution request to the
+    /// principal, target, operation, resources, and authorization that were actually approved.
+    pub fn activity(&self, id: &ActivityId) -> Option<&ActivityEvent> {
+        self.activities.get(id)
+    }
+
+    /// Projects only a controller identity that has already completed the mTLS handshake. A TCP
+    /// connection alone never calls this boundary.
+    pub fn observe_authenticated_controller(
+        &mut self,
+        controller_id: &str,
+        observed_at_ms: u64,
+    ) -> Result<(), DashboardServiceError> {
+        self.topology
+            .connect_registry(controller_id, observed_at_ms.max(1), true)
+            .map_err(|_| DashboardServiceError::InvalidRequest)?;
+        self.topology
+            .observe_registry(
+                observed_at_ms.max(1),
+                observed_at_ms,
+                true,
+                vec![RegistryHost {
+                    snapshot: HostSnapshot {
+                        id: controller_id.to_owned(),
+                        operating_system: "unknown".into(),
+                        architecture: "unknown".into(),
+                        status: "online".into(),
+                        capabilities: Vec::new(),
+                        devices: Vec::new(),
+                    },
+                    display_name: "Paired controller".into(),
+                    trust: TrustState::Trusted,
+                    connection_path: ConnectionPath::Registry,
+                    permissions: Vec::new(),
+                    devices: Vec::new(),
+                }],
+            )
+            .map_err(|_| DashboardServiceError::InvalidRequest)
     }
 
     pub fn pending_approval_for_notification(

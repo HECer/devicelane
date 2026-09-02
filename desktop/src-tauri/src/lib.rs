@@ -196,6 +196,27 @@ impl<T: DaemonTransport> DesktopBridge<T> {
         }
     }
 
+    pub fn start_remote_execution(
+        &self,
+        activity_id: &str,
+        workspace_path: &str,
+        request_id: &str,
+        app_path: &str,
+    ) -> Result<device_development_mesh::dashboard::ActivityId, String> {
+        let activity_id = device_development_mesh::dashboard::ActivityId::parse(activity_id)
+            .map_err(|error| format!("invalid activity_id: {error}"))?;
+        match self.transport.send(LocalRequest::StartRemoteExecution {
+            version: LocalProtocolVersion::CURRENT,
+            activity_id,
+            workspace_path: workspace_path.to_owned(),
+            request_id: request_id.to_owned(),
+            app_path: app_path.to_owned(),
+        })? {
+            LocalResponse::ExecutionStarted { activity_id } => Ok(activity_id),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
     pub fn acknowledge_events(
         &self,
         subscriber_id: &str,
@@ -799,6 +820,23 @@ fn activity_events(
 }
 
 #[tauri::command]
+fn start_remote_execution(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    activity_id: String,
+    workspace_path: String,
+    request_id: String,
+    app_path: String,
+) -> Result<String, String> {
+    report(
+        &app,
+        bridge
+            .start_remote_execution(&activity_id, &workspace_path, &request_id, &app_path)
+            .map(|activity_id| activity_id.to_string()),
+    )
+}
+
+#[tauri::command]
 fn acknowledge_events(
     app: AppHandle,
     bridge: State<'_, AppBridge>,
@@ -1063,6 +1101,7 @@ pub fn run() {
             create_diagnostics,
             dashboard_snapshot,
             activity_events,
+            start_remote_execution,
             acknowledge_events,
             pending_approvals,
             decide_approval,

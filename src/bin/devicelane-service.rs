@@ -8,7 +8,8 @@ use device_development_mesh::dashboard::topology::TopologyProjector;
 use device_development_mesh::dashboard::{HostId, policy::PolicyEngine};
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, DiagnosticItem, LocalProtocolVersion,
-    local_endpoint, platform_autostart_enabled, serve_local, validate_state_paths,
+    RemoteExecutionConfig, local_endpoint, platform_autostart_enabled, serve_local,
+    validate_state_paths,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -93,7 +94,7 @@ fn run() -> Result<(), String> {
         HostId::parse(public_identity.clone()).map_err(|error| error.to_string())?;
     let mut daemon_state = DaemonState::new_with_platform_lifecycle(
         DaemonSnapshot {
-            public_identity,
+            public_identity: public_identity.clone(),
             daemon_version: env!("CARGO_PKG_VERSION").into(),
             os: std::env::consts::OS.into(),
             architecture: std::env::consts::ARCH.into(),
@@ -148,6 +149,14 @@ fn run() -> Result<(), String> {
         )
         .map_err(|error| format!("cannot restore dashboard activities: {}", error.code()))?,
     );
+    if !args.registry.is_empty() {
+        daemon_state.enable_remote_execution(RemoteExecutionConfig {
+            registry_address: args.registry,
+            registry_peer_id: "registry".into(),
+            identity_path: args.identity,
+            client_id: public_identity,
+        });
+    }
     let state = Arc::new(Mutex::new(daemon_state));
     if args.foreground {
         eprintln!("devicelane-service: listening on {}", args.listen);
