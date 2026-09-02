@@ -1,7 +1,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import type { AuditPage, AuditRecord, AuditExport } from "../api";
+import type { AuditPage, AuditRecord, AuditSaveResult } from "../api";
 import { AuditHistory } from "./AuditHistory";
 
 const record: AuditRecord = {
@@ -19,9 +19,9 @@ const record: AuditRecord = {
   redacted_message: { code: "redacted", params: [] }
 };
 const page: AuditPage = { items: [record], next_cursor: { epoch: "1", sequence: "42" } };
-const exported: AuditExport = {
-  records: [record],
-  records_json: ["91", "93"],
+const exported: AuditSaveResult = {
+  status: "saved",
+  file_name: "devicelane-audit.json",
   manifest: {
     format_version: "1",
     record_count: "1",

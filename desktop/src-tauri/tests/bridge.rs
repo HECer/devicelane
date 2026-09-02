@@ -1,3 +1,4 @@
+use device_development_mesh::dashboard::audit::{AuditFilter, ExportManifest, ExportSignature};
 use device_development_mesh::dashboard::event_log::EventRead;
 use device_development_mesh::dashboard::{
     ApprovalDecision, DashboardScope, DashboardSnapshot, EventCursor, SubscriberId,
@@ -9,6 +10,7 @@ use devicelane_desktop::{
     DaemonTransport, DesktopBridge, JavaScriptWire, RepairProcess, WireEventCursor, repair_spec,
     run_smoke_probe_with_transport, sha256_file, validate_bundle_asset,
 };
+use sha2::Digest;
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
@@ -271,6 +273,72 @@ fn management_bridge_preserves_daemon_error_codes() {
         bridge.delete_policy_rule("rule-1", 7).unwrap_err(),
         "daemon error (revision_conflict): rule changed"
     );
+}
+
+#[test]
+fn cancelled_native_audit_export_does_not_contact_the_daemon_or_create_a_file() {
+    let requests = Arc::new(Mutex::new(vec![]));
+    let bridge = DesktopBridge::new(FakeTransport {
+        requests: Arc::clone(&requests),
+        response: LocalResponse::Acknowledged,
+    });
+
+    let result = bridge
+        .save_audit_export_with_picker(AuditFilter::default(), || None)
+        .unwrap();
+
+    assert!(matches!(
+        result,
+        devicelane_desktop::AuditSaveResult::Cancelled
+    ));
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+struct QueueTransport {
+    requests: Arc<Mutex<Vec<LocalRequest>>>,
+    responses: Mutex<Vec<LocalResponse>>,
+}
+
+impl DaemonTransport for QueueTransport {
+    fn send(&self, request: LocalRequest) -> Result<LocalResponse, String> {
+        self.requests.lock().unwrap().push(request);
+        if self.responses.lock().unwrap().is_empty() {
+            return Err("unexpected daemon request".into());
+        }
+        Ok(self.responses.lock().unwrap().remove(0))
+    }
+}
+
+#[test]
+fn failed_audit_export_write_leaves_no_partial_file() {
+    let missing = std::env::temp_dir()
+        .join(format!(
+            "devicelane-missing-export-parent-{}",
+            std::process::id()
+        ))
+        .join("audit.json");
+    let bridge = DesktopBridge::new(QueueTransport {
+        requests: Arc::new(Mutex::new(vec![])),
+        responses: Mutex::new(vec![
+            LocalResponse::AuditExportManifest(ExportManifest {
+                format_version: 1,
+                record_count: 0,
+                records_sha256: format!("{:x}", sha2::Sha256::digest(b"[]")),
+                signature: ExportSignature::Unavailable,
+            }),
+            LocalResponse::AuditRecords(device_development_mesh::dashboard::CursorPage {
+                items: vec![],
+                next_cursor: None,
+            }),
+        ]),
+    });
+
+    assert!(
+        bridge
+            .save_audit_export_to_path(AuditFilter::default(), &missing)
+            .is_err()
+    );
+    assert!(!missing.exists());
 }
 
 #[test]

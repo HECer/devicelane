@@ -1,5 +1,7 @@
 use command_group::CommandGroup;
-use device_development_mesh::dashboard::audit::{AuditDeletionScope, AuditExport, AuditFilter};
+use device_development_mesh::dashboard::audit::{
+    AuditDeletionScope, AuditFilter, ExportManifest, write_private_atomic,
+};
 use device_development_mesh::dashboard::event_log::EventRead;
 use device_development_mesh::dashboard::service::AdminMutation;
 use device_development_mesh::dashboard::{
@@ -46,6 +48,16 @@ impl DaemonTransport for LocalDaemonTransport {
 pub struct DiagnosticsResult {
     pub path: String,
     pub items: Vec<DiagnosticItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum AuditSaveResult {
+    Saved {
+        file_name: String,
+        manifest: ExportManifest,
+    },
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -311,13 +323,67 @@ impl<T: DaemonTransport> DesktopBridge<T> {
         }
     }
 
-    pub fn audit_export(&self, filter: AuditFilter) -> Result<AuditExport, String> {
-        match self.transport.send(LocalRequest::AuditExport {
+    fn audit_export_manifest(&self, filter: AuditFilter) -> Result<ExportManifest, String> {
+        match self.transport.send(LocalRequest::AuditExportManifest {
             version: LocalProtocolVersion::CURRENT,
             filter,
         })? {
-            LocalResponse::AuditExport(export) => Ok(export),
+            LocalResponse::AuditExportManifest(manifest) => Ok(manifest),
             response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn save_audit_export_to_path(
+        &self,
+        filter: AuditFilter,
+        path: &Path,
+    ) -> Result<AuditSaveResult, String> {
+        let manifest = self.audit_export_manifest(filter.clone())?;
+        let mut cursor = None;
+        let mut records = Vec::with_capacity(manifest.record_count);
+        loop {
+            let page = self.audit_query(filter.clone(), cursor, 32)?;
+            if page.items.is_empty() {
+                break;
+            }
+            cursor = page.next_cursor;
+            records.extend(page.items);
+            if records.len() > manifest.record_count {
+                return Err("audit export changed while saving".into());
+            }
+        }
+        let records_json = serde_json::to_vec(&records).map_err(|error| error.to_string())?;
+        if records.len() != manifest.record_count
+            || format!("{:x}", Sha256::digest(&records_json)) != manifest.records_sha256
+        {
+            return Err("audit export changed while saving".into());
+        }
+        let document = serde_json::to_vec_pretty(
+            &serde_json::json!({ "records": records, "manifest": manifest }),
+        )
+        .map_err(|error| error.to_string())?;
+        write_private_atomic(path, &document).map_err(|error| error.to_string())?;
+        Ok(AuditSaveResult::Saved {
+            file_name: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("audit-export.json")
+                .to_owned(),
+            manifest,
+        })
+    }
+
+    pub fn save_audit_export_with_picker<F>(
+        &self,
+        filter: AuditFilter,
+        picker: F,
+    ) -> Result<AuditSaveResult, String>
+    where
+        F: FnOnce() -> Option<PathBuf>,
+    {
+        match picker() {
+            Some(path) => self.save_audit_export_to_path(filter, &path),
+            None => Ok(AuditSaveResult::Cancelled),
         }
     }
 
@@ -863,12 +929,22 @@ fn audit_query(
 }
 
 #[tauri::command]
-fn audit_export(
+fn save_audit_export(
     app: AppHandle,
     bridge: State<'_, AppBridge>,
     filter: AuditFilter,
-) -> Result<JavaScriptWire<AuditExport>, String> {
-    report(&app, bridge.audit_export(filter).map(JavaScriptWire))
+) -> Result<JavaScriptWire<AuditSaveResult>, String> {
+    report(
+        &app,
+        bridge
+            .save_audit_export_with_picker(filter, || {
+                rfd::FileDialog::new()
+                    .set_file_name("devicelane-audit.json")
+                    .add_filter("JSON", &["json"])
+                    .save_file()
+            })
+            .map(JavaScriptWire),
+    )
 }
 
 #[tauri::command]
@@ -997,7 +1073,7 @@ pub fn run() {
             request_admin_audit_delete,
             delete_policy_rule,
             audit_query,
-            audit_export,
+            save_audit_export,
             delete_audit,
             notify_pending_approval,
             repair_daemon

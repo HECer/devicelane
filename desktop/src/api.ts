@@ -218,16 +218,13 @@ export type ExportSignature =
   | { signature_status: "signed"; key_id: string; signature_hex: string }
   | { signature_status: "unavailable" };
 
-export interface AuditExport {
-  records: AuditRecord[];
-  records_json: U64Decimal[];
-  manifest: {
+export interface AuditManifest {
     format_version: U64Decimal;
     record_count: U64Decimal;
     records_sha256: string;
     signature: ExportSignature;
-  };
 }
+export type AuditSaveResult = { status: "saved"; file_name: string; manifest: AuditManifest } | { status: "cancelled" };
 
 export type AuditDeletionScope = "current_filter" | "all_retained";
 
@@ -284,7 +281,7 @@ export interface DaemonClient {
   putPolicyRule(rule: PolicyRule, signal?: AbortSignal): Promise<void>;
   deletePolicyRule(ruleId: string, expectedRevision: U64Decimal, signal?: AbortSignal): Promise<void>;
   auditQuery(filter: AuditFilter, cursor: EventCursor | null, limit: number, signal?: AbortSignal): Promise<AuditPage>;
-  auditExport(filter: AuditFilter, signal?: AbortSignal): Promise<AuditExport>;
+  auditExport(filter: AuditFilter, signal?: AbortSignal): Promise<AuditSaveResult>;
   deleteAudit(scope: AuditDeletionScope, filter: AuditFilter, signal?: AbortSignal): Promise<void>;
   notifyPendingApproval(approvalId: string, signal?: AbortSignal): Promise<void>;
   onOpenApproval(listener: (approvalId: string) => void): Promise<() => void>;
@@ -335,7 +332,7 @@ export const tauriDaemonClient: DaemonClient = {
   putPolicyRule: (rule, signal) => invokeAdminMutation("put_policy_rule", { rule }, "request_admin_policy_put", { rule, expectedRevision: previousRevision(rule.revision) }, signal),
   deletePolicyRule: (ruleId, expectedRevision, signal) => invokeAdminMutation("delete_policy_rule", { ruleId, expectedRevision }, "request_admin_policy_delete", { ruleId, expectedRevision }, signal),
   auditQuery: (filter, cursor, limit, signal) => invokeWithSignal("audit_query", { filter, cursor, limit }, signal),
-  auditExport: (filter, signal) => invokeWithSignal("audit_export", { filter }, signal),
+  auditExport: (filter, signal) => invokeWithSignal("save_audit_export", { filter }, signal),
   deleteAudit: (scope, filter, signal) => invokeAdminMutation("delete_audit", { scope, filter }, "request_admin_audit_delete", { scope, filter }, signal),
   notifyPendingApproval: (approvalId, signal) => invokeWithSignal("notify_pending_approval", { approvalId }, signal),
   onOpenApproval: (listener) => listen<string>("open-approval", (event) => listener(event.payload))

@@ -358,6 +358,31 @@ pub struct AuditExport {
     pub manifest: ExportManifest,
 }
 
+pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), AuditError> {
+    let root = path.parent().ok_or(AuditError::InsecureStorage)?;
+    let name = path
+        .file_name()
+        .ok_or(AuditError::InsecureStorage)?
+        .to_string_lossy();
+    let temporary = root.join(format!(".{name}.devicelane-{}.tmp", std::process::id()));
+    if temporary.exists() {
+        validate_private_file(&temporary)?;
+        fs::remove_file(&temporary)?;
+    }
+    let result = (|| {
+        let mut file = create_private_file(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        validate_private_file(&temporary)?;
+        atomic_replace(&temporary, path, root)
+    })();
+    if result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 pub trait AuditSigner: Send + Sync {
     fn key_id(&self) -> &str;
     fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>, AuditError>;

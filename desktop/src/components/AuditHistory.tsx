@@ -1,10 +1,10 @@
 import { useRef, useState } from "react";
-import type { AuditDeletionScope, AuditExport, AuditFilter, AuditPage, EventCursor } from "../api";
+import type { AuditDeletionScope, AuditManifest, AuditSaveResult, AuditFilter, AuditPage, EventCursor } from "../api";
 import { messageCodeLabel, resourceLabel } from "../dashboard-model";
 
 interface AuditHistoryProps {
   onQuery: (filter: AuditFilter, cursor: EventCursor | null, limit: number) => Promise<AuditPage>;
-  onExport: (filter: AuditFilter) => Promise<AuditExport>;
+  onExport: (filter: AuditFilter) => Promise<AuditSaveResult>;
   onDelete?: (scope: AuditDeletionScope, filter: AuditFilter) => Promise<void>;
 }
 
@@ -17,7 +17,7 @@ export function AuditHistory({ onQuery, onExport, onDelete }: AuditHistoryProps)
   const [page, setPage] = useState<AuditPage>({ items: [], next_cursor: null });
   const [limit, setLimit] = useState(100);
   const [announcement, setAnnouncement] = useState("");
-  const [manifest, setManifest] = useState<AuditExport["manifest"]>();
+  const [manifest, setManifest] = useState<AuditManifest>();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteScope, setDeleteScope] = useState<AuditDeletionScope | "">("");
   const [deleteConfirmed, setDeleteConfirmed] = useState(false);
@@ -44,7 +44,9 @@ export function AuditHistory({ onQuery, onExport, onDelete }: AuditHistoryProps)
     if (inFlight.current) return;
     inFlight.current = true;
     try {
-      const result = await onExport(filter); setManifest(result.manifest);
+      const result = await onExport(filter);
+      if (result.status === "cancelled") { setAnnouncement("Export abgebrochen; es wurde keine Datei erstellt."); return; }
+      setManifest(result.manifest);
       setAnnouncement(result.manifest.signature.signature_status === "signed" ? `Export signiert mit Schlüssel ${result.manifest.signature.key_id}.` : "Export erstellt. Signatur nicht verfügbar; der Export ist nicht verifiziert.");
     } catch (error) { setAnnouncement(`Audit-Export fehlgeschlagen: ${error instanceof Error ? error.message : String(error)}`); }
     finally { inFlight.current = false; }

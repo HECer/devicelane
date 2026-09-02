@@ -1,4 +1,4 @@
-use crate::dashboard::audit::{AuditDeletionScope, AuditExport, AuditFilter};
+use crate::dashboard::audit::{AuditDeletionScope, AuditExport, AuditFilter, ExportManifest};
 use crate::dashboard::event_log::EventRead;
 use crate::dashboard::model::{
     ActivityId, AuditRecord, CursorPage, DashboardScope, DashboardSnapshot, EventCursor, HostId,
@@ -152,6 +152,10 @@ pub enum LocalRequest {
         version: LocalProtocolVersion,
         filter: AuditFilter,
     },
+    AuditExportManifest {
+        version: LocalProtocolVersion,
+        filter: AuditFilter,
+    },
     AuditDelete {
         version: LocalProtocolVersion,
         scope: AuditDeletionScope,
@@ -190,6 +194,7 @@ impl LocalRequest {
             | Self::DeletePolicyRuleIfRevision { version, .. }
             | Self::AuditQuery { version, .. }
             | Self::AuditExport { version, .. }
+            | Self::AuditExportManifest { version, .. }
             | Self::AuditDelete { version, .. }
             | Self::CancelActivity { version, .. }
             | Self::PauseRemoteAccessWithJobs { version, .. } => version,
@@ -247,6 +252,7 @@ pub enum LocalResponse {
     PolicyRules(Vec<PolicyRule>),
     AuditRecords(CursorPage<AuditRecord>),
     AuditExport(AuditExport),
+    AuditExportManifest(ExportManifest),
     AuditDeleted {
         deleted: usize,
     },
@@ -584,6 +590,7 @@ impl DaemonState {
             | LocalRequest::DeletePolicyRuleIfRevision { .. }
             | LocalRequest::AuditQuery { .. }
             | LocalRequest::AuditExport { .. }
+            | LocalRequest::AuditExportManifest { .. }
             | LocalRequest::AuditDelete { .. }
             | LocalRequest::CancelActivity { .. }
             | LocalRequest::PauseRemoteAccessWithJobs { .. } => {
@@ -816,6 +823,16 @@ impl DaemonState {
                     .audit_export(filter, None)
                     .map_err(map_dashboard_error)?;
                 Ok(LocalResponse::AuditExport(export))
+            }
+            LocalRequest::AuditExportManifest { filter, .. } => {
+                let manifest = self
+                    .dashboard
+                    .as_ref()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .audit_export(filter, None)
+                    .map_err(map_dashboard_error)?
+                    .manifest;
+                Ok(LocalResponse::AuditExportManifest(manifest))
             }
             LocalRequest::AuditDelete { scope, filter, .. } => {
                 let deleted = self
