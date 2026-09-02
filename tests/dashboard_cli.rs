@@ -32,7 +32,12 @@ fn endpoint_text(_runtime: &std::path::Path) -> String {
     }
     #[cfg(unix)]
     {
-        _runtime.join("devicelane.sock").display().to_string()
+        _runtime
+            .canonicalize()
+            .unwrap()
+            .join("devicelane.sock")
+            .display()
+            .to_string()
     }
 }
 

@@ -1640,7 +1640,7 @@ mod admin_mutation_tests {
     use std::sync::{Arc, Barrier, Mutex};
 
     fn service() -> DashboardService {
-        let root = tempfile::tempdir().unwrap().keep();
+        let root = tempfile::tempdir().unwrap().keep().join("audit");
         let audit = Arc::new(Mutex::new(
             AuditStore::open(root, RetentionPolicy::default(), Redactor::default()).unwrap(),
         ));

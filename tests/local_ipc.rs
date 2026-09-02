@@ -1175,7 +1175,7 @@ fn production_unix_socket_serves_state_and_recovers_after_bad_frames() {
     use std::os::unix::fs::MetadataExt;
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("devicelane.sock");
-    let stale = std::os::unix::net::UnixDatagram::bind(&socket).unwrap();
+    let stale = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     drop(stale);
     let identity = temp.path().join("identity");
     let logs = temp.path().join("logs");
@@ -1297,6 +1297,11 @@ fn service_managed_policy_configuration_is_paired_and_fails_closed() {
     let logs = temp.path().join("logs");
     for path in [&identity, &runtime, &logs] {
         std::fs::create_dir(path).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let policy = temp.path().join("policy.json");
     let trust = temp.path().join("admins.json");
