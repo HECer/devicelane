@@ -65,6 +65,7 @@ describe("PolicyRules", () => {
     await user.click(screen.getByRole("button", { name: "Regel löschen" }));
     expect(remove).not.toHaveBeenCalled();
     const dialog = screen.getByRole("dialog", { name: "Regel löschen bestätigen" });
+    expect(within(dialog).getByRole("button", { name: "Abbrechen" })).toHaveFocus();
     await user.click(within(dialog).getByRole("checkbox", { name: /Revision 7/ }));
     await user.click(within(dialog).getByRole("button", { name: "Regel endgültig löschen" }));
     expect(remove).toHaveBeenCalledWith("rule-user", "7");

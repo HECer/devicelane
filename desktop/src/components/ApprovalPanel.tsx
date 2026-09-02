@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ApprovalDecision, ApprovalRequest } from "../api";
 import { resourceLabel } from "../dashboard-model";
+import { Modal } from "./Modal";
 
 interface ApprovalPanelProps {
   approvals: ApprovalRequest[];
@@ -27,8 +28,21 @@ export function ApprovalPanel({ approvals, nowMs, focusApprovalId, onDecide, onR
     card?.focus();
   }, [focusApprovalId, approvals]);
 
+  useEffect(() => {
+    if (!confirmation) return;
+    const current = approvals.find(({ id }) => id === confirmation.approval.id);
+    if (current && Number(current.expires_at_ms) > nowMs) return;
+    setConfirmation(undefined);
+    setConfirmed(false);
+    setAnnouncement(current ? "Freigabe ist abgelaufen; die Bestätigung wurde geschlossen." : "Freigabe ist nicht mehr ausstehend; die Bestätigung wurde geschlossen.");
+  }, [approvals, confirmation, nowMs]);
+
   const decide = async (approval: ApprovalRequest, decision: ApprovalDecision) => {
-    if (submitting.current.has(approval.id) || Number(approval.expires_at_ms) <= nowMs) return;
+    if (submitting.current.has(approval.id)) return;
+    if (!approvals.some(({ id }) => id === approval.id) || Number(approval.expires_at_ms) <= nowMs) {
+      setAnnouncement("Freigabe ist nicht mehr ausstehend oder abgelaufen.");
+      return;
+    }
     submitting.current.add(approval.id);
     setPendingIds((ids) => [...ids, approval.id]);
     setAnnouncement("");
@@ -85,12 +99,12 @@ export function ApprovalPanel({ approvals, nowMs, focusApprovalId, onDecide, onR
           })}
         </ul>
       )}
-      {confirmation && <div className="modal-backdrop"><div className="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="approval-confirm-title">
+      {confirmation && <Modal titleId="approval-confirm-title" onClose={() => setConfirmation(undefined)}>
         <h3 id="approval-confirm-title">Dauerhafte Regel bestätigen</h3>
         <p>{confirmation.decision === "allow_and_remember" ? "DeviceLane erstellt eine exakte, möglichst eingeschränkte Regel für diese Anfrage." : "DeviceLane erstellt eine exakte Sperrregel. Ablehnungen haben Vorrang vor Erlaubnissen."}</p>
         <label className="confirm-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.currentTarget.checked)} /> Auswirkung verstanden</label>
-        <div className="dialog-actions"><button onClick={() => setConfirmation(undefined)}>Abbrechen</button><button className={confirmation.decision === "deny_and_block" ? "danger-action" : "primary-action"} disabled={!confirmed} onClick={() => void decide(confirmation.approval, confirmation.decision)}>{confirmation.decision === "allow_and_remember" ? "Dauerhaft erlauben" : "Dauerhaft blockieren"}</button></div>
-      </div></div>}
+        <div className="dialog-actions"><button data-modal-initial onClick={() => setConfirmation(undefined)}>Abbrechen</button><button className={confirmation.decision === "deny_and_block" ? "danger-action" : "primary-action"} disabled={!confirmed} onClick={() => void decide(confirmation.approval, confirmation.decision)}>{confirmation.decision === "allow_and_remember" ? "Dauerhaft erlauben" : "Dauerhaft blockieren"}</button></div>
+      </Modal>}
     </section>
   );
 }

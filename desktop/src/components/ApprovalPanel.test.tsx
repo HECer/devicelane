@@ -38,6 +38,7 @@ describe("ApprovalPanel", () => {
     await user.click(screen.getByRole("button", { name: "Erlauben und merken" }));
     expect(decide).not.toHaveBeenCalled();
     const dialog = screen.getByRole("dialog", { name: "Dauerhafte Regel bestätigen" });
+    expect(within(dialog).getByRole("button", { name: "Abbrechen" })).toHaveFocus();
     expect(within(dialog).getByText(/exakte.*Regel/i)).toBeVisible();
     await user.click(within(dialog).getByRole("checkbox", { name: /Auswirkung verstanden/ }));
     await user.click(within(dialog).getByRole("button", { name: "Dauerhaft erlauben" }));
@@ -70,6 +71,26 @@ describe("ApprovalPanel", () => {
     render(<ApprovalPanel approvals={[approval, second]} nowMs={1725000001000} focusApprovalId="approval-99" onDecide={decide} onRefresh={vi.fn()} />);
 
     expect(screen.getByRole("article", { name: "Freigabe approval-99" })).toHaveFocus();
+    expect(decide).not.toHaveBeenCalled();
+  });
+
+  it("closes and announces when daemon truth removes or expires an approval during confirmation", async () => {
+    const user = userEvent.setup();
+    const decide = vi.fn();
+    const refresh = vi.fn();
+    const view = render(<ApprovalPanel approvals={[approval]} nowMs={1725000001000} onDecide={decide} onRefresh={refresh} />);
+    await user.click(screen.getByRole("button", { name: "Ablehnen und blockieren" }));
+    expect(screen.getByRole("dialog")).toBeVisible();
+    view.rerender(<ApprovalPanel approvals={[]} nowMs={1725000001000} onDecide={decide} onRefresh={refresh} />);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("nicht mehr ausstehend");
+    expect(decide).not.toHaveBeenCalled();
+
+    view.rerender(<ApprovalPanel approvals={[approval]} nowMs={1725000001000} onDecide={decide} onRefresh={refresh} />);
+    await user.click(screen.getByRole("button", { name: "Erlauben und merken" }));
+    view.rerender(<ApprovalPanel approvals={[approval]} nowMs={1725000300000} onDecide={decide} onRefresh={refresh} />);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("abgelaufen");
     expect(decide).not.toHaveBeenCalled();
   });
 });

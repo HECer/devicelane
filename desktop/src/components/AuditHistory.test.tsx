@@ -66,6 +66,7 @@ describe("AuditHistory", () => {
     render(<AuditHistory onQuery={query} onExport={vi.fn()} onDelete={remove} />);
     await user.click(screen.getByRole("button", { name: "Auditdaten löschen" }));
     const dialog = screen.getByRole("dialog", { name: "Auditdaten löschen bestätigen" });
+    expect(within(dialog).getByRole("button", { name: "Abbrechen" })).toHaveFocus();
     expect(within(dialog).getByText(/30 Tage/)).toBeVisible();
     const confirm = within(dialog).getByRole("button", { name: "Ausgewählten Bereich löschen" });
     expect(confirm).toBeDisabled();

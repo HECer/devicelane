@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import type { PolicyRule } from "../api";
 import { resourceLabel } from "../dashboard-model";
+import { Modal } from "./Modal";
 
 interface PolicyRulesProps {
   rules: PolicyRule[];
@@ -70,14 +71,14 @@ export function PolicyRules({ rules, onPut, onDelete, onRefresh }: PolicyRulesPr
       <ul className="resource-tags">{rule.resources.length ? rule.resources.map((resource) => <li key={resource}>{resourceLabel(resource)}</li>) : <li>Alle Ressourcen</li>}</ul>
       <div className="rule-actions"><button disabled={rule.origin === "managed"} onClick={() => setEditing(rule)}>Regel bearbeiten</button><button className="danger-action" disabled={rule.origin === "managed"} onClick={() => { setDeleteConfirmed(false); setDeleting(rule); }}>Regel löschen</button></div>
     </article></li>)}</ul>}
-    {editing && <div className="modal-backdrop"><form className="confirmation-dialog rule-form" role="dialog" aria-modal="true" aria-labelledby="edit-rule-title" onSubmit={save}>
+    {editing && <Modal titleId="edit-rule-title" className="rule-form" onClose={() => setEditing(undefined)}><form onSubmit={save}>
       <h3 id="edit-rule-title">Regel {editing.id} bearbeiten</h3><p>Ausgangspunkt: Revision {editing.revision}, Spezifität {specificity(editing)}, Ursprung Benutzer.</p>
       <label>Regelwirkung<select name="effect" aria-label="Regelwirkung" defaultValue={editing.effect}><option value="allow">Erlauben</option><option value="deny">Ablehnen</option></select></label>
       <label>Ablaufzeit (Unix-Millisekunden)<input name="expiry" aria-label="Ablaufzeit (Unix-Millisekunden)" type="number" min="0" defaultValue={editing.expires_at_ms ?? ""} /></label>
       <label className="confirm-check"><input name="require_presence" type="checkbox" defaultChecked={editing.require_user_presence} /> Benutzerpräsenz erforderlich</label>
       <label className="confirm-check"><input name="enabled" type="checkbox" defaultChecked={editing.enabled} /> Regel aktiviert</label>
-      <div className="dialog-actions"><button type="button" onClick={() => setEditing(undefined)}>Abbrechen</button><button className="primary-action" type="submit">Änderungen speichern</button></div>
-    </form></div>}
-    {deleting && <div className="modal-backdrop"><div className="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-rule-title"><h3 id="delete-rule-title">Regel löschen bestätigen</h3><p>Nur Revision {deleting.revision} von {deleting.id} wird gelöscht. Bei einer zwischenzeitlichen Änderung bricht DeviceLane ab.</p><label className="confirm-check"><input type="checkbox" checked={deleteConfirmed} onChange={(event) => setDeleteConfirmed(event.currentTarget.checked)} /> Revision {deleting.revision} geprüft</label><div className="dialog-actions"><button onClick={() => setDeleting(undefined)}>Abbrechen</button><button className="danger-action" disabled={!deleteConfirmed} onClick={() => void execute(() => onDelete(deleting.id, deleting.revision), "Regel gelöscht. Die Ansicht zeigt den aktuellen Dienststand.")}>Regel endgültig löschen</button></div></div></div>}
+      <div className="dialog-actions"><button data-modal-initial type="button" onClick={() => setEditing(undefined)}>Abbrechen</button><button className="primary-action" type="submit">Änderungen speichern</button></div>
+    </form></Modal>}
+    {deleting && <Modal titleId="delete-rule-title" onClose={() => setDeleting(undefined)}><h3 id="delete-rule-title">Regel löschen bestätigen</h3><p>Nur Revision {deleting.revision} von {deleting.id} wird gelöscht. Bei einer zwischenzeitlichen Änderung bricht DeviceLane ab.</p><label className="confirm-check"><input type="checkbox" checked={deleteConfirmed} onChange={(event) => setDeleteConfirmed(event.currentTarget.checked)} /> Revision {deleting.revision} geprüft</label><div className="dialog-actions"><button data-modal-initial onClick={() => setDeleting(undefined)}>Abbrechen</button><button className="danger-action" disabled={!deleteConfirmed} onClick={() => void execute(() => onDelete(deleting.id, deleting.revision), "Regel gelöscht. Die Ansicht zeigt den aktuellen Dienststand.")}>Regel endgültig löschen</button></div></Modal>}
   </section>;
 }
