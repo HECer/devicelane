@@ -1,3 +1,21 @@
+use device_development_mesh::dashboard::{
+    ActivityId, ApprovalDecision, HostId, OperationId, PrincipalId, ResourceClass,
+    policy::AccessRequest,
+};
+
+fn approval_access(target: &str) -> AccessRequest {
+    AccessRequest {
+        activity_id: ActivityId::parse("ipc-approval").unwrap(),
+        principal_id: PrincipalId::parse("local-client").unwrap(),
+        source_host_id: HostId::parse("source").unwrap(),
+        target_host_id: HostId::parse(target).unwrap(),
+        device_id: None,
+        operation: OperationId::parse("workspace.write").unwrap(),
+        resources: vec![ResourceClass::WorkspaceWrite],
+        physical_device: false,
+        user_present: true,
+    }
+}
 use device_development_mesh::local_ipc::{
     Authorizer, AutostartAdapter, ConnectionState, DaemonRole, DaemonSnapshot, DaemonState,
     DiagnosticItem, LocalProtocolError, LocalProtocolVersion, LocalRequest, LocalResponse,
@@ -342,6 +360,48 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         .expect("service did not bind named pipe");
     assert!(matches!(first, LocalResponse::Snapshot(snapshot) if !snapshot.remote_access_paused));
 
+    let access = approval_access("identity");
+    let created = send_local_request(
+        &endpoint,
+        &LocalRequest::RequestApproval {
+            version: LocalProtocolVersion::CURRENT,
+            access: access.clone(),
+            lifetime_ms: 60_000,
+        },
+    )
+    .unwrap();
+    let nonce = match created {
+        LocalResponse::ApprovalCreated { nonce, .. } => nonce,
+        response => panic!("unexpected approval response: {response:?}"),
+    };
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::DecideApproval {
+                version: LocalProtocolVersion::CURRENT,
+                nonce,
+                access: access.clone(),
+                decision: ApprovalDecision::AllowOnce,
+            },
+        )
+        .unwrap(),
+        LocalResponse::ApprovalDecided { .. }
+    ));
+    let mut spoofed = access;
+    spoofed.target_host_id = HostId::parse("claimed-target").unwrap();
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::RequestApproval {
+                version: LocalProtocolVersion::CURRENT,
+                access: spoofed,
+                lifetime_ms: 60_000,
+            },
+        )
+        .unwrap(),
+        LocalResponse::Error { code, .. } if code == "unauthorized"
+    ));
+
     assert!(matches!(
         send_local_request(
             &endpoint,
@@ -553,6 +613,31 @@ fn production_unix_socket_serves_state_and_recovers_after_bad_frames() {
         0o600
     );
     assert!(matches!(first, LocalResponse::Snapshot(snapshot) if !snapshot.remote_access_paused));
+    let access = approval_access("identity");
+    let created = send_local_request(
+        &endpoint,
+        &LocalRequest::RequestApproval {
+            version: LocalProtocolVersion::CURRENT,
+            access: access.clone(),
+            lifetime_ms: 60_000,
+        },
+    )
+    .unwrap();
+    assert!(matches!(created, LocalResponse::ApprovalCreated { .. }));
+    let mut spoofed = access;
+    spoofed.target_host_id = HostId::parse("claimed-target").unwrap();
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::RequestApproval {
+                version: LocalProtocolVersion::CURRENT,
+                access: spoofed,
+                lifetime_ms: 60_000,
+            },
+        )
+        .unwrap(),
+        LocalResponse::Error { code, .. } if code == "unauthorized"
+    ));
     assert!(matches!(
         send_local_request(
             &endpoint,

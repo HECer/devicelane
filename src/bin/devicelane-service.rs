@@ -1,3 +1,4 @@
+use device_development_mesh::dashboard::{HostId, policy::PolicyEngine};
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, DiagnosticItem, LocalProtocolVersion,
     local_endpoint, platform_autostart_enabled, serve_local, validate_state_paths,
@@ -72,7 +73,9 @@ fn run() -> Result<(), String> {
         .and_then(|name| name.to_str())
         .unwrap_or("devicelane")
         .to_owned();
-    let state = Arc::new(Mutex::new(DaemonState::new_with_platform_lifecycle(
+    let local_host_id =
+        HostId::parse(public_identity.clone()).map_err(|error| error.to_string())?;
+    let mut daemon_state = DaemonState::new_with_platform_lifecycle(
         DaemonSnapshot {
             public_identity,
             daemon_version: env!("CARGO_PKG_VERSION").into(),
@@ -93,7 +96,9 @@ fn run() -> Result<(), String> {
             message: "local daemon is ready".into(),
             healthy: true,
         }],
-    )));
+    );
+    daemon_state.enable_dashboard_policy(local_host_id, PolicyEngine::new());
+    let state = Arc::new(Mutex::new(daemon_state));
     if args.foreground {
         eprintln!("devicelane-service: listening on {}", args.listen);
     }

@@ -1,7 +1,9 @@
+use super::managed_policy::VerifiedManagedPolicyBundle;
 use super::model::{
     ActivityId, ApprovalDecision, DeviceId, HostId, OperationId, PolicyEffect, PolicyOrigin,
     PolicyRule, PrincipalId, ResourceClass, RuleId, ValidationError,
 };
+use crate::local_ipc::AuthenticatedTargetSession;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -148,112 +150,6 @@ pub enum PolicyConfigurationError {
     ManagedOriginRequiresVerification,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TrustError {
-    TransportTargetMismatch,
-    ManagedPolicyVerificationFailed,
-    InvalidCapability,
-}
-
-pub trait ManagedPolicyVerifier: Send + Sync {
-    fn verify(&self, rules_digest: &[u8; 32]) -> bool;
-}
-
-pub struct TransportAuthentication {
-    authenticated_host_id: HostId,
-}
-
-impl TransportAuthentication {
-    #[allow(dead_code)]
-    pub(crate) fn new(authenticated_host_id: HostId) -> Self {
-        Self {
-            authenticated_host_id,
-        }
-    }
-}
-
-pub struct PolicyTrustAuthority {
-    secret: [u8; 32],
-    managed_verifier: Box<dyn ManagedPolicyVerifier>,
-}
-
-impl PolicyTrustAuthority {
-    #[allow(dead_code)]
-    pub(crate) fn new(managed_verifier: Box<dyn ManagedPolicyVerifier>) -> Self {
-        let mut secret = [0_u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret);
-        Self {
-            secret,
-            managed_verifier,
-        }
-    }
-
-    pub fn issue_target_session(
-        &self,
-        transport: &TransportAuthentication,
-        requested_target: &HostId,
-    ) -> Result<AuthenticatedTargetSession, TrustError> {
-        if &transport.authenticated_host_id != requested_target {
-            return Err(TrustError::TransportTargetMismatch);
-        }
-        let mac = trust_mac(
-            &self.secret,
-            b"target-session",
-            requested_target.as_str().as_bytes(),
-        );
-        Ok(AuthenticatedTargetSession {
-            target_host_id: requested_target.clone(),
-            mac,
-        })
-    }
-
-    pub fn verify_managed_rules(
-        &self,
-        rules: Vec<PolicyRule>,
-    ) -> Result<VerifiedManagedPolicyBundle, TrustError> {
-        let digest = rules_digest(&rules)?;
-        if !self.managed_verifier.verify(&digest) {
-            return Err(TrustError::ManagedPolicyVerificationFailed);
-        }
-        Ok(VerifiedManagedPolicyBundle {
-            rules,
-            digest,
-            mac: trust_mac(&self.secret, b"managed-rules", &digest),
-        })
-    }
-
-    fn verifies_session(&self, session: &AuthenticatedTargetSession) -> bool {
-        session.mac
-            == trust_mac(
-                &self.secret,
-                b"target-session",
-                session.target_host_id.as_str().as_bytes(),
-            )
-    }
-
-    fn verifies_bundle(&self, bundle: &VerifiedManagedPolicyBundle) -> bool {
-        rules_digest(&bundle.rules).is_ok_and(|digest| digest == bundle.digest)
-            && bundle.mac == trust_mac(&self.secret, b"managed-rules", &bundle.digest)
-    }
-}
-
-/// Proof that the caller was authenticated as the target host.
-///
-/// ```compile_fail
-/// use device_development_mesh::dashboard::{HostId, policy::AuthenticatedTargetSession};
-/// let _ = AuthenticatedTargetSession { target_host_id: HostId::parse("forged").unwrap() };
-/// ```
-pub struct AuthenticatedTargetSession {
-    target_host_id: HostId,
-    mac: [u8; 32],
-}
-
-pub struct VerifiedManagedPolicyBundle {
-    rules: Vec<PolicyRule>,
-    digest: [u8; 32],
-    mac: [u8; 32],
-}
-
 #[derive(Clone, Debug)]
 struct PendingApproval {
     request_digest: [u8; 32],
@@ -292,21 +188,18 @@ impl PolicyEngine {
 
     pub fn add_verified_managed_rules(
         &mut self,
-        authority: &PolicyTrustAuthority,
         bundle: VerifiedManagedPolicyBundle,
     ) -> Result<(), PolicyConfigurationError> {
-        if !authority.verifies_bundle(&bundle) {
-            return Err(PolicyConfigurationError::ManagedOriginRequiresVerification);
-        }
-        validate_rule_set(&bundle.rules, true)?;
-        if self.rules.len().saturating_add(bundle.rules.len()) > MAX_POLICY_RULES {
+        let rules = bundle.into_rules();
+        validate_rule_set(&rules, true)?;
+        if self.rules.len().saturating_add(rules.len()) > MAX_POLICY_RULES {
             return Err(PolicyConfigurationError::RuleLimitExceeded);
         }
         let existing: HashSet<_> = self.rules.iter().map(|rule| &rule.id).collect();
-        if bundle.rules.iter().any(|rule| existing.contains(&rule.id)) {
+        if rules.iter().any(|rule| existing.contains(&rule.id)) {
             return Err(PolicyConfigurationError::DuplicateRuleId);
         }
-        self.rules.extend(bundle.rules);
+        self.rules.extend(rules);
         Ok(())
     }
 
@@ -410,7 +303,6 @@ impl PolicyEngine {
 
     pub fn decide(
         &mut self,
-        authority: &PolicyTrustAuthority,
         nonce: &str,
         session: &AuthenticatedTargetSession,
         request: &AccessRequest,
@@ -418,9 +310,6 @@ impl PolicyEngine {
         now_ms: u64,
     ) -> Result<ApprovalOutcome, ApprovalError> {
         validate_request(request).map_err(|_| ApprovalError::InvalidRequest)?;
-        if !authority.verifies_session(session) {
-            return Err(ApprovalError::UnauthenticatedTargetSession);
-        }
         let pending = self
             .approvals
             .get_mut(nonce)
@@ -431,7 +320,7 @@ impl PolicyEngine {
         if now_ms >= pending.expires_at_ms {
             return Err(ApprovalError::Expired);
         }
-        if session.target_host_id != pending.target_host_id {
+        if session.local_host_id() != &pending.target_host_id {
             return Err(ApprovalError::WrongTarget);
         }
         if request_digest(request) != pending.request_digest {
@@ -646,61 +535,14 @@ fn hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn trust_mac(secret: &[u8; 32], domain: &[u8], payload: &[u8]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(secret);
-    digest.update(domain);
-    digest.update((payload.len() as u64).to_be_bytes());
-    digest.update(payload);
-    digest.finalize().into()
-}
-
-fn rules_digest(rules: &[PolicyRule]) -> Result<[u8; 32], TrustError> {
-    let mut canonical = rules.to_vec();
-    canonical.sort_by(|left, right| left.id.cmp(&right.id));
-    for rule in &mut canonical {
-        rule.resources.sort_unstable();
-        rule.resources.dedup();
-    }
-    let encoded =
-        serde_json::to_vec(&canonical).map_err(|_| TrustError::ManagedPolicyVerificationFailed)?;
-    Ok(Sha256::digest(encoded).into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const NOW: u64 = 5_000;
 
-    struct AllowManaged;
-
-    impl ManagedPolicyVerifier for AllowManaged {
-        fn verify(&self, _rules_digest: &[u8; 32]) -> bool {
-            true
-        }
-    }
-
-    fn authority() -> PolicyTrustAuthority {
-        PolicyTrustAuthority::new(Box::new(AllowManaged))
-    }
-
-    fn target_session(
-        authority: &PolicyTrustAuthority,
-        host_id: &HostId,
-    ) -> AuthenticatedTargetSession {
-        let transport = TransportAuthentication::new(host_id.clone());
-        authority.issue_target_session(&transport, host_id).unwrap()
-    }
-
-    #[test]
-    fn request_target_cannot_issue_capability_without_matching_transport_identity() {
-        let authority = authority();
-        let transport = TransportAuthentication::new(HostId::parse("source").unwrap());
-        assert!(matches!(
-            authority.issue_target_session(&transport, &HostId::parse("target").unwrap()),
-            Err(TrustError::TransportTargetMismatch)
-        ));
+    fn target_session(host_id: &HostId) -> AuthenticatedTargetSession {
+        crate::local_ipc::authenticated_target_session_for_test(host_id.clone())
     }
 
     fn request(resources: Vec<ResourceClass>) -> AccessRequest {
@@ -741,14 +583,12 @@ mod tests {
 
     #[test]
     fn only_authenticated_target_session_can_decide_and_nonce_is_one_use() {
-        let authority = authority();
         let req = request(vec![ResourceClass::WorkspaceWrite]);
         let mut engine = PolicyEngine::new();
         let approval = engine.create_approval(&req, NOW, 100).unwrap();
-        let source = target_session(&authority, &req.source_host_id);
+        let source = target_session(&req.source_host_id);
         assert_eq!(
             engine.decide(
-                &authority,
                 &approval.nonce,
                 &source,
                 &req,
@@ -757,24 +597,10 @@ mod tests {
             ),
             Err(ApprovalError::WrongTarget)
         );
-        let other_authority = PolicyTrustAuthority::new(Box::new(AllowManaged));
-        let foreign_target = target_session(&other_authority, &req.target_host_id);
-        assert_eq!(
-            engine.decide(
-                &authority,
-                &approval.nonce,
-                &foreign_target,
-                &req,
-                ApprovalDecision::AllowOnce,
-                NOW + 1,
-            ),
-            Err(ApprovalError::UnauthenticatedTargetSession)
-        );
-        let target = target_session(&authority, &req.target_host_id);
+        let target = target_session(&req.target_host_id);
         assert!(
             engine
                 .decide(
-                    &authority,
                     &approval.nonce,
                     &target,
                     &req,
@@ -785,7 +611,6 @@ mod tests {
         );
         assert_eq!(
             engine.decide(
-                &authority,
                 &approval.nonce,
                 &target,
                 &req,
@@ -798,7 +623,6 @@ mod tests {
 
     #[test]
     fn canonical_resource_order_is_bound_to_the_same_approval_digest() {
-        let authority = authority();
         let req = request(vec![
             ResourceClass::WorkspaceWrite,
             ResourceClass::WorkspaceRead,
@@ -807,11 +631,10 @@ mod tests {
         reordered.resources.reverse();
         let mut engine = PolicyEngine::new();
         let approval = engine.create_approval(&req, NOW, 100).unwrap();
-        let target = target_session(&authority, &req.target_host_id);
+        let target = target_session(&req.target_host_id);
         assert!(
             engine
                 .decide(
-                    &authority,
                     &approval.nonce,
                     &target,
                     &reordered,
@@ -824,9 +647,8 @@ mod tests {
 
     #[test]
     fn remembered_rule_binds_absent_device_empty_resources_and_uses_unique_128_bit_ids() {
-        let authority = authority();
         let req = request(vec![]);
-        let target = target_session(&authority, &req.target_host_id);
+        let target = target_session(&req.target_host_id);
         let mut engine = PolicyEngine::new();
         let mut ids = HashSet::new();
         for index in 0..32 {
@@ -835,7 +657,6 @@ mod tests {
             let approval = engine.create_approval(&distinct, NOW, 100).unwrap();
             let rule = engine
                 .decide(
-                    &authority,
                     &approval.nonce,
                     &target,
                     &distinct,
@@ -866,14 +687,12 @@ mod tests {
 
     #[test]
     fn blocking_rule_binds_absent_device_and_empty_resources_exactly() {
-        let authority = authority();
         let req = request(vec![]);
-        let target = target_session(&authority, &req.target_host_id);
+        let target = target_session(&req.target_host_id);
         let mut engine = PolicyEngine::new();
         let approval = engine.create_approval(&req, NOW, 100).unwrap();
         let block = engine
             .decide(
-                &authority,
                 &approval.nonce,
                 &target,
                 &req,
@@ -901,53 +720,13 @@ mod tests {
     }
 
     #[test]
-    fn verified_managed_bundle_is_the_only_high_risk_bypass() {
-        let authority = authority();
-        let rule = managed_rule();
-        let mut user_allow = rule.clone();
-        user_allow.id = RuleId::parse("specific-user-allow").unwrap();
-        user_allow.origin = PolicyOrigin::User;
-        user_allow.principal_id = Some(PrincipalId::parse("principal").unwrap());
-        let bundle = authority.verify_managed_rules(vec![rule.clone()]).unwrap();
-        let mut engine = PolicyEngine::with_rules(vec![user_allow]).unwrap();
-        engine
-            .add_verified_managed_rules(&authority, bundle)
-            .unwrap();
-        let mut req = request(vec![ResourceClass::Debugger]);
-        req.operation = OperationId::parse("debug.attach").unwrap();
-        assert_eq!(
-            engine.evaluate(&req, NOW).unwrap(),
-            PolicyDecision::Allowed { rule_id: rule.id }
-        );
-
-        let mut user_deny = managed_rule();
-        user_deny.id = RuleId::parse("user-deny").unwrap();
-        user_deny.origin = PolicyOrigin::User;
-        user_deny.effect = PolicyEffect::Deny;
-        let managed = managed_rule();
-        let bundle = authority.verify_managed_rules(vec![managed]).unwrap();
-        let mut denied = PolicyEngine::with_rules(vec![user_deny.clone()]).unwrap();
-        denied
-            .add_verified_managed_rules(&authority, bundle)
-            .unwrap();
-        assert_eq!(
-            denied.evaluate(&req, NOW).unwrap(),
-            PolicyDecision::Denied {
-                rule_id: user_deny.id
-            }
-        );
-    }
-
-    #[test]
     fn approval_expires_at_boundary() {
-        let authority = authority();
         let req = request(vec![]);
-        let target = target_session(&authority, &req.target_host_id);
+        let target = target_session(&req.target_host_id);
         let mut engine = PolicyEngine::new();
         let approval = engine.create_approval(&req, NOW, 10).unwrap();
         assert_eq!(
             engine.decide(
-                &authority,
                 &approval.nonce,
                 &target,
                 &req,
@@ -960,7 +739,6 @@ mod tests {
 
     #[test]
     fn remembered_decision_cannot_overflow_rule_bound_or_consume_nonce() {
-        let authority = authority();
         let rules = (0..MAX_POLICY_RULES)
             .map(|index| {
                 let mut rule = managed_rule();
@@ -971,11 +749,10 @@ mod tests {
             .collect();
         let mut engine = PolicyEngine::with_rules(rules).unwrap();
         let req = request(vec![]);
-        let target = target_session(&authority, &req.target_host_id);
+        let target = target_session(&req.target_host_id);
         let approval = engine.create_approval(&req, NOW, 100).unwrap();
         assert_eq!(
             engine.decide(
-                &authority,
                 &approval.nonce,
                 &target,
                 &req,
@@ -987,7 +764,6 @@ mod tests {
         assert!(
             engine
                 .decide(
-                    &authority,
                     &approval.nonce,
                     &target,
                     &req,

@@ -145,6 +145,9 @@ fn text(response: &LocalResponse, acknowledged: &str) -> Result<String, String> 
             .collect::<Vec<_>>()
             .join("\n")),
         LocalResponse::Acknowledged => Ok(acknowledged.into()),
+        LocalResponse::ApprovalCreated { .. } | LocalResponse::ApprovalDecided { .. } => {
+            Err("unexpected approval response for this command".into())
+        }
         LocalResponse::Error { code, message } => Err(format!("daemon error ({code}): {message}")),
     }
 }

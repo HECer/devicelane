@@ -1,8 +1,38 @@
+use crate::dashboard::model::HostId;
+use crate::dashboard::model::{ApprovalDecision, PolicyRule};
+use crate::dashboard::policy::{AccessRequest, PolicyEngine};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+/// Opaque proof issued only inside the authorized local IPC dispatch path.
+///
+/// ```compile_fail
+/// use device_development_mesh::{dashboard::HostId, local_ipc::AuthenticatedTargetSession};
+/// let _ = AuthenticatedTargetSession { local_host_id: HostId::parse("spoof").unwrap() };
+/// ```
+pub struct AuthenticatedTargetSession {
+    local_host_id: HostId,
+}
+
+impl AuthenticatedTargetSession {
+    fn issue(local_host_id: HostId) -> Self {
+        Self { local_host_id }
+    }
+
+    pub(crate) fn local_host_id(&self) -> &HostId {
+        &self.local_host_id
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn authenticated_target_session_for_test(
+    local_host_id: HostId,
+) -> AuthenticatedTargetSession {
+    AuthenticatedTargetSession::issue(local_host_id)
+}
 #[cfg(unix)]
 use std::{io, path::PathBuf};
 
@@ -46,6 +76,17 @@ pub enum LocalRequest {
     Diagnostics {
         version: LocalProtocolVersion,
     },
+    RequestApproval {
+        version: LocalProtocolVersion,
+        access: AccessRequest,
+        lifetime_ms: u64,
+    },
+    DecideApproval {
+        version: LocalProtocolVersion,
+        nonce: String,
+        access: AccessRequest,
+        decision: ApprovalDecision,
+    },
 }
 
 impl LocalRequest {
@@ -55,7 +96,9 @@ impl LocalRequest {
             | Self::PauseRemoteAccess { version }
             | Self::ResumeRemoteAccess { version }
             | Self::SetAutostart { version, .. }
-            | Self::Diagnostics { version } => version,
+            | Self::Diagnostics { version }
+            | Self::RequestApproval { version, .. }
+            | Self::DecideApproval { version, .. } => version,
         }
     }
 
@@ -78,7 +121,18 @@ pub enum LocalResponse {
     Snapshot(DaemonSnapshot),
     Acknowledged,
     Diagnostics(Vec<DiagnosticItem>),
-    Error { code: String, message: String },
+    ApprovalCreated {
+        nonce: String,
+        expires_at_ms: u64,
+    },
+    ApprovalDecided {
+        decision: ApprovalDecision,
+        created_rule: Option<PolicyRule>,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -257,6 +311,12 @@ pub struct DaemonState {
     snapshot: DaemonSnapshot,
     diagnostics: Vec<DiagnosticItem>,
     autostart_adapter: Option<Arc<dyn AutostartAdapter>>,
+    dashboard_policy: Option<DashboardPolicyRuntime>,
+}
+
+struct DashboardPolicyRuntime {
+    local_host_id: HostId,
+    engine: PolicyEngine,
 }
 
 pub trait AutostartAdapter: Send + Sync {
@@ -277,6 +337,7 @@ impl DaemonState {
             snapshot,
             diagnostics,
             autostart_adapter: None,
+            dashboard_policy: None,
         }
     }
 
@@ -288,6 +349,7 @@ impl DaemonState {
             snapshot,
             diagnostics,
             autostart_adapter: Some(Arc::new(PlatformAutostartAdapter)),
+            dashboard_policy: None,
         }
     }
 
@@ -300,11 +362,25 @@ impl DaemonState {
             snapshot,
             diagnostics,
             autostart_adapter: Some(autostart_adapter),
+            dashboard_policy: None,
         }
     }
 
     pub fn snapshot(&self) -> &DaemonSnapshot {
         &self.snapshot
+    }
+
+    pub fn enable_dashboard_policy(&mut self, local_host_id: HostId, engine: PolicyEngine) {
+        self.dashboard_policy = Some(DashboardPolicyRuntime {
+            local_host_id,
+            engine,
+        });
+    }
+
+    fn local_policy_host_id(&self) -> Option<HostId> {
+        self.dashboard_policy
+            .as_ref()
+            .map(|runtime| runtime.local_host_id.clone())
     }
 
     pub fn handle(&mut self, request: LocalRequest) -> Result<LocalResponse, LocalProtocolError> {
@@ -329,6 +405,71 @@ impl DaemonState {
             LocalRequest::Diagnostics { .. } => {
                 Ok(LocalResponse::Diagnostics(self.diagnostics.clone()))
             }
+            LocalRequest::RequestApproval { .. } | LocalRequest::DecideApproval { .. } => {
+                Err(LocalProtocolError::Unauthorized)
+            }
+        }
+    }
+
+    fn handle_authorized(
+        &mut self,
+        request: LocalRequest,
+        session: &AuthenticatedTargetSession,
+    ) -> Result<LocalResponse, LocalProtocolError> {
+        request.validate()?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| LocalProtocolError::Io)?
+            .as_millis() as u64;
+        match request {
+            LocalRequest::RequestApproval {
+                access,
+                lifetime_ms,
+                ..
+            } => {
+                let runtime = self
+                    .dashboard_policy
+                    .as_mut()
+                    .ok_or(LocalProtocolError::Unauthorized)?;
+                if session.local_host_id() != &runtime.local_host_id
+                    || access.target_host_id != runtime.local_host_id
+                {
+                    return Err(LocalProtocolError::Unauthorized);
+                }
+                let approval = runtime
+                    .engine
+                    .create_approval(&access, now_ms, lifetime_ms)
+                    .map_err(|_| LocalProtocolError::Unauthorized)?;
+                Ok(LocalResponse::ApprovalCreated {
+                    nonce: approval.nonce,
+                    expires_at_ms: approval.expires_at_ms,
+                })
+            }
+            LocalRequest::DecideApproval {
+                nonce,
+                access,
+                decision,
+                ..
+            } => {
+                let runtime = self
+                    .dashboard_policy
+                    .as_mut()
+                    .ok_or(LocalProtocolError::Unauthorized)?;
+                if session.local_host_id() != &runtime.local_host_id
+                    || access.target_host_id != runtime.local_host_id
+                {
+                    return Err(LocalProtocolError::Unauthorized);
+                }
+                let outcome = runtime
+                    .engine
+                    .decide(&nonce, session, &access, decision, now_ms)
+                    .map_err(|_| LocalProtocolError::Unauthorized)?;
+                Ok(LocalResponse::ApprovalDecided {
+                    decision: outcome.decision,
+                    created_rule: outcome.created_rule,
+                })
+            }
+            legacy => self.handle(legacy),
         }
     }
 }
@@ -501,7 +642,24 @@ fn dispatch_connection(
     } else {
         match request {
             Ok(request) => match state.lock() {
-                Ok(mut state) => state.handle(request).unwrap_or_else(error_response),
+                Ok(mut state) => {
+                    if matches!(
+                        request,
+                        LocalRequest::RequestApproval { .. } | LocalRequest::DecideApproval { .. }
+                    ) {
+                        match state.local_policy_host_id() {
+                            Some(local_host_id) => {
+                                let session = AuthenticatedTargetSession::issue(local_host_id);
+                                state
+                                    .handle_authorized(request, &session)
+                                    .unwrap_or_else(error_response)
+                            }
+                            None => error_response(LocalProtocolError::Unauthorized),
+                        }
+                    } else {
+                        state.handle(request).unwrap_or_else(error_response)
+                    }
+                }
                 Err(_) => LocalResponse::Error {
                     code: "internal_error".into(),
                     message: "daemon state unavailable".into(),
