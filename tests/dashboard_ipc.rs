@@ -288,7 +288,17 @@ fn restart_reconciles_one_existing_activity_id_without_starting_another() {
     let snapshot = service.snapshot(DashboardScope::Local, 30);
     assert_eq!(snapshot.activities.len(), 1);
     assert_eq!(snapshot.activities[0].activity_id.as_str(), "job-1");
-    assert_eq!(snapshot.activities[0].state, ActivityState::Reconnecting);
+    assert_eq!(snapshot.activities[0].state, ActivityState::Failed);
+    assert_eq!(
+        service
+            .activity(&ActivityId::parse("job-1").unwrap())
+            .unwrap()
+            .message
+            .as_ref()
+            .unwrap()
+            .code,
+        device_development_mesh::dashboard::MessageCode::DaemonRestarted
+    );
 }
 
 #[test]
@@ -424,7 +434,17 @@ fn persistent_service_reopen_reconciles_same_activity_id() {
     let snapshot = service.snapshot(DashboardScope::Local, 30);
     assert_eq!(snapshot.activities.len(), 1);
     assert_eq!(snapshot.activities[0].activity_id.as_str(), "job-1");
-    assert_eq!(snapshot.activities[0].state, ActivityState::Reconnecting);
+    assert_eq!(snapshot.activities[0].state, ActivityState::Failed);
+    assert_eq!(
+        service
+            .activity(&ActivityId::parse("job-1").unwrap())
+            .unwrap()
+            .message
+            .as_ref()
+            .unwrap()
+            .code,
+        device_development_mesh::dashboard::MessageCode::DaemonRestarted
+    );
 }
 
 #[test]
