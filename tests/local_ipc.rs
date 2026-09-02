@@ -20,6 +20,61 @@ fn approval_access(target: &str) -> AccessRequest {
     }
 }
 
+fn admin_access(
+    activity: &str,
+    operation: &str,
+    resource: ResourceClass,
+    host: &str,
+) -> AccessRequest {
+    AccessRequest {
+        activity_id: ActivityId::parse(activity).unwrap(),
+        principal_id: PrincipalId::parse("local-user").unwrap(),
+        source_host_id: HostId::parse(host).unwrap(),
+        target_host_id: HostId::parse(host).unwrap(),
+        device_id: None,
+        operation: OperationId::parse(operation).unwrap(),
+        resources: vec![resource],
+        physical_device: false,
+        user_present: true,
+    }
+}
+
+#[cfg(windows)]
+fn approve_once(
+    endpoint: &device_development_mesh::local_ipc::LocalEndpoint,
+    access: &AccessRequest,
+) {
+    let nonce = match send_local_request(
+        endpoint,
+        &LocalRequest::RequestApproval {
+            version: LocalProtocolVersion::CURRENT,
+            access: access.clone(),
+            lifetime_ms: 60_000,
+        },
+    )
+    .unwrap()
+    {
+        LocalResponse::ApprovalCreated { nonce, .. } => nonce,
+        response => panic!(
+            "unexpected approval request response for {}: {response:?}",
+            access.operation.as_str()
+        ),
+    };
+    assert!(matches!(
+        send_local_request(
+            endpoint,
+            &LocalRequest::DecideApproval {
+                version: LocalProtocolVersion::CURRENT,
+                nonce,
+                access: access.clone(),
+                decision: ApprovalDecision::AllowOnce,
+            }
+        )
+        .unwrap(),
+        LocalResponse::ApprovalDecided { .. }
+    ));
+}
+
 fn user_rule() -> PolicyRule {
     PolicyRule {
         id: RuleId::parse("ipc-rule").unwrap(),
@@ -55,11 +110,11 @@ fn send_eventually(
     endpoint: &device_development_mesh::local_ipc::LocalEndpoint,
     request: &LocalRequest,
 ) -> LocalResponse {
-    for _ in 0..100 {
+    for _ in 0..400 {
         if let Ok(response) = send_local_request(endpoint, request) {
             return response;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("local IPC request never became available: {request:?}");
 }
@@ -398,7 +453,12 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
             })
         })
         .expect("service did not bind named pipe");
-    assert!(matches!(first, LocalResponse::Snapshot(snapshot) if !snapshot.remote_access_paused));
+    let public_identity = match first {
+        LocalResponse::Snapshot(snapshot) if !snapshot.remote_access_paused => {
+            snapshot.public_identity
+        }
+        response => panic!("unexpected status response: {response:?}"),
+    };
 
     let access = approval_access("identity");
     let created = send_local_request(
@@ -440,6 +500,15 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         .unwrap(),
         LocalResponse::PolicyRules(_)
     ));
+    approve_once(
+        &endpoint,
+        &admin_access(
+            "admin-put",
+            "devicelane.policy.put",
+            ResourceClass::DeviceLanePolicy,
+            &public_identity,
+        ),
+    );
     assert!(matches!(
         send_local_request(
             &endpoint,
@@ -451,6 +520,14 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         .unwrap(),
         LocalResponse::Acknowledged
     ));
+    let mut replayed_rule = user_rule();
+    replayed_rule.revision = 2;
+    assert!(
+        matches!(send_eventually(&endpoint, &LocalRequest::PutPolicyRule {
+        version: LocalProtocolVersion::CURRENT,
+        rule: replayed_rule,
+    }), LocalResponse::Error { code, .. } if code == "permission_denied")
+    );
     let mut expiring = approval_access("identity");
     expiring.activity_id = ActivityId::parse("ipc-expiring").unwrap();
     let expiring_nonce = match send_local_request(
@@ -470,6 +547,15 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
     assert!(
         matches!(send_local_request(&endpoint, &LocalRequest::DecideApproval { version: LocalProtocolVersion::CURRENT, nonce: expiring_nonce, access: expiring, decision: ApprovalDecision::AllowOnce }).unwrap(), LocalResponse::Error { code, .. } if code == "approval_expired")
     );
+    approve_once(
+        &endpoint,
+        &admin_access(
+            "admin-delete",
+            "devicelane.policy.delete",
+            ResourceClass::DeviceLanePolicy,
+            &public_identity,
+        ),
+    );
     assert!(matches!(
         send_local_request(
             &endpoint,
@@ -487,6 +573,15 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
     assert!(
         matches!(send_eventually(&endpoint, &LocalRequest::AuditExport { version: LocalProtocolVersion::CURRENT, filter: AuditFilter::default() }), LocalResponse::AuditExport(export) if !export.records.is_empty())
     );
+    approve_once(
+        &endpoint,
+        &admin_access(
+            "admin-cancel",
+            "devicelane.activity.cancel",
+            ResourceClass::DeviceLaneService,
+            &public_identity,
+        ),
+    );
     assert!(matches!(
         send_local_request(
             &endpoint,
@@ -498,7 +593,7 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         .unwrap(),
         LocalResponse::Cancellation { cancelled: true }
     ));
-    let events = send_local_request(
+    let events = send_eventually(
         &endpoint,
         &LocalRequest::ActivityEvents {
             version: LocalProtocolVersion::CURRENT,
@@ -508,8 +603,7 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
             },
             limit: 32,
         },
-    )
-    .unwrap();
+    );
     let cursor = match events {
         LocalResponse::ActivityEvents(
             device_development_mesh::dashboard::event_log::EventRead::Events {
@@ -541,6 +635,15 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         .unwrap(),
         LocalResponse::DashboardSnapshot(_)
     ));
+    approve_once(
+        &endpoint,
+        &admin_access(
+            "admin-pause",
+            "devicelane.service.pause",
+            ResourceClass::DeviceLaneService,
+            &public_identity,
+        ),
+    );
     assert!(matches!(
         send_local_request(
             &endpoint,
@@ -552,6 +655,15 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         .unwrap(),
         LocalResponse::Acknowledged
     ));
+    approve_once(
+        &endpoint,
+        &admin_access(
+            "admin-resume",
+            "devicelane.service.resume",
+            ResourceClass::DeviceLaneService,
+            &public_identity,
+        ),
+    );
     assert!(matches!(
         send_local_request(
             &endpoint,

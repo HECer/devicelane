@@ -68,6 +68,12 @@ pub enum AppendError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppendTransactionError<E> {
+    Append(AppendError),
+    Precommit(E),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubscribeError {
     AlreadyExists,
     LimitExceeded,
@@ -166,42 +172,72 @@ impl EventJournal {
         idempotency_key: impl Into<String>,
         event: ActivityEvent,
     ) -> Result<AppendOutcome, AppendError> {
-        event
-            .validate()
-            .map_err(|error| AppendError::InvalidEvent(error.code().to_owned()))?;
+        self.append_with_precommit(idempotency_key, event, || {
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .map_err(|error| match error {
+            AppendTransactionError::Append(error) => error,
+            AppendTransactionError::Precommit(never) => match never {},
+        })
+    }
+
+    /// Atomically reserves the journal position, runs durable precommit work, and only then
+    /// publishes the event. Other `EventJournal` clones cannot interleave an append.
+    pub fn append_with_precommit<E>(
+        &self,
+        idempotency_key: impl Into<String>,
+        event: ActivityEvent,
+        precommit: impl FnOnce() -> Result<(), E>,
+    ) -> Result<AppendOutcome, AppendTransactionError<E>> {
+        event.validate().map_err(|error| {
+            AppendTransactionError::Append(AppendError::InvalidEvent(error.code().to_owned()))
+        })?;
         let key = idempotency_key.into();
         if key.trim().is_empty() {
-            return Err(AppendError::EmptyIdempotencyKey);
+            return Err(AppendTransactionError::Append(
+                AppendError::EmptyIdempotencyKey,
+            ));
         }
         if key.len() > 256 {
-            return Err(AppendError::IdempotencyKeyTooLong);
+            return Err(AppendTransactionError::Append(
+                AppendError::IdempotencyKeyTooLong,
+            ));
         }
-        let event_json = serde_json::to_vec(&event)
-            .map_err(|error| AppendError::InvalidEvent(error.to_string()))?;
+        let event_json = serde_json::to_vec(&event).map_err(|error| {
+            AppendTransactionError::Append(AppendError::InvalidEvent(error.to_string()))
+        })?;
         let event_digest: [u8; 32] = Sha256::digest(&event_json).into();
         let mut inner = self.lock();
         if let Some(existing) = inner.idempotency.get(&key) {
             return if existing.event_digest == event_digest {
                 Ok(AppendOutcome::DuplicateCollapsed)
             } else {
-                Err(AppendError::IdempotencyConflict)
+                Err(AppendTransactionError::Append(
+                    AppendError::IdempotencyConflict,
+                ))
             };
         }
         if event.sequence == u64::MAX {
-            return Err(AppendError::SequenceOverflow);
+            return Err(AppendTransactionError::Append(
+                AppendError::SequenceOverflow,
+            ));
         }
         if inner.max_events == 0 || event_json.len() > inner.max_bytes {
-            return Err(AppendError::LimitExceeded {
+            return Err(AppendTransactionError::Append(AppendError::LimitExceeded {
                 serialized_bytes: event_json.len(),
                 maximum_bytes: inner.max_bytes,
-            });
+            }));
         }
         let previous_activity_sequence = inner.activity_sequences.get(&event.activity_id).copied();
         let expected = previous_activity_sequence
             .map_or(Some(1), |value| value.checked_add(1))
-            .ok_or(AppendError::SequenceOverflow)?;
+            .ok_or(AppendTransactionError::Append(
+                AppendError::SequenceOverflow,
+            ))?;
         if event.sequence != expected {
-            return Err(AppendError::NonMonotonicSequence { expected });
+            return Err(AppendTransactionError::Append(
+                AppendError::NonMonotonicSequence { expected },
+            ));
         }
         let needs_rotation =
             previous_activity_sequence.is_none() && inner.activity_sequences.len() >= MAX_EVENTS;
@@ -209,7 +245,7 @@ impl EventJournal {
             let next_epoch = inner
                 .epoch
                 .checked_add(1)
-                .ok_or(AppendError::EpochOverflow)?;
+                .ok_or(AppendTransactionError::Append(AppendError::EpochOverflow))?;
             let snapshot_revision = inner.snapshot_revision;
             rotate_locked(&mut inner, next_epoch, snapshot_revision);
             if let Some(previous) = previous_activity_sequence {
@@ -218,10 +254,14 @@ impl EventJournal {
                     .insert(event.activity_id.clone(), previous);
             }
         }
-        let next_cursor_sequence = inner
-            .next_cursor_sequence
-            .checked_add(1)
-            .ok_or(AppendError::SequenceOverflow)?;
+        let next_cursor_sequence =
+            inner
+                .next_cursor_sequence
+                .checked_add(1)
+                .ok_or(AppendTransactionError::Append(
+                    AppendError::SequenceOverflow,
+                ))?;
+        precommit().map_err(AppendTransactionError::Precommit)?;
         while inner.events.len() >= inner.max_events
             || inner.serialized_bytes > inner.max_bytes - event_json.len()
         {

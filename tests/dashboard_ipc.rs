@@ -170,7 +170,7 @@ fn admin_rule(
 }
 
 #[test]
-fn cancellation_is_idempotent_and_audited_before_its_event() {
+fn cancellation_requires_an_explicit_one_use_admin_grant() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
         AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
@@ -188,19 +188,18 @@ fn cancellation_is_idempotent_and_audited_before_its_event() {
 
     assert_eq!(
         service.cancel_activity(&ActivityId::parse("job-1").unwrap(), 20),
-        Ok(true)
+        Err(DashboardServiceError::PermissionDenied)
     );
     assert_eq!(
         service.cancel_activity(&ActivityId::parse("job-1").unwrap(), 21),
-        Ok(false)
+        Err(DashboardServiceError::PermissionDenied)
     );
     let audit = service
         .audit_query(AuditFilter::default(), None, 10)
         .unwrap();
-    assert_eq!(audit.items.len(), 1);
-    assert_eq!(audit.items[0].occurred_at_ms, 20);
+    assert!(audit.items.is_empty());
     assert!(
-        matches!(service.events(EventCursor { epoch: 1, sequence: 1 }, 10), EventRead::Events { events, .. } if events.len() == 1 && events[0].state == ActivityState::Cancelled)
+        matches!(service.events(EventCursor { epoch: 1, sequence: 1 }, 10), EventRead::Events { events, .. } if events.is_empty())
     );
 }
 
@@ -228,7 +227,7 @@ fn restart_reconciles_one_existing_activity_id_without_starting_another() {
 }
 
 #[test]
-fn poisoned_audit_fails_closed_before_policy_mutation() {
+fn missing_admin_grant_fails_closed_before_policy_mutation() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
         AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
@@ -250,7 +249,7 @@ fn poisoned_audit_fails_closed_before_policy_mutation() {
         &device_development_mesh::dashboard::RuleId::parse("r1").unwrap(),
         10,
     );
-    assert_eq!(result, Err(DashboardServiceError::AuditUnavailable));
+    assert_eq!(result, Err(DashboardServiceError::PermissionDenied));
     assert!(service.policy_rules().is_empty());
 }
 
@@ -303,7 +302,7 @@ fn subscriber_limit_is_stable_and_idle_housekeeping_frees_capacity() {
 }
 
 #[test]
-fn pause_finish_then_resume_accepts_new_approval_requests() {
+fn pause_and_resume_require_separate_explicit_grants() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
         AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
@@ -315,17 +314,15 @@ fn pause_finish_then_resume_accepts_new_approval_requests() {
         audit,
         PolicyEngine::new(),
     );
-    service.pause(ExistingJobs::Finish, 10).unwrap();
     assert_eq!(
-        service.request_approval(access("paused-job"), 60_000, 11),
+        service.pause(ExistingJobs::Finish, 10),
         Err(DashboardServiceError::PermissionDenied)
     );
-    service.resume(12).unwrap();
-    assert!(
-        service
-            .request_approval(access("new-job"), 60_000, 13)
-            .is_ok()
+    assert_eq!(
+        service.resume(12),
+        Err(DashboardServiceError::PermissionDenied)
     );
+    assert!(!service.remote_access_paused());
 }
 
 #[test]
@@ -396,6 +393,36 @@ fn approval_request_is_audited_before_pending_state_and_emits_live_event() {
 }
 
 #[test]
+fn local_admin_approval_request_is_accepted_but_does_not_authorize_before_decision() {
+    let root = tempfile::tempdir().unwrap();
+    let mut service = persistent_service(root.path(), PolicyEngine::new());
+    let request = AccessRequest {
+        activity_id: ActivityId::parse("admin-put").unwrap(),
+        principal_id: PrincipalId::parse("local-user").unwrap(),
+        source_host_id: HostId::parse("mac").unwrap(),
+        target_host_id: HostId::parse("mac").unwrap(),
+        device_id: None,
+        operation: OperationId::parse("devicelane.policy.put").unwrap(),
+        resources: vec![ResourceClass::DeviceLanePolicy],
+        physical_device: false,
+        user_present: true,
+    };
+    assert!(service.request_approval(request, 60_000, 10).is_ok());
+    assert_eq!(
+        service.put_policy_rule(
+            admin_rule(
+                "candidate",
+                PolicyEffect::Allow,
+                "build",
+                ResourceClass::WorkspaceRead
+            ),
+            11
+        ),
+        Err(DashboardServiceError::PermissionDenied)
+    );
+}
+
+#[test]
 fn explicit_admin_deny_prevents_policy_mutation_despite_local_authentication() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
@@ -425,6 +452,32 @@ fn explicit_admin_deny_prevents_policy_mutation_despite_local_authentication() {
         Err(DashboardServiceError::PermissionDenied)
     );
     assert_eq!(service.policy_rules().len(), 1);
+}
+
+#[test]
+fn same_user_without_an_explicit_admin_grant_is_denied() {
+    let root = tempfile::tempdir().unwrap();
+    let audit = Arc::new(Mutex::new(
+        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+    ));
+    let mut service = DashboardService::new(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(1, 0),
+        audit,
+        PolicyEngine::new(),
+    );
+    let candidate = admin_rule(
+        "candidate",
+        PolicyEffect::Allow,
+        "build",
+        ResourceClass::WorkspaceRead,
+    );
+    assert_eq!(
+        service.put_policy_rule(candidate, 10),
+        Err(DashboardServiceError::PermissionDenied)
+    );
+    assert!(service.policy_rules().is_empty());
 }
 
 #[test]
@@ -497,7 +550,7 @@ fn persistent_service(root: &std::path::Path, policy: PolicyEngine) -> Dashboard
 }
 
 #[test]
-fn checkpoint_failure_rolls_back_each_staged_mutation() {
+fn checkpoint_failure_rolls_back_staged_approval_request() {
     let request_root = tempfile::tempdir().unwrap();
     let mut request_service = persistent_service(request_root.path(), PolicyEngine::new());
     break_checkpoint(request_root.path());
@@ -507,73 +560,4 @@ fn checkpoint_failure_rolls_back_each_staged_mutation() {
             .is_err()
     );
     assert!(request_service.pending_approvals(11).is_empty());
-
-    let put_root = tempfile::tempdir().unwrap();
-    let mut put_service = persistent_service(put_root.path(), PolicyEngine::new());
-    break_checkpoint(put_root.path());
-    assert!(
-        put_service
-            .put_policy_rule(
-                admin_rule(
-                    "put",
-                    PolicyEffect::Allow,
-                    "build",
-                    ResourceClass::WorkspaceRead
-                ),
-                10
-            )
-            .is_err()
-    );
-    assert!(put_service.policy_rules().is_empty());
-
-    let delete_root = tempfile::tempdir().unwrap();
-    let existing = admin_rule(
-        "delete",
-        PolicyEffect::Allow,
-        "build",
-        ResourceClass::WorkspaceRead,
-    );
-    let mut delete_service = persistent_service(
-        delete_root.path(),
-        PolicyEngine::with_rules(vec![existing]).unwrap(),
-    );
-    break_checkpoint(delete_root.path());
-    assert!(
-        delete_service
-            .delete_policy_rule(&RuleId::parse("delete").unwrap(), 10)
-            .is_err()
-    );
-    assert_eq!(delete_service.policy_rules().len(), 1);
-
-    let pause_root = tempfile::tempdir().unwrap();
-    let mut pause_service = persistent_service(pause_root.path(), PolicyEngine::new());
-    break_checkpoint(pause_root.path());
-    assert!(pause_service.pause(ExistingJobs::Finish, 10).is_err());
-    assert!(!pause_service.remote_access_paused());
-
-    let resume_root = tempfile::tempdir().unwrap();
-    let mut resume_service = persistent_service(resume_root.path(), PolicyEngine::new());
-    resume_service.pause(ExistingJobs::Finish, 10).unwrap();
-    break_checkpoint(resume_root.path());
-    assert!(resume_service.resume(11).is_err());
-    assert!(resume_service.remote_access_paused());
-
-    let cancel_root = tempfile::tempdir().unwrap();
-    let mut cancel_service = persistent_service(cancel_root.path(), PolicyEngine::new());
-    cancel_service
-        .record_activity(event(ActivityState::Running, 1, 10), "start")
-        .unwrap();
-    break_checkpoint(cancel_root.path());
-    assert!(
-        cancel_service
-            .cancel_activity(&ActivityId::parse("job-1").unwrap(), 11)
-            .is_err()
-    );
-    assert_eq!(
-        cancel_service
-            .snapshot(DashboardScope::Local, 11)
-            .activities[0]
-            .state,
-        ActivityState::Running
-    );
 }

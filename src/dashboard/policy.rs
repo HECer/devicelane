@@ -150,7 +150,8 @@ pub enum PolicyConfigurationError {
     ManagedOriginRequiresVerification,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PendingApproval {
     request_digest: [u8; 32],
     target_host_id: HostId,
@@ -158,7 +159,8 @@ struct PendingApproval {
     used: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyEngine {
     rules: Vec<PolicyRule>,
     approvals: HashMap<String, PendingApproval>,
@@ -205,6 +207,14 @@ impl PolicyEngine {
 
     pub fn rules(&self) -> &[PolicyRule] {
         &self.rules
+    }
+
+    pub(crate) fn validate_restored(&self) -> Result<(), PolicyConfigurationError> {
+        validate_rule_set(&self.rules, true)?;
+        if self.approvals.len() > MAX_PENDING_APPROVALS {
+            return Err(PolicyConfigurationError::RuleLimitExceeded);
+        }
+        Ok(())
     }
 
     pub fn put_user_rule(&mut self, rule: PolicyRule) -> Result<(), PolicyConfigurationError> {

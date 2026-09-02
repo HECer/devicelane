@@ -3,6 +3,34 @@ use device_development_mesh::dashboard::event_log::{
     MAX_EVENTS, MAX_PAGE_BYTES, MAX_PAGE_EVENTS, MAX_SUBSCRIBERS, ReadLimit, SUBSCRIBER_IDLE_MS,
     SubscribeError,
 };
+
+#[test]
+fn durable_precommit_reservation_prevents_a_second_writer_from_interleaving() {
+    let journal = EventJournal::new(1, 0);
+    let first = journal.clone();
+    let second = journal.clone();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (second_done_tx, second_done_rx) = std::sync::mpsc::channel();
+    let first_thread = std::thread::spawn(move || {
+        first.append_with_precommit("reserved-1", event("reserved", 1), || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<_, ()>(())
+        })
+    });
+    entered_rx.recv().unwrap();
+    let second_thread = std::thread::spawn(move || {
+        let result = second.append("reserved-2", event("reserved", 2));
+        second_done_tx.send(()).unwrap();
+        result
+    });
+    assert!(second_done_rx.try_recv().is_err());
+    release_tx.send(()).unwrap();
+    assert!(first_thread.join().unwrap().is_ok());
+    assert!(second_thread.join().unwrap().is_ok());
+    assert_eq!(journal.stats().events, 2);
+}
 use device_development_mesh::dashboard::{
     ActivityEvent, ActivityId, ActivityState, Authorization, EventCursor, HostId, MetricSnapshot,
     MetricValue, OperationId, PolicyEffect, PrincipalId, ResourceClass, SafeCode, SubscriberId,

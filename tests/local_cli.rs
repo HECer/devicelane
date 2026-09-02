@@ -123,15 +123,8 @@ fn unified_cli_round_trips_typed_local_requests() {
     assert!(snapshot.remote_access_paused);
 
     let resume = run_cli(&endpoint_text, &["remote-access", "resume", "--local"]);
-    assert!(
-        resume.status.success(),
-        "{}",
-        String::from_utf8_lossy(&resume.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&resume.stdout).trim(),
-        "remote access resumed"
-    );
+    assert!(!resume.status.success());
+    assert!(String::from_utf8_lossy(&resume.stderr).contains("permission_denied"));
 
     let direct_diagnostics = send_local_request(
         &endpoint,
