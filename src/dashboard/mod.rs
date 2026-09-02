@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod event_log;
 pub mod managed_policy;
 pub mod model;
