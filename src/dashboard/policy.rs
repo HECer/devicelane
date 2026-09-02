@@ -12,8 +12,7 @@ pub const MAX_POLICY_RULES: usize = super::model::MAX_COLLECTION_ITEMS;
 pub const MAX_PENDING_APPROVALS: usize = super::model::MAX_COLLECTION_ITEMS;
 const NONCE_GENERATION_ATTEMPTS: usize = 32;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessRequest {
     pub activity_id: ActivityId,
     pub principal_id: PrincipalId,
@@ -24,6 +23,87 @@ pub struct AccessRequest {
     pub resources: Vec<ResourceClass>,
     pub physical_device: bool,
     pub user_present: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccessRequestWire {
+    activity_id: ActivityId,
+    principal_id: PrincipalId,
+    source_host_id: HostId,
+    target_host_id: HostId,
+    device_id: Option<DeviceId>,
+    operation: OperationId,
+    resources: Vec<ResourceClass>,
+    physical_device: bool,
+    user_present: bool,
+}
+
+impl From<&AccessRequest> for AccessRequestWire {
+    fn from(value: &AccessRequest) -> Self {
+        Self {
+            activity_id: value.activity_id.clone(),
+            principal_id: value.principal_id.clone(),
+            source_host_id: value.source_host_id.clone(),
+            target_host_id: value.target_host_id.clone(),
+            device_id: value.device_id.clone(),
+            operation: value.operation.clone(),
+            resources: value.resources.clone(),
+            physical_device: value.physical_device,
+            user_present: value.user_present,
+        }
+    }
+}
+
+impl TryFrom<AccessRequestWire> for AccessRequest {
+    type Error = PolicyError;
+
+    fn try_from(value: AccessRequestWire) -> Result<Self, Self::Error> {
+        let request = Self {
+            activity_id: value.activity_id,
+            principal_id: value.principal_id,
+            source_host_id: value.source_host_id,
+            target_host_id: value.target_host_id,
+            device_id: value.device_id,
+            operation: value.operation,
+            resources: value.resources,
+            physical_device: value.physical_device,
+            user_present: value.user_present,
+        };
+        validate_request(&request)?;
+        Ok(request)
+    }
+}
+
+impl Serialize for AccessRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        validate_request(self).map_err(serde::ser::Error::custom)?;
+        AccessRequestWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AccessRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        AccessRequest::try_from(AccessRequestWire::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PolicyError {
+    InvalidRequest,
+}
+
+impl std::fmt::Display for PolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid access request")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +137,7 @@ pub enum ApprovalError {
     ApprovalLimitExceeded,
     RuleLimitExceeded,
     NonceGenerationFailed,
+    UnauthenticatedTargetSession,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +148,95 @@ pub enum PolicyConfigurationError {
     ManagedOriginRequiresVerification,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrustError {
+    TransportTargetMismatch,
+    ManagedPolicyVerificationFailed,
+    InvalidCapability,
+}
+
+pub trait ManagedPolicyVerifier: Send + Sync {
+    fn verify(&self, rules_digest: &[u8; 32]) -> bool;
+}
+
+pub struct TransportAuthentication {
+    authenticated_host_id: HostId,
+}
+
+impl TransportAuthentication {
+    #[allow(dead_code)]
+    pub(crate) fn new(authenticated_host_id: HostId) -> Self {
+        Self {
+            authenticated_host_id,
+        }
+    }
+}
+
+pub struct PolicyTrustAuthority {
+    secret: [u8; 32],
+    managed_verifier: Box<dyn ManagedPolicyVerifier>,
+}
+
+impl PolicyTrustAuthority {
+    #[allow(dead_code)]
+    pub(crate) fn new(managed_verifier: Box<dyn ManagedPolicyVerifier>) -> Self {
+        let mut secret = [0_u8; 32];
+        rand::thread_rng().fill_bytes(&mut secret);
+        Self {
+            secret,
+            managed_verifier,
+        }
+    }
+
+    pub fn issue_target_session(
+        &self,
+        transport: &TransportAuthentication,
+        requested_target: &HostId,
+    ) -> Result<AuthenticatedTargetSession, TrustError> {
+        if &transport.authenticated_host_id != requested_target {
+            return Err(TrustError::TransportTargetMismatch);
+        }
+        let mac = trust_mac(
+            &self.secret,
+            b"target-session",
+            requested_target.as_str().as_bytes(),
+        );
+        Ok(AuthenticatedTargetSession {
+            target_host_id: requested_target.clone(),
+            mac,
+        })
+    }
+
+    pub fn verify_managed_rules(
+        &self,
+        rules: Vec<PolicyRule>,
+    ) -> Result<VerifiedManagedPolicyBundle, TrustError> {
+        let digest = rules_digest(&rules)?;
+        if !self.managed_verifier.verify(&digest) {
+            return Err(TrustError::ManagedPolicyVerificationFailed);
+        }
+        Ok(VerifiedManagedPolicyBundle {
+            rules,
+            digest,
+            mac: trust_mac(&self.secret, b"managed-rules", &digest),
+        })
+    }
+
+    fn verifies_session(&self, session: &AuthenticatedTargetSession) -> bool {
+        session.mac
+            == trust_mac(
+                &self.secret,
+                b"target-session",
+                session.target_host_id.as_str().as_bytes(),
+            )
+    }
+
+    fn verifies_bundle(&self, bundle: &VerifiedManagedPolicyBundle) -> bool {
+        rules_digest(&bundle.rules).is_ok_and(|digest| digest == bundle.digest)
+            && bundle.mac == trust_mac(&self.secret, b"managed-rules", &bundle.digest)
+    }
+}
+
 /// Proof that the caller was authenticated as the target host.
 ///
 /// ```compile_fail
@@ -75,24 +245,13 @@ pub enum PolicyConfigurationError {
 /// ```
 pub struct AuthenticatedTargetSession {
     target_host_id: HostId,
-}
-
-impl AuthenticatedTargetSession {
-    #[allow(dead_code)]
-    pub(crate) fn new(target_host_id: HostId) -> Self {
-        Self { target_host_id }
-    }
+    mac: [u8; 32],
 }
 
 pub struct VerifiedManagedPolicyBundle {
     rules: Vec<PolicyRule>,
-}
-
-impl VerifiedManagedPolicyBundle {
-    #[allow(dead_code)]
-    pub(crate) fn new(rules: Vec<PolicyRule>) -> Self {
-        Self { rules }
-    }
+    digest: [u8; 32],
+    mac: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -131,23 +290,36 @@ impl PolicyEngine {
         })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn with_verified_managed_rules(
+    pub fn add_verified_managed_rules(
+        &mut self,
+        authority: &PolicyTrustAuthority,
         bundle: VerifiedManagedPolicyBundle,
-    ) -> Result<Self, PolicyConfigurationError> {
+    ) -> Result<(), PolicyConfigurationError> {
+        if !authority.verifies_bundle(&bundle) {
+            return Err(PolicyConfigurationError::ManagedOriginRequiresVerification);
+        }
         validate_rule_set(&bundle.rules, true)?;
-        let rules = bundle.rules;
-        Ok(Self {
-            rules,
-            approvals: HashMap::new(),
-        })
+        if self.rules.len().saturating_add(bundle.rules.len()) > MAX_POLICY_RULES {
+            return Err(PolicyConfigurationError::RuleLimitExceeded);
+        }
+        let existing: HashSet<_> = self.rules.iter().map(|rule| &rule.id).collect();
+        if bundle.rules.iter().any(|rule| existing.contains(&rule.id)) {
+            return Err(PolicyConfigurationError::DuplicateRuleId);
+        }
+        self.rules.extend(bundle.rules);
+        Ok(())
     }
 
     pub fn rules(&self) -> &[PolicyRule] {
         &self.rules
     }
 
-    pub fn evaluate(&self, request: &AccessRequest, now_ms: u64) -> PolicyDecision {
+    pub fn evaluate(
+        &self,
+        request: &AccessRequest,
+        now_ms: u64,
+    ) -> Result<PolicyDecision, PolicyError> {
+        validate_request(request)?;
         let matching: Vec<&PolicyRule> = self
             .rules
             .iter()
@@ -155,31 +327,36 @@ impl PolicyEngine {
             .collect();
 
         if let Some(rule) = select_rule(&matching, PolicyEffect::Deny) {
-            return PolicyDecision::Denied {
+            return Ok(PolicyDecision::Denied {
                 rule_id: rule.id.clone(),
-            };
+            });
+        }
+
+        if is_high_risk(request) {
+            let managed: Vec<_> = matching
+                .iter()
+                .copied()
+                .filter(|rule| rule.origin == PolicyOrigin::Managed)
+                .collect();
+            if let Some(rule) = select_rule(&managed, PolicyEffect::Allow) {
+                return Ok(PolicyDecision::Allowed {
+                    rule_id: rule.id.clone(),
+                });
+            }
+            return Ok(PolicyDecision::ApprovalRequired {
+                reason: "fresh_target_confirmation".to_owned(),
+            });
         }
 
         let allow = select_rule(&matching, PolicyEffect::Allow);
-        if is_high_risk(request) {
-            if let Some(rule) = allow.filter(|rule| rule.origin == PolicyOrigin::Managed) {
-                return PolicyDecision::Allowed {
-                    rule_id: rule.id.clone(),
-                };
-            }
-            return PolicyDecision::ApprovalRequired {
-                reason: "fresh_target_confirmation".to_owned(),
-            };
-        }
-
-        match allow {
+        Ok(match allow {
             Some(rule) => PolicyDecision::Allowed {
                 rule_id: rule.id.clone(),
             },
             None => PolicyDecision::ApprovalRequired {
                 reason: "no_matching_rule".to_owned(),
             },
-        }
+        })
     }
 
     pub fn create_approval(
@@ -188,7 +365,7 @@ impl PolicyEngine {
         now_ms: u64,
         lifetime_ms: u64,
     ) -> Result<ApprovalChallenge, ApprovalError> {
-        validate_request(request)?;
+        validate_request(request).map_err(|_| ApprovalError::InvalidRequest)?;
         if lifetime_ms == 0 {
             return Err(ApprovalError::InvalidLifetime);
         }
@@ -205,6 +382,10 @@ impl PolicyEngine {
             let candidate = hex(&bytes);
             let rule_id = generated_rule_id(&candidate);
             if !self.approvals.contains_key(&candidate)
+                && self
+                    .approvals
+                    .keys()
+                    .all(|pending_nonce| generated_rule_id(pending_nonce) != rule_id)
                 && self.rules.iter().all(|rule| rule.id != rule_id)
             {
                 nonce = Some(candidate);
@@ -229,13 +410,17 @@ impl PolicyEngine {
 
     pub fn decide(
         &mut self,
+        authority: &PolicyTrustAuthority,
         nonce: &str,
         session: &AuthenticatedTargetSession,
         request: &AccessRequest,
         decision: ApprovalDecision,
         now_ms: u64,
     ) -> Result<ApprovalOutcome, ApprovalError> {
-        validate_request(request)?;
+        validate_request(request).map_err(|_| ApprovalError::InvalidRequest)?;
+        if !authority.verifies_session(session) {
+            return Err(ApprovalError::UnauthenticatedTargetSession);
+        }
         let pending = self
             .approvals
             .get_mut(nonce)
@@ -286,13 +471,13 @@ impl PolicyEngine {
     }
 }
 
-fn validate_request(request: &AccessRequest) -> Result<(), ApprovalError> {
+fn validate_request(request: &AccessRequest) -> Result<(), PolicyError> {
     if request.resources.len() > super::model::MAX_COLLECTION_ITEMS {
-        return Err(ApprovalError::InvalidRequest);
+        return Err(PolicyError::InvalidRequest);
     }
     let unique: HashSet<_> = request.resources.iter().collect();
     if unique.len() != request.resources.len() {
-        return Err(ApprovalError::InvalidRequest);
+        return Err(PolicyError::InvalidRequest);
     }
     Ok(())
 }
@@ -461,11 +646,62 @@ fn hex(bytes: &[u8]) -> String {
     encoded
 }
 
+fn trust_mac(secret: &[u8; 32], domain: &[u8], payload: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(secret);
+    digest.update(domain);
+    digest.update((payload.len() as u64).to_be_bytes());
+    digest.update(payload);
+    digest.finalize().into()
+}
+
+fn rules_digest(rules: &[PolicyRule]) -> Result<[u8; 32], TrustError> {
+    let mut canonical = rules.to_vec();
+    canonical.sort_by(|left, right| left.id.cmp(&right.id));
+    for rule in &mut canonical {
+        rule.resources.sort_unstable();
+        rule.resources.dedup();
+    }
+    let encoded =
+        serde_json::to_vec(&canonical).map_err(|_| TrustError::ManagedPolicyVerificationFailed)?;
+    Ok(Sha256::digest(encoded).into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const NOW: u64 = 5_000;
+
+    struct AllowManaged;
+
+    impl ManagedPolicyVerifier for AllowManaged {
+        fn verify(&self, _rules_digest: &[u8; 32]) -> bool {
+            true
+        }
+    }
+
+    fn authority() -> PolicyTrustAuthority {
+        PolicyTrustAuthority::new(Box::new(AllowManaged))
+    }
+
+    fn target_session(
+        authority: &PolicyTrustAuthority,
+        host_id: &HostId,
+    ) -> AuthenticatedTargetSession {
+        let transport = TransportAuthentication::new(host_id.clone());
+        authority.issue_target_session(&transport, host_id).unwrap()
+    }
+
+    #[test]
+    fn request_target_cannot_issue_capability_without_matching_transport_identity() {
+        let authority = authority();
+        let transport = TransportAuthentication::new(HostId::parse("source").unwrap());
+        assert!(matches!(
+            authority.issue_target_session(&transport, &HostId::parse("target").unwrap()),
+            Err(TrustError::TransportTargetMismatch)
+        ));
+    }
 
     fn request(resources: Vec<ResourceClass>) -> AccessRequest {
         AccessRequest {
@@ -505,12 +741,14 @@ mod tests {
 
     #[test]
     fn only_authenticated_target_session_can_decide_and_nonce_is_one_use() {
+        let authority = authority();
         let req = request(vec![ResourceClass::WorkspaceWrite]);
         let mut engine = PolicyEngine::new();
         let approval = engine.create_approval(&req, NOW, 100).unwrap();
-        let source = AuthenticatedTargetSession::new(req.source_host_id.clone());
+        let source = target_session(&authority, &req.source_host_id);
         assert_eq!(
             engine.decide(
+                &authority,
                 &approval.nonce,
                 &source,
                 &req,
@@ -519,10 +757,24 @@ mod tests {
             ),
             Err(ApprovalError::WrongTarget)
         );
-        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        let other_authority = PolicyTrustAuthority::new(Box::new(AllowManaged));
+        let foreign_target = target_session(&other_authority, &req.target_host_id);
+        assert_eq!(
+            engine.decide(
+                &authority,
+                &approval.nonce,
+                &foreign_target,
+                &req,
+                ApprovalDecision::AllowOnce,
+                NOW + 1,
+            ),
+            Err(ApprovalError::UnauthenticatedTargetSession)
+        );
+        let target = target_session(&authority, &req.target_host_id);
         assert!(
             engine
                 .decide(
+                    &authority,
                     &approval.nonce,
                     &target,
                     &req,
@@ -533,6 +785,7 @@ mod tests {
         );
         assert_eq!(
             engine.decide(
+                &authority,
                 &approval.nonce,
                 &target,
                 &req,
@@ -545,6 +798,7 @@ mod tests {
 
     #[test]
     fn canonical_resource_order_is_bound_to_the_same_approval_digest() {
+        let authority = authority();
         let req = request(vec![
             ResourceClass::WorkspaceWrite,
             ResourceClass::WorkspaceRead,
@@ -553,10 +807,11 @@ mod tests {
         reordered.resources.reverse();
         let mut engine = PolicyEngine::new();
         let approval = engine.create_approval(&req, NOW, 100).unwrap();
-        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        let target = target_session(&authority, &req.target_host_id);
         assert!(
             engine
                 .decide(
+                    &authority,
                     &approval.nonce,
                     &target,
                     &reordered,
@@ -569,8 +824,9 @@ mod tests {
 
     #[test]
     fn remembered_rule_binds_absent_device_empty_resources_and_uses_unique_128_bit_ids() {
+        let authority = authority();
         let req = request(vec![]);
-        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        let target = target_session(&authority, &req.target_host_id);
         let mut engine = PolicyEngine::new();
         let mut ids = HashSet::new();
         for index in 0..32 {
@@ -579,6 +835,7 @@ mod tests {
             let approval = engine.create_approval(&distinct, NOW, 100).unwrap();
             let rule = engine
                 .decide(
+                    &authority,
                     &approval.nonce,
                     &target,
                     &distinct,
@@ -596,25 +853,27 @@ mod tests {
         let mut with_device = req.clone();
         with_device.device_id = Some(DeviceId::parse("phone").unwrap());
         assert!(matches!(
-            engine.evaluate(&with_device, NOW + 2),
+            engine.evaluate(&with_device, NOW + 2).unwrap(),
             PolicyDecision::ApprovalRequired { .. }
         ));
         let mut with_resource = req;
         with_resource.resources = vec![ResourceClass::WorkspaceRead];
         assert!(matches!(
-            engine.evaluate(&with_resource, NOW + 2),
+            engine.evaluate(&with_resource, NOW + 2).unwrap(),
             PolicyDecision::ApprovalRequired { .. }
         ));
     }
 
     #[test]
     fn blocking_rule_binds_absent_device_and_empty_resources_exactly() {
+        let authority = authority();
         let req = request(vec![]);
-        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        let target = target_session(&authority, &req.target_host_id);
         let mut engine = PolicyEngine::new();
         let approval = engine.create_approval(&req, NOW, 100).unwrap();
         let block = engine
             .decide(
+                &authority,
                 &approval.nonce,
                 &target,
                 &req,
@@ -630,38 +889,65 @@ mod tests {
         let mut with_device = req.clone();
         with_device.device_id = Some(DeviceId::parse("phone").unwrap());
         assert!(matches!(
-            engine.evaluate(&with_device, NOW + 2),
+            engine.evaluate(&with_device, NOW + 2).unwrap(),
             PolicyDecision::ApprovalRequired { .. }
         ));
         let mut with_resource = req;
         with_resource.resources = vec![ResourceClass::WorkspaceRead];
         assert!(matches!(
-            engine.evaluate(&with_resource, NOW + 2),
+            engine.evaluate(&with_resource, NOW + 2).unwrap(),
             PolicyDecision::ApprovalRequired { .. }
         ));
     }
 
     #[test]
     fn verified_managed_bundle_is_the_only_high_risk_bypass() {
+        let authority = authority();
         let rule = managed_rule();
-        let bundle = VerifiedManagedPolicyBundle::new(vec![rule.clone()]);
-        let engine = PolicyEngine::with_verified_managed_rules(bundle).unwrap();
+        let mut user_allow = rule.clone();
+        user_allow.id = RuleId::parse("specific-user-allow").unwrap();
+        user_allow.origin = PolicyOrigin::User;
+        user_allow.principal_id = Some(PrincipalId::parse("principal").unwrap());
+        let bundle = authority.verify_managed_rules(vec![rule.clone()]).unwrap();
+        let mut engine = PolicyEngine::with_rules(vec![user_allow]).unwrap();
+        engine
+            .add_verified_managed_rules(&authority, bundle)
+            .unwrap();
         let mut req = request(vec![ResourceClass::Debugger]);
         req.operation = OperationId::parse("debug.attach").unwrap();
         assert_eq!(
-            engine.evaluate(&req, NOW),
+            engine.evaluate(&req, NOW).unwrap(),
             PolicyDecision::Allowed { rule_id: rule.id }
+        );
+
+        let mut user_deny = managed_rule();
+        user_deny.id = RuleId::parse("user-deny").unwrap();
+        user_deny.origin = PolicyOrigin::User;
+        user_deny.effect = PolicyEffect::Deny;
+        let managed = managed_rule();
+        let bundle = authority.verify_managed_rules(vec![managed]).unwrap();
+        let mut denied = PolicyEngine::with_rules(vec![user_deny.clone()]).unwrap();
+        denied
+            .add_verified_managed_rules(&authority, bundle)
+            .unwrap();
+        assert_eq!(
+            denied.evaluate(&req, NOW).unwrap(),
+            PolicyDecision::Denied {
+                rule_id: user_deny.id
+            }
         );
     }
 
     #[test]
     fn approval_expires_at_boundary() {
+        let authority = authority();
         let req = request(vec![]);
-        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        let target = target_session(&authority, &req.target_host_id);
         let mut engine = PolicyEngine::new();
         let approval = engine.create_approval(&req, NOW, 10).unwrap();
         assert_eq!(
             engine.decide(
+                &authority,
                 &approval.nonce,
                 &target,
                 &req,
@@ -674,6 +960,7 @@ mod tests {
 
     #[test]
     fn remembered_decision_cannot_overflow_rule_bound_or_consume_nonce() {
+        let authority = authority();
         let rules = (0..MAX_POLICY_RULES)
             .map(|index| {
                 let mut rule = managed_rule();
@@ -684,10 +971,11 @@ mod tests {
             .collect();
         let mut engine = PolicyEngine::with_rules(rules).unwrap();
         let req = request(vec![]);
-        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        let target = target_session(&authority, &req.target_host_id);
         let approval = engine.create_approval(&req, NOW, 100).unwrap();
         assert_eq!(
             engine.decide(
+                &authority,
                 &approval.nonce,
                 &target,
                 &req,
@@ -699,6 +987,7 @@ mod tests {
         assert!(
             engine
                 .decide(
+                    &authority,
                     &approval.nonce,
                     &target,
                     &req,

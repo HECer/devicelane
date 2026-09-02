@@ -4,7 +4,7 @@ use device_development_mesh::dashboard::model::{
 };
 use device_development_mesh::dashboard::policy::{
     AccessRequest, ApprovalError, MAX_PENDING_APPROVALS, MAX_POLICY_RULES,
-    PolicyConfigurationError, PolicyDecision, PolicyEngine,
+    PolicyConfigurationError, PolicyDecision, PolicyEngine, PolicyError,
 };
 
 const NOW: u64 = 1_000_000;
@@ -45,6 +45,10 @@ fn rule(id: &str, effect: PolicyEffect) -> PolicyRule {
     }
 }
 
+fn evaluate(engine: &PolicyEngine, request: &AccessRequest, now_ms: u64) -> PolicyDecision {
+    engine.evaluate(request, now_ms).unwrap()
+}
+
 #[test]
 fn deny_overrides_more_specific_allow_regardless_of_order() {
     let req = request("workspace.read", vec![ResourceClass::WorkspaceRead]);
@@ -62,7 +66,7 @@ fn deny_overrides_more_specific_allow_regardless_of_order() {
     ] {
         let engine = PolicyEngine::with_rules(rules).unwrap();
         assert_eq!(
-            engine.evaluate(&req, NOW),
+            evaluate(&engine, &req, NOW),
             PolicyDecision::Denied {
                 rule_id: deny.id.clone()
             }
@@ -97,7 +101,7 @@ fn matching_covers_all_scopes_presence_expiry_and_disabled_rules() {
 
     let engine = PolicyEngine::with_rules(vec![expired, disabled, exact.clone()]).unwrap();
     assert_eq!(
-        engine.evaluate(&req, NOW),
+        evaluate(&engine, &req, NOW),
         PolicyDecision::Allowed {
             rule_id: exact.id.clone()
         }
@@ -105,7 +109,7 @@ fn matching_covers_all_scopes_presence_expiry_and_disabled_rules() {
 
     req.user_present = false;
     assert_eq!(
-        engine.evaluate(&req, NOW),
+        evaluate(&engine, &req, NOW),
         PolicyDecision::ApprovalRequired {
             reason: "no_matching_rule".into()
         }
@@ -122,7 +126,7 @@ fn newest_revision_breaks_equal_specificity_ties_within_effect() {
     new.revision = 2;
     let engine = PolicyEngine::with_rules(vec![new.clone(), old]).unwrap();
     assert_eq!(
-        engine.evaluate(&req, NOW),
+        evaluate(&engine, &req, NOW),
         PolicyDecision::Allowed { rule_id: new.id }
     );
 }
@@ -150,7 +154,7 @@ fn every_high_risk_class_requires_fresh_target_confirmation() {
         ordinary_allow.operation = Some(req.operation.clone());
         let engine = PolicyEngine::with_rules(vec![ordinary_allow]).unwrap();
         assert_eq!(
-            engine.evaluate(&req, NOW),
+            evaluate(&engine, &req, NOW),
             PolicyDecision::ApprovalRequired {
                 reason: "fresh_target_confirmation".into()
             }
@@ -180,14 +184,14 @@ fn additive_exact_flags_distinguish_absent_device_and_empty_resources_from_wildc
     exact.match_resources_exact = true;
     let engine = PolicyEngine::with_rules(vec![exact.clone()]).unwrap();
     assert_eq!(
-        engine.evaluate(&req, NOW),
+        evaluate(&engine, &req, NOW),
         PolicyDecision::Allowed { rule_id: exact.id }
     );
 
     let mut with_device = req.clone();
     with_device.device_id = Some(DeviceId::parse("phone").unwrap());
     assert_eq!(
-        engine.evaluate(&with_device, NOW),
+        evaluate(&engine, &with_device, NOW),
         PolicyDecision::ApprovalRequired {
             reason: "no_matching_rule".into()
         }
@@ -195,7 +199,7 @@ fn additive_exact_flags_distinguish_absent_device_and_empty_resources_from_wildc
     let mut with_resource = req;
     with_resource.resources = vec![ResourceClass::WorkspaceRead];
     assert_eq!(
-        engine.evaluate(&with_resource, NOW),
+        evaluate(&engine, &with_resource, NOW),
         PolicyDecision::ApprovalRequired {
             reason: "no_matching_rule".into()
         }
@@ -249,7 +253,7 @@ fn policy_and_pending_approval_collections_are_hard_bounded() {
 fn pairing_without_an_access_rule_still_requires_approval() {
     let req = request("mesh.pair", vec![]);
     assert_eq!(
-        PolicyEngine::new().evaluate(&req, NOW),
+        evaluate(&PolicyEngine::new(), &req, NOW),
         PolicyDecision::ApprovalRequired {
             reason: "no_matching_rule".into()
         }
@@ -271,12 +275,12 @@ fn legacy_presence_false_is_wildcard_and_true_requires_presence() {
     legacy.require_user_presence = false;
     let wildcard = PolicyEngine::with_rules(vec![legacy.clone()]).unwrap();
     assert!(matches!(
-        wildcard.evaluate(&req, NOW),
+        evaluate(&wildcard, &req, NOW),
         PolicyDecision::Allowed { .. }
     ));
     req.user_present = true;
     assert!(matches!(
-        wildcard.evaluate(&req, NOW),
+        evaluate(&wildcard, &req, NOW),
         PolicyDecision::Allowed { .. }
     ));
 
@@ -284,14 +288,14 @@ fn legacy_presence_false_is_wildcard_and_true_requires_presence() {
     let required = PolicyEngine::with_rules(vec![legacy]).unwrap();
     req.user_present = false;
     assert_eq!(
-        required.evaluate(&req, NOW),
+        evaluate(&required, &req, NOW),
         PolicyDecision::ApprovalRequired {
             reason: "no_matching_rule".into()
         }
     );
     req.user_present = true;
     assert!(matches!(
-        required.evaluate(&req, NOW),
+        evaluate(&required, &req, NOW),
         PolicyDecision::Allowed { .. }
     ));
 }
@@ -308,7 +312,7 @@ fn legacy_and_exact_presence_have_equal_specificity_and_revision_wins() {
     exact.revision = 2;
     let engine = PolicyEngine::with_rules(vec![legacy, exact.clone()]).unwrap();
     assert_eq!(
-        engine.evaluate(&req, NOW),
+        evaluate(&engine, &req, NOW),
         PolicyDecision::Allowed { rule_id: exact.id }
     );
 }
@@ -340,7 +344,7 @@ fn rule_permutations_preserve_deny_dominance_and_allow_selection() {
             ])
             .unwrap();
             assert_eq!(
-                engine.evaluate(&req, NOW),
+                evaluate(&engine, &req, NOW),
                 PolicyDecision::Denied {
                     rule_id: deny.id.clone()
                 }
@@ -360,4 +364,22 @@ fn raw_identifier_length_is_rejected_before_whitespace_normalization() {
 fn malformed_resource_json_is_rejected_before_any_execution_layer() {
     let json = r#"{"activity_id":"a","principal_id":"p","source_host_id":"s","target_host_id":"t","device_id":null,"operation":"op","resources":["shell_command"],"physical_device":false,"user_present":false}"#;
     assert!(serde_json::from_str::<AccessRequest>(json).is_err());
+}
+
+#[test]
+fn invalid_access_requests_cannot_serialize_deserialize_or_evaluate() {
+    let duplicate = request(
+        "workspace.read",
+        vec![ResourceClass::WorkspaceRead, ResourceClass::WorkspaceRead],
+    );
+    assert!(serde_json::to_value(&duplicate).is_err());
+    assert_eq!(
+        PolicyEngine::new().evaluate(&duplicate, NOW),
+        Err(PolicyError::InvalidRequest)
+    );
+    let oversized = request("workspace.read", vec![ResourceClass::WorkspaceRead; 129]);
+    assert!(serde_json::to_value(&oversized).is_err());
+
+    let duplicate_json = r#"{"activity_id":"a","principal_id":"p","source_host_id":"s","target_host_id":"t","device_id":null,"operation":"op","resources":["workspace_read","workspace_read"],"physical_device":false,"user_present":false}"#;
+    assert!(serde_json::from_str::<AccessRequest>(duplicate_json).is_err());
 }
