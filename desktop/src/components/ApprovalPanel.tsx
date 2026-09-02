@@ -88,6 +88,7 @@ export function ApprovalPanel({ approvals, nowMs, focusApprovalId, onDecide, onR
                   <div><dt>Angefragt</dt><dd>{new Date(Number(approval.requested_at_ms)).toLocaleString("de-DE")}</dd></div>
                 </dl>
                 <ul className="resource-tags" aria-label="Angefragte Ressourcen">{approval.resources.map((resource) => <li key={resource}>{resourceLabel(resource)}</li>)}</ul>
+                {approval.remote_operation_sha256 && <p className="activity-operation-digest">Grant SHA-256: {approval.remote_operation_sha256}</p>}
                 <div className="approval-actions" aria-label={`Entscheidung für ${approval.id}`}>
                   <button disabled={expired || busy} onClick={() => void decide(approval, "allow_once")}>Einmal erlauben</button>
                   <button disabled={expired || busy} onClick={() => { setConfirmed(false); setConfirmation({ approval, decision: "allow_and_remember" }); }}>Erlauben und merken</button>

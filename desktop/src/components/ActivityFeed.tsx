@@ -76,6 +76,9 @@ export function ActivityFeed({ events, reconnecting = false }: ActivityFeedProps
                 <ul className="resource-tags" aria-label="Verwendete Ressourcen">
                   {event.resources.map((resource) => <li key={resource}>{resource}</li>)}
                 </ul>
+                {event.remote_operation_sha256 && <p className="activity-operation-digest">
+                  Grant SHA-256: {event.remote_operation_sha256}
+                </p>}
                 <dl className="metric-grid">
                   <div><dt>Arbeitsspeicher</dt><dd>{formatMetric(event.metrics.current_memory_bytes, formatBytes)}</dd></div>
                   <div><dt>Spitze</dt><dd>{formatMetric(event.metrics.peak_memory_bytes, formatBytes)}</dd></div>

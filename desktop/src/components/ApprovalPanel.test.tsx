@@ -13,6 +13,7 @@ const approval: ApprovalRequest = {
   device_id: "iphone-15",
   operation: "xcode.install",
   resources: ["application_install", "device_lease"],
+  remote_operation_sha256: "b".repeat(64),
   requested_at_ms: "1725000000000",
   expires_at_ms: "1725000300000",
   risk: "physical_device_install"
@@ -26,6 +27,7 @@ describe("ApprovalPanel", () => {
       expect(within(card).getByText(text, { exact: false })).toBeVisible();
     }
     expect(within(card).getByText(/Läuft ab/)).toBeVisible();
+    expect(within(card).getByText(`Grant SHA-256: ${"b".repeat(64)}`)).toBeVisible();
   });
 
   it("requires explicit confirmation for remembered and blocking decisions and never default-focuses destructive actions", async () => {

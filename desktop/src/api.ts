@@ -117,6 +117,7 @@ export interface ActivityEvent {
   device_id: string | null;
   operation: string;
   resources: ResourceClass[];
+  remote_operation_sha256?: string | null;
   authorization: Authorization;
   state: ActivityState;
   message: DisplayMessage | null;
@@ -133,6 +134,7 @@ export interface ActivitySummary {
   device_id: string | null;
   operation: string;
   resources: ResourceClass[];
+  remote_operation_sha256?: string | null;
   state: ActivityState;
   started_at_ms: U64Decimal | null;
   finished_at_ms: U64Decimal | null;
@@ -156,6 +158,7 @@ export interface ApprovalRequest {
   device_id: string | null;
   operation: string;
   resources: ResourceClass[];
+  remote_operation_sha256?: string | null;
   requested_at_ms: U64Decimal;
   expires_at_ms: U64Decimal;
   risk: string;

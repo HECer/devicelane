@@ -15,6 +15,7 @@ function event(sequence: number, activityId = `activity-${sequence}`): ActivityE
     device_id: sequence % 2 ? "iphone-1" : null,
     operation: "xcode.build",
     resources: ["workspace_read", "debugger"],
+    remote_operation_sha256: "a".repeat(64),
     authorization: { effect: "allow", rule_id: "rule-1", approval_id: "approval-1" },
     state: sequence === 1 ? "running" : "succeeded",
     message: { code: "activity_started", params: ["remote"] },
@@ -44,6 +45,7 @@ describe("ActivityFeed", () => {
     expect(screen.getAllByText("agent-codex")).toHaveLength(2);
     expect(screen.getAllByText(/windows-workstation → mac-build-host/)).toHaveLength(2);
     expect(screen.getAllByText("workspace_read")).toHaveLength(2);
+    expect(screen.getAllByText(`Grant SHA-256: ${"a".repeat(64)}`)).toHaveLength(2);
     expect(screen.getAllByText("Nicht verfügbar: observer_failed")).toHaveLength(4);
     expect(screen.queryByText(/^0$/)).not.toBeInTheDocument();
     expect(screen.getAllByText("Erlaubt")).toHaveLength(2);
