@@ -1,8 +1,10 @@
 use device_development_mesh::{
     apple_discovery::{AppleDiscovery, Availability},
-    network_processes::{DeviceSnapshot, HostSnapshot, Request, Response},
+    network_processes::{DeviceSnapshot, HostSnapshot, LeaseGrant, Request, Response},
     preflight::{AppleTool, AppleToolRunner},
-    process_execution::{CancellationToken, EventKind, ProcessExecutor, ProcessRequest},
+    process_execution::{
+        CancellationToken, EventKind, ProcessError, ProcessExecutor, ProcessRequest,
+    },
     remote_apple_protocol::AppleAgent,
     secure_transport::SecureTransport,
 };
@@ -337,33 +339,26 @@ fn start_apple_job(
         ) {
             let _ = std::fs::create_dir_all(&workspace);
         }
-        let grant_authentic = if operation.operation.mutates_device() {
-            lease_grant.as_ref().is_some_and(|grant| {
-                grant.job_id == job_id
-                    && grant.device_id == operation.device_id.clone().unwrap_or_default()
-                    && grant.lease_id == operation.lease_id.clone().unwrap_or_default()
-                    && transport
-                        .verify_peer_signature(
-                            "registry",
-                            &grant.signed_payload(),
-                            &grant.signature,
-                        )
-                        .is_ok()
-            })
+        let validation_error = if let Err(code) =
+            validate_lease_grant(&operation, &job_id, lease_grant.as_ref(), &transport)
+        {
+            Some(code.to_owned())
+        } else if let Err(error) = AppleAgent::new(
+            &host_workspace,
+            capabilities.iter().cloned(),
+            devices.iter().cloned(),
+        )
+        .and_then(|agent| agent.validate(&operation))
+        {
+            Some(error.code().to_owned())
+        } else if !std::fs::canonicalize(&workspace)
+            .ok()
+            .is_some_and(|path| path.starts_with(&host_workspace))
+        {
+            Some("workspace_path_denied".to_owned())
         } else {
-            true
+            None
         };
-        let valid = grant_authentic
-            && AppleAgent::new(
-                &host_workspace,
-                capabilities.iter().cloned(),
-                devices.iter().cloned(),
-            )
-            .and_then(|agent| agent.validate(&operation))
-            .is_ok()
-            && std::fs::canonicalize(&workspace)
-                .ok()
-                .is_some_and(|path| path.starts_with(&host_workspace));
         let (selected_tool, arguments) = match &operation.operation {
             device_development_mesh::remote_apple_protocol::AppleOperation::Discovery => {
                 (AppleTool::Devicectl, vec!["list".into(), "devices".into()])
@@ -471,7 +466,10 @@ fn start_apple_job(
         let mut events = Vec::new();
         let mut artifact_bytes = Vec::new();
         let mut succeeded = false;
-        if valid && let Ok(runner) = AppleToolRunner::new(&host_workspace, configured_tools) {
+        let mut rejection_code = validation_error;
+        if rejection_code.is_none()
+            && let Ok(runner) = AppleToolRunner::new(&host_workspace, configured_tools)
+        {
             let writer_device = operation
                 .operation
                 .mutates_device()
@@ -484,9 +482,12 @@ fn start_apple_job(
                 }
                 writers.insert(device_id.clone());
             }
-            let lease_active = writer_device.is_none()
-                || lease_grant.as_ref().is_some_and(|grant| {
-                    rpc(
+            let lease_validation_error = writer_device.as_ref().and_then(|_| {
+                let Some(grant) = lease_grant.as_ref() else {
+                    return Some("lease_grant_missing".into());
+                };
+                validate_lease_with_retry(
+                    || match rpc(
                         &registry,
                         &transport,
                         &Request::Lease {
@@ -495,10 +496,20 @@ fn start_apple_job(
                                     grant: grant.clone(),
                                 },
                         },
-                    )
-                    .is_some_and(|response| response.lease_status.as_deref() == Some("active"))
-                });
-            if lease_active {
+                    ) {
+                        Some(response) if response.lease_status.as_deref() == Some("active") => {
+                            Ok(())
+                        }
+                        Some(response) => {
+                            Err(response.error.unwrap_or_else(|| "lease_inactive".into()))
+                        }
+                        None => Err("lease_validation_unavailable".into()),
+                    },
+                    Duration::from_millis(850),
+                )
+                .err()
+            });
+            if lease_validation_error.is_none() {
                 let execution = if matches!(
                     operation.operation,
                     device_development_mesh::remote_apple_protocol::AppleOperation::HardwareGate { .. }
@@ -558,9 +569,9 @@ fn start_apple_job(
                         cancellation.clone(),
                     )
                 };
-                if let Ok(process_events) = execution {
-                    succeeded =
-                        process_events.last().is_some_and(|event| {
+                match execution {
+                    Ok(process_events) => {
+                        succeeded = process_events.last().is_some_and(|event| {
                             matches!(
                         event.kind,
                         EventKind::Terminal(
@@ -568,34 +579,45 @@ fn start_apple_job(
                         )
                     )
                         });
-                    for event in process_events {
-                        if event.kind == EventKind::Stdout {
-                            artifact_bytes.extend_from_slice(&event.payload);
-                            if !matches!(
+                        if !succeeded {
+                            rejection_code = Some("tool_failed".into());
+                        }
+                        for event in process_events {
+                            if event.kind == EventKind::Stdout {
+                                artifact_bytes.extend_from_slice(&event.payload);
+                                if !matches!(
                             operation.operation,
                             device_development_mesh::remote_apple_protocol::AppleOperation::HardwareGate { .. }
                         ) {
-                            events.push(network_event(
-                                events.len() as u64 + 2,
-                                "stdout",
-                                &String::from_utf8_lossy(&event.payload),
-                            ));
-                        } else if event.kind == EventKind::Stderr {
-                            events.push(network_event(
-                                events.len() as u64 + 2,
-                                "stderr",
-                                &String::from_utf8_lossy(&event.payload),
-                            ));
-                        }
+                                    events.push(network_event(
+                                        events.len() as u64 + 2,
+                                        "stdout",
+                                        &String::from_utf8_lossy(&event.payload),
+                                    ));
+                                }
+                            } else if event.kind == EventKind::Stderr {
+                                events.push(network_event(
+                                    events.len() as u64 + 2,
+                                    "stderr",
+                                    &String::from_utf8_lossy(&event.payload),
+                                ));
+                            }
                         }
                     }
+                    Err(error) => {
+                        rejection_code = Some(process_error_code(error).into());
+                    }
                 }
+            } else {
+                rejection_code = lease_validation_error;
             }
             if let Some(device_id) = writer_device {
                 let (writers, available) = &*device_writers;
                 writers.lock().unwrap().remove(&device_id);
                 available.notify_all();
             }
+        } else if rejection_code.is_none() {
+            rejection_code = Some("tool_configuration_invalid".into());
         }
         let (artifact_name, artifact_media_type) = if matches!(
             operation.operation,
@@ -618,6 +640,13 @@ fn start_apple_job(
             })
             .flatten()
             .unwrap_or_default();
+        let terminal_payload = if cancellation.is_cancelled() {
+            "cancelled"
+        } else if succeeded {
+            artifact_id.as_str()
+        } else {
+            rejection_code.as_deref().unwrap_or("tool_failed")
+        };
         events.push(network_event(
             events.len() as u64 + 2,
             if cancellation.is_cancelled() {
@@ -627,13 +656,57 @@ fn start_apple_job(
             } else {
                 "rejected"
             },
-            &artifact_id,
+            terminal_payload,
         ));
         while !send_apple_progress(&registry, &transport, &job_id, events.clone(), true) {
             thread::sleep(Duration::from_millis(100));
         }
         running.lock().unwrap().remove(&job_id);
     });
+}
+
+fn validate_lease_grant(
+    operation: &device_development_mesh::remote_apple_protocol::AppleRequest,
+    job_id: &str,
+    grant: Option<&LeaseGrant>,
+    transport: &SecureTransport,
+) -> Result<(), &'static str> {
+    if !operation.operation.mutates_device() {
+        return Ok(());
+    }
+    let grant = grant.ok_or("lease_grant_missing")?;
+    if grant.job_id != job_id {
+        return Err("lease_grant_job_mismatch");
+    }
+    if operation.device_id.as_deref() != Some(&grant.device_id) {
+        return Err("lease_grant_device_mismatch");
+    }
+    if operation.lease_id.as_deref() != Some(&grant.lease_id) {
+        return Err("lease_grant_id_mismatch");
+    }
+    transport
+        .verify_peer_signature("registry", &grant.signed_payload(), &grant.signature)
+        .map_err(|_| "lease_grant_signature_invalid")
+}
+
+fn validate_lease_with_retry(
+    mut validate: impl FnMut() -> Result<(), String>,
+    total_timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + total_timeout;
+    for attempt in 0..3 {
+        match validate() {
+            Ok(()) => return Ok(()),
+            Err(error) if error == "lease_validation_unavailable" => {
+                if attempt == 2 || Instant::now() >= deadline {
+                    return Err(error);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 
 fn publish_artifact(
@@ -707,6 +780,15 @@ fn network_event(
         sequence,
         kind: kind.into(),
         payload: payload.into(),
+    }
+}
+
+fn process_error_code(error: ProcessError) -> &'static str {
+    match error {
+        ProcessError::ProgramDenied => "program_denied",
+        ProcessError::WorkspaceEscape => "workspace_path_denied",
+        ProcessError::EnvironmentDenied => "environment_denied",
+        ProcessError::Io => "tool_io_failed",
     }
 }
 
@@ -859,6 +941,126 @@ mod tests {
             r#"{"accepted":false,"hosts":[],"events":[],"audit":[],"cancel_jobs":[],"error":"persistence_failed"}"#
         ));
         assert!(!progress_acknowledged("not-json"));
+    }
+
+    #[test]
+    fn process_rejections_have_stable_actionable_codes() {
+        assert_eq!(
+            [
+                ProcessError::ProgramDenied,
+                ProcessError::WorkspaceEscape,
+                ProcessError::EnvironmentDenied,
+                ProcessError::Io,
+            ]
+            .map(process_error_code),
+            [
+                "program_denied",
+                "workspace_path_denied",
+                "environment_denied",
+                "tool_io_failed",
+            ]
+        );
+    }
+
+    #[test]
+    fn lease_grant_rejections_identify_the_exact_safe_category() {
+        use device_development_mesh::remote_apple_protocol::{
+            AppleOperation, AppleRequest, RemoteProtocolVersion,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            SecureTransport::load_or_create(root.path().join("registry"), "registry").unwrap();
+        let mut agent =
+            SecureTransport::load_or_create(root.path().join("agent"), "agent").unwrap();
+        agent.trust("registry", registry.certificate_der()).unwrap();
+        let operation = AppleRequest {
+            version: RemoteProtocolVersion { major: 1, minor: 0 },
+            request_id: "request-1".into(),
+            idempotency_key: "idempotency-1".into(),
+            capability: "apple.simulator@1".into(),
+            workspace_path: "project".into(),
+            device_id: Some("sim-1".into()),
+            lease_id: Some("lease-1".into()),
+            operation: AppleOperation::InstallApp {
+                app_path: "build/App.app".into(),
+            },
+        };
+        let mut valid = LeaseGrant {
+            lease_id: "lease-1".into(),
+            device_id: "sim-1".into(),
+            client_id: "client-1".into(),
+            job_id: "job-1".into(),
+            expires_at_ms: 30_000,
+            signature: Vec::new(),
+        };
+        valid.signature = registry.sign(&valid.signed_payload()).unwrap();
+
+        assert_eq!(
+            validate_lease_grant(&operation, "job-1", None, &agent),
+            Err("lease_grant_missing")
+        );
+        let mut wrong_job = valid.clone();
+        wrong_job.job_id = "job-2".into();
+        assert_eq!(
+            validate_lease_grant(&operation, "job-1", Some(&wrong_job), &agent),
+            Err("lease_grant_job_mismatch")
+        );
+        let mut wrong_device = valid.clone();
+        wrong_device.device_id = "sim-2".into();
+        assert_eq!(
+            validate_lease_grant(&operation, "job-1", Some(&wrong_device), &agent),
+            Err("lease_grant_device_mismatch")
+        );
+        let mut wrong_lease = valid.clone();
+        wrong_lease.lease_id = "lease-2".into();
+        assert_eq!(
+            validate_lease_grant(&operation, "job-1", Some(&wrong_lease), &agent),
+            Err("lease_grant_id_mismatch")
+        );
+        let mut bad_signature = valid.clone();
+        bad_signature.signature = vec![0; valid.signature.len()];
+        assert_eq!(
+            validate_lease_grant(&operation, "job-1", Some(&bad_signature), &agent),
+            Err("lease_grant_signature_invalid")
+        );
+        assert_eq!(
+            validate_lease_grant(&operation, "job-1", Some(&valid), &agent),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn lease_validation_retries_only_transport_unavailability() {
+        let mut transient_attempts = 0;
+        assert_eq!(
+            validate_lease_with_retry(
+                || {
+                    transient_attempts += 1;
+                    if transient_attempts < 3 {
+                        Err("lease_validation_unavailable".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                Duration::from_millis(100),
+            ),
+            Ok(())
+        );
+        assert_eq!(transient_attempts, 3);
+
+        let mut denied_attempts = 0;
+        assert_eq!(
+            validate_lease_with_retry(
+                || {
+                    denied_attempts += 1;
+                    Err("lease_inactive".into())
+                },
+                Duration::from_millis(100),
+            ),
+            Err("lease_inactive".into())
+        );
+        assert_eq!(denied_attempts, 1);
     }
 
     #[test]

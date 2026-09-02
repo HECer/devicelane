@@ -526,7 +526,7 @@ fn detached_device_without_a_writer_can_migrate_to_another_agent() {
 
 #[test]
 fn reconnected_device_keeps_its_agent_owner_after_writer_terminal() {
-    let mut harness = Harness::start_with_heartbeat(Duration::from_millis(2_000), 4_000);
+    let mut harness = Harness::start_gated_with_heartbeat(4_000);
     let owned = acquire(&harness, &harness.client_a, 30_000);
     let job = cli_json(
         &harness.address,
@@ -567,6 +567,11 @@ fn reconnected_device_keeps_its_agent_owner_after_writer_terminal() {
             true
         );
     }
+    std::fs::write(
+        harness.mutation_gate.as_ref().unwrap(),
+        b"release mutation\n",
+    )
+    .unwrap();
     wait_for_terminal(
         &harness.address,
         &harness.client_a,
@@ -789,12 +794,12 @@ impl Harness {
         Self::start_with_options(mutation_delay, 50, false)
     }
 
-    fn start_with_heartbeat(mutation_delay: Duration, heartbeat_ms: u64) -> Self {
-        Self::start_with_options(mutation_delay, heartbeat_ms, false)
-    }
-
     fn start_gated() -> Self {
         Self::start_with_options(Duration::ZERO, 50, true)
+    }
+
+    fn start_gated_with_heartbeat(heartbeat_ms: u64) -> Self {
+        Self::start_with_options(Duration::ZERO, heartbeat_ms, true)
     }
 
     fn start_with_options(
@@ -1012,8 +1017,6 @@ fn wait_for_mutation(
     job_id: Option<&str>,
 ) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut next_event_probe = Instant::now();
-    let mut last_event_snapshot = serde_json::Value::Null;
     loop {
         let markers = mutation_lines(&harness.marker);
         let agent_status = harness._agent.try_wait().unwrap();
@@ -1030,37 +1033,17 @@ fn wait_for_mutation(
         if markers.iter().any(|line| line == expected) {
             return;
         }
-        if let Some(job_id) = job_id
-            && Instant::now() >= next_event_probe
-        {
-            let output = cli(
-                &harness.address,
-                &harness.client_a,
-                "events",
-                &serde_json::json!({"job_id": job_id, "after": 0}),
-            );
-            assert!(
-                output.status.success(),
-                "event probe failed before {label}; status={}; stderr={}; markers={markers:?}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            last_event_snapshot = serde_json::from_slice(&output.stdout).unwrap();
-            let terminal = last_event_snapshot["events"].as_array().and_then(|events| {
-                events.iter().find(|event| {
-                    matches!(
-                        event["kind"].as_str(),
-                        Some("completed" | "rejected" | "cancelled")
-                    )
-                })
-            });
-            assert!(
-                terminal.is_none(),
-                "job terminated before {label}; terminal={terminal:?}; snapshot={last_event_snapshot}; markers={markers:?}"
-            );
-            next_event_probe = Instant::now() + Duration::from_millis(250);
-        }
         if Instant::now() >= deadline {
+            let event_snapshot = job_id.map_or(serde_json::Value::Null, |job_id| {
+                rpc(
+                    &harness.address,
+                    &harness.client_a,
+                    &Request::Events {
+                        job_id: job_id.into(),
+                        after: 0,
+                    },
+                )
+            });
             let hosts = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
                 .args([
                     "--registry",
@@ -1073,7 +1056,7 @@ fn wait_for_mutation(
                 .output()
                 .unwrap();
             panic!(
-                "timed out waiting for {label}; agent_status={agent_status:?}; registry_status={registry_status:?}; markers={markers:?}; last_event_snapshot={last_event_snapshot}; host_status={}; host_stdout={}; host_stderr={}",
+                "timed out waiting for {label}; agent_status={agent_status:?}; registry_status={registry_status:?}; markers={markers:?}; event_snapshot={event_snapshot}; host_status={}; host_stdout={}; host_stderr={}",
                 hosts.status,
                 String::from_utf8_lossy(&hosts.stdout),
                 String::from_utf8_lossy(&hosts.stderr)
