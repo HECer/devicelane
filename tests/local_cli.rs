@@ -21,7 +21,12 @@ fn endpoint_text(_runtime_dir: &std::path::Path) -> String {
     }
     #[cfg(unix)]
     {
-        _runtime_dir.join("devicelane.sock").display().to_string()
+        _runtime_dir
+            .canonicalize()
+            .unwrap()
+            .join("devicelane.sock")
+            .display()
+            .to_string()
     }
 }
 
