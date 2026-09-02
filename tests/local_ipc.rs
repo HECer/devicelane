@@ -1222,9 +1222,7 @@ fn production_unix_socket_serves_state_and_recovers_after_bad_frames() {
             })
         })
         .expect("service did not bind Unix socket");
-    let socket_path = match &endpoint {
-        device_development_mesh::local_ipc::LocalEndpoint::UnixSocket(path) => path,
-    };
+    let device_development_mesh::local_ipc::LocalEndpoint::UnixSocket(socket_path) = &endpoint;
     assert_eq!(
         std::fs::metadata(socket_path).unwrap().mode() & 0o777,
         0o600
