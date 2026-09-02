@@ -310,7 +310,7 @@ fn authorized_agent_detach_promotes_the_waiting_client() {
 
 #[test]
 fn agent_detach_recovers_a_writer_after_terminal_progress_is_lost() {
-    let mut harness = Harness::start(Duration::from_millis(800));
+    let mut harness = Harness::start_gated();
     let owned = acquire(&harness, &harness.client_a, 30_000);
     assert_eq!(
         lease(
@@ -323,25 +323,57 @@ fn agent_detach_recovers_a_writer_after_terminal_progress_is_lost() {
         )["lease_status"],
         "queued"
     );
-    cli_json(
+    let job = cli_json(
         &harness.address,
         &harness.client_a,
         "apple-run",
         &apple_request("lost-terminal", &grant_id(&owned)),
     );
-    wait_for_mutation(&mut harness, "mutation-start", "mutating tool start", true);
+    let job_id = job["job_id"].as_str().unwrap().to_owned();
+    wait_for_mutation(
+        &mut harness,
+        "mutation-start",
+        "mutating tool start",
+        true,
+        Some(&job_id),
+    );
     harness._registry.kill().unwrap();
     harness._registry.wait().unwrap();
+    std::fs::write(
+        harness.mutation_gate.as_ref().unwrap(),
+        b"release mutation\n",
+    )
+    .unwrap();
     wait_for_mutation(
         &mut harness,
         "mutation-end",
         "tool completion while terminal delivery is unavailable",
         false,
+        None,
     );
     harness._agent.kill().unwrap();
     harness._agent.wait().unwrap();
     harness._registry = start_registry(&harness.address, &harness._root.path().join("registry"));
     wait_for_listener(&harness.address);
+    let snapshot = cli_json(
+        &harness.address,
+        &harness.client_a,
+        "events",
+        &serde_json::json!({"job_id": job_id, "after": 0}),
+    );
+    assert_eq!(snapshot["accepted"], true, "{snapshot}");
+    assert_eq!(snapshot["job_id"], job_id, "{snapshot}");
+    assert!(
+        snapshot["events"].as_array().is_none_or(|events| {
+            events.iter().all(|event| {
+                !matches!(
+                    event["kind"].as_str(),
+                    Some("completed" | "rejected" | "cancelled")
+                )
+            })
+        }),
+        "agent delivered a terminal event before the detach recovery boundary: {snapshot}"
+    );
 
     let detached_inventory = rpc(
         &harness.address,
@@ -502,7 +534,13 @@ fn reconnected_device_keeps_its_agent_owner_after_writer_terminal() {
         "apple-run",
         &apple_request("transient-detach", &grant_id(&owned)),
     );
-    wait_for_mutation(&mut harness, "mutation-start", "mutating tool start", true);
+    wait_for_mutation(
+        &mut harness,
+        "mutation-start",
+        "mutating tool start",
+        true,
+        job["job_id"].as_str(),
+    );
     for devices in [
         Vec::new(),
         vec![DeviceSnapshot {
@@ -740,6 +778,7 @@ struct Harness {
     agent: PathBuf,
     agent_b: PathBuf,
     marker: PathBuf,
+    mutation_gate: Option<PathBuf>,
     _registry: ChildGuard,
     _agent: ChildGuard,
     _network_test_lock: MutexGuard<'static, ()>,
@@ -747,10 +786,22 @@ struct Harness {
 
 impl Harness {
     fn start(mutation_delay: Duration) -> Self {
-        Self::start_with_heartbeat(mutation_delay, 50)
+        Self::start_with_options(mutation_delay, 50, false)
     }
 
     fn start_with_heartbeat(mutation_delay: Duration, heartbeat_ms: u64) -> Self {
+        Self::start_with_options(mutation_delay, heartbeat_ms, false)
+    }
+
+    fn start_gated() -> Self {
+        Self::start_with_options(Duration::ZERO, 50, true)
+    }
+
+    fn start_with_options(
+        mutation_delay: Duration,
+        heartbeat_ms: u64,
+        gate_mutation: bool,
+    ) -> Self {
         let network_test_lock = NETWORK_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -772,9 +823,11 @@ impl Harness {
         let project = workspace_root.join("mac-1/project");
         std::fs::create_dir_all(project.join(".leases")).unwrap();
         let marker = root.path().join("apple-tools.log");
-        let xcodebuild = fake_tool(root.path(), "xcodebuild", &marker, mutation_delay);
-        let devicectl = fake_tool(root.path(), "devicectl", &marker, mutation_delay);
-        let simctl = fake_tool(root.path(), "simctl", &marker, mutation_delay);
+        let mutation_gate = root.path().join("mutation-release");
+        let gate = gate_mutation.then_some(mutation_gate.as_path());
+        let xcodebuild = fake_tool(root.path(), "xcodebuild", &marker, mutation_delay, gate);
+        let devicectl = fake_tool(root.path(), "devicectl", &marker, mutation_delay, gate);
+        let simctl = fake_tool(root.path(), "simctl", &marker, mutation_delay, gate);
 
         let client_transport = SecureTransport::load_or_create(&client_a, "client-a").unwrap();
         let mut forged_grant = LeaseGrant {
@@ -840,6 +893,7 @@ impl Harness {
             agent,
             agent_b,
             marker,
+            mutation_gate: gate_mutation.then_some(mutation_gate),
             _registry: registry_process,
             _agent: agent_process,
             _network_test_lock: network_test_lock,
@@ -955,13 +1009,13 @@ fn wait_for_mutation(
     expected: &str,
     label: &str,
     registry_should_run: bool,
+    job_id: Option<&str>,
 ) {
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut next_event_probe = Instant::now();
+    let mut last_event_snapshot = serde_json::Value::Null;
     loop {
         let markers = mutation_lines(&harness.marker);
-        if markers.iter().any(|line| line == expected) {
-            return;
-        }
         let agent_status = harness._agent.try_wait().unwrap();
         let registry_status = harness._registry.try_wait().unwrap();
         assert!(
@@ -973,10 +1027,58 @@ fn wait_for_mutation(
             registry_should_run,
             "registry state changed before {label}; agent_status={agent_status:?}; registry_status={registry_status:?}; markers={markers:?}"
         );
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {label}; agent_status={agent_status:?}; registry_status={registry_status:?}; markers={markers:?}"
-        );
+        if markers.iter().any(|line| line == expected) {
+            return;
+        }
+        if let Some(job_id) = job_id
+            && Instant::now() >= next_event_probe
+        {
+            let output = cli(
+                &harness.address,
+                &harness.client_a,
+                "events",
+                &serde_json::json!({"job_id": job_id, "after": 0}),
+            );
+            assert!(
+                output.status.success(),
+                "event probe failed before {label}; status={}; stderr={}; markers={markers:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            last_event_snapshot = serde_json::from_slice(&output.stdout).unwrap();
+            let terminal = last_event_snapshot["events"].as_array().and_then(|events| {
+                events.iter().find(|event| {
+                    matches!(
+                        event["kind"].as_str(),
+                        Some("completed" | "rejected" | "cancelled")
+                    )
+                })
+            });
+            assert!(
+                terminal.is_none(),
+                "job terminated before {label}; terminal={terminal:?}; snapshot={last_event_snapshot}; markers={markers:?}"
+            );
+            next_event_probe = Instant::now() + Duration::from_millis(250);
+        }
+        if Instant::now() >= deadline {
+            let hosts = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
+                .args([
+                    "--registry",
+                    &harness.address,
+                    "--identity",
+                    harness.client_a.to_str().unwrap(),
+                    "list",
+                    "--json",
+                ])
+                .output()
+                .unwrap();
+            panic!(
+                "timed out waiting for {label}; agent_status={agent_status:?}; registry_status={registry_status:?}; markers={markers:?}; last_event_snapshot={last_event_snapshot}; host_status={}; host_stdout={}; host_stderr={}",
+                hosts.status,
+                String::from_utf8_lossy(&hosts.stdout),
+                String::from_utf8_lossy(&hosts.stderr)
+            );
+        }
         thread::sleep(Duration::from_millis(25));
     }
 }
@@ -999,7 +1101,13 @@ fn start_registry(address: &str, identity: &Path) -> ChildGuard {
     )
 }
 
-fn fake_tool(root: &Path, name: &str, marker: &Path, mutation_delay: Duration) -> PathBuf {
+fn fake_tool(
+    root: &Path,
+    name: &str,
+    marker: &Path,
+    mutation_delay: Duration,
+    mutation_gate: Option<&Path>,
+) -> PathBuf {
     #[cfg(windows)]
     {
         let path = root.join(format!("{name}.cmd"));
@@ -1009,11 +1117,21 @@ fn fake_tool(root: &Path, name: &str, marker: &Path, mutation_delay: Duration) -
             let ping_count = mutation_delay.as_millis().div_ceil(1_000) + 1;
             format!("ping.exe -n {ping_count} 127.0.0.1 >nul")
         };
+        let gate_command = mutation_gate.map_or_else(
+            || "rem no mutation gate".to_owned(),
+            |gate| {
+                format!(
+                    ":wait_gate\r\nif not exist \"{}\" (\r\n  ping.exe -n 2 127.0.0.1 >nul\r\n  goto wait_gate\r\n)",
+                    gate.display()
+                )
+            },
+        );
         std::fs::write(
             &path,
             format!(
-                "@echo off\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"install\" goto mutation\r\nif \"%1\"==\"-version\" goto version\r\nif \"{name}\"==\"devicectl\" if \"%1\"==\"list\" goto devices\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"list\" goto simulators\r\necho tool-output {name} %*\r\nexit /b 0\r\n:mutation\r\necho mutation-start>>\"{}\"\r\n{}\r\necho mutation-end>>\"{}\"\r\necho installed\r\nexit /b 0\r\n:version\r\necho Xcode 16\r\nexit /b 0\r\n:devices\r\necho {{\"result\":{{\"devices\":[]}}}}\r\nexit /b 0\r\n:simulators\r\necho {{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}\r\nexit /b 0\r\n",
+                "@echo off\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"install\" goto mutation\r\nif \"%1\"==\"-version\" goto version\r\nif \"{name}\"==\"devicectl\" if \"%1\"==\"list\" goto devices\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"list\" goto simulators\r\necho tool-output {name} %*\r\nexit /b 0\r\n:mutation\r\necho mutation-start>>\"{}\"\r\n{}\r\n{}\r\necho mutation-end>>\"{}\"\r\necho installed\r\nexit /b 0\r\n:version\r\necho Xcode 16\r\nexit /b 0\r\n:devices\r\necho {{\"result\":{{\"devices\":[]}}}}\r\nexit /b 0\r\n:simulators\r\necho {{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}\r\nexit /b 0\r\n",
                 marker.display(),
+                gate_command,
                 delay_command,
                 marker.display()
             ),
@@ -1025,11 +1143,18 @@ fn fake_tool(root: &Path, name: &str, marker: &Path, mutation_delay: Duration) -
     {
         use std::os::unix::fs::PermissionsExt;
         let path = root.join(name);
+        let gate_command = mutation_gate.map_or_else(String::new, |gate| {
+            format!(
+                "  while [ ! -f '{}' ]; do sleep 0.05; done\n",
+                gate.display()
+            )
+        });
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\nif [ '{name}' = simctl ] && [ \"$1\" = install ]; then\n  echo mutation-start >> '{}'\n  sleep {}\n  echo mutation-end >> '{}'\n  echo installed\n  exit 0\nfi\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && [ \"$1\" = list ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && [ \"$1\" = list ] && echo '{{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}' && exit 0\necho \"tool-output {name} $*\"\n",
+                "#!/bin/sh\nif [ '{name}' = simctl ] && [ \"$1\" = install ]; then\n  echo mutation-start >> '{}'\n{}  sleep {}\n  echo mutation-end >> '{}'\n  echo installed\n  exit 0\nfi\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && [ \"$1\" = list ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && [ \"$1\" = list ] && echo '{{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}' && exit 0\necho \"tool-output {name} $*\"\n",
                 marker.display(),
+                gate_command,
                 mutation_delay.as_secs_f64(),
                 marker.display()
             ),
