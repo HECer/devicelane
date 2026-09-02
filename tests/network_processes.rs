@@ -94,9 +94,7 @@ fn separate_processes_pair_heartbeat_and_retain_offline_snapshot() {
     assert!(text.contains("capabilities: apple.build@1"));
     assert!(text.contains("devices: iphone-1 ios connected"));
 
-    let json = eventually_list(&address, &cli_identity, &["--json"]);
-    assert!(json.status.success());
-    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let json = eventually_host_status(&address, &cli_identity, "online");
     assert_eq!(json[0]["id"], "mac-1");
     assert_eq!(json[0]["status"], "online");
     assert_eq!(json[0]["capabilities"][0], "apple.build@1");

@@ -222,7 +222,7 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
     registry_process.wait().unwrap();
     registry_process = start_registry(&address, &registry_identity);
     wait_for_host(&address, &first_identity);
-    let after = events(&address, &first_identity, &durable_job, 0);
+    let after = wait_for_event_snapshot(&address, &first_identity, &durable_job, &before);
     assert!(after["events"].as_array().unwrap().contains(&before));
 
     agent.kill().unwrap();
@@ -347,7 +347,20 @@ fn cli_json<T: serde::Serialize>(
     command: &str,
     body: &T,
 ) -> serde_json::Value {
-    serde_json::from_slice(&cli(address, identity, command, body).stdout).unwrap()
+    let output = cli(address, identity, command, body);
+    assert!(
+        output.status.success(),
+        "mesh-cli {command} failed with {}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "mesh-cli {command} returned invalid JSON: {error}; status={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }
 
 fn cli_value(
@@ -385,8 +398,9 @@ fn wait_for_terminal(address: &str, identity: &Path, job_id: &str) -> serde_json
 }
 
 fn wait_for_host(address: &str, identity: &Path) {
-    wait_until("host", || {
-        Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
             .args([
                 "--registry",
                 address,
@@ -396,10 +410,57 @@ fn wait_for_host(address: &str, identity: &Path) {
                 "--json",
             ])
             .output()
-            .is_ok_and(|output| {
-                output.status.success() && String::from_utf8_lossy(&output.stdout).contains("mac-1")
-            })
-    });
+            .unwrap();
+        if output.status.success()
+            && serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .ok()
+                .and_then(|hosts| hosts.as_array().cloned())
+                .is_some_and(|hosts| hosts.iter().any(|host| host["id"] == "mac-1"))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "registry never exposed mac-1 through a valid CLI response; status={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_event_snapshot(
+    address: &str,
+    identity: &Path,
+    job_id: &str,
+    expected: &serde_json::Value,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = cli(
+            address,
+            identity,
+            "events",
+            &serde_json::json!({"job_id": job_id, "after": 0}),
+        );
+        if output.status.success() {
+            if let Ok(snapshot) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if snapshot["events"]
+                    .as_array()
+                    .is_some_and(|events| events.contains(expected))
+                {
+                    return snapshot;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "registry never restored the durable event snapshot; status={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {

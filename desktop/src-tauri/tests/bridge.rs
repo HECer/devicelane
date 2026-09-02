@@ -1015,7 +1015,7 @@ fn fake_apple_tool(root: &Path, name: &str, marker: &Path, delay_ms: u64) -> Pat
         let path = root.join(name);
         std::fs::write(
             &path,
-            format!("#!/bin/sh\necho '{name} $*' >> '{}'\nif [ '{name}' = simctl ] && [ \"$1\" = install ]; then sleep {}; echo installed; exit 0; fi\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && [ \"$1\" = list ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && [ \"$1\" = list ] && echo '{{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"iphone-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}' && exit 0\necho complete\n", marker.display(), delay_ms as f64 / 1000.0),
+            format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\nif [ '{name}' = simctl ] && [ \"$1\" = install ]; then sleep {}; echo installed; exit 0; fi\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && [ \"$1\" = list ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && [ \"$1\" = list ] && echo '{{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"iphone-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}' && exit 0\necho complete\n", marker.display(), delay_ms as f64 / 1000.0),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
