@@ -299,6 +299,30 @@ fn restart_reconciles_one_existing_activity_id_without_starting_another() {
             .code,
         device_development_mesh::dashboard::MessageCode::DaemonRestarted
     );
+    let audit = service
+        .audit_query(
+            AuditFilter {
+                result: Some(device_development_mesh::dashboard::AuditResult::Failed),
+                ..AuditFilter::default()
+            },
+            None,
+            10,
+        )
+        .unwrap();
+    let terminal = audit
+        .items
+        .into_iter()
+        .find(|record| {
+            record
+                .activity_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == "job-1")
+        })
+        .expect("restart failure audit missing");
+    assert_eq!(
+        terminal.redacted_message.unwrap().code,
+        device_development_mesh::dashboard::MessageCode::DaemonRestarted
+    );
 }
 
 #[test]
