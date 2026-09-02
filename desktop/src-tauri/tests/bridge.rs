@@ -193,7 +193,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
             "--identity",
             registry_identity.to_str().unwrap(),
             "--offline-after-ms",
-            "500",
+            "5000",
             "--agent-peer",
             "mac-agent",
         ],
@@ -711,7 +711,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
             "--identity",
             registry_identity.to_str().unwrap(),
             "--offline-after-ms",
-            "500",
+            "5000",
             "--agent-peer",
             "mac-agent",
         ],
@@ -896,23 +896,37 @@ fn pair_process_optional(
             registry_identity.to_str().unwrap(),
         ],
     );
-    let mut command = Command::new(binary);
-    command.args([
-        "pair",
-        "--address",
-        &address,
-        "--identity",
-        peer_identity.to_str().unwrap(),
-    ]);
-    if let Some(peer_id) = peer_id {
-        command.args(["--peer-id", peer_id]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut command = Command::new(binary);
+        command.args([
+            "pair",
+            "--address",
+            &address,
+            "--identity",
+            peer_identity.to_str().unwrap(),
+        ]);
+        if let Some(peer_id) = peer_id {
+            command.args(["--peer-id", peer_id]);
+        }
+        let output = command.output().unwrap();
+        if output.status.success() {
+            break;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let transient_refusal = connection_refused(&stderr);
+        assert!(
+            transient_refusal,
+            "pairing failed with {}; stderr={stderr}",
+            output.status
+        );
+        assert!(
+            Instant::now() < deadline,
+            "pairing listener stayed unavailable for five seconds; status={}; stderr={stderr}",
+            output.status
+        );
+        thread::sleep(Duration::from_millis(25));
     }
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     assert!(registry.wait().unwrap().success());
 }
 
@@ -944,15 +958,42 @@ fn wait_for_mesh_host(address: &str, identity: &Path, host: &str) {
                 "list",
                 "--json",
             ])
-            .output();
-        if output.is_ok_and(|value| {
-            value.status.success() && String::from_utf8_lossy(&value.stdout).contains(host)
-        }) {
-            return;
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            assert!(
+                connection_refused(&stderr),
+                "mesh host lookup failed with {}; stderr={stderr}",
+                output.status
+            );
+        } else {
+            let hosts: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "mesh host lookup returned invalid JSON: {error}; status={}; stderr={stderr}",
+                    output.status
+                )
+            });
+            if hosts.as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["id"] == host && item["status"] == "online")
+            }) {
+                return;
+            }
         }
-        assert!(Instant::now() < deadline, "timed out waiting for mesh host");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for online mesh host {host}; status={}; stderr={stderr}",
+            output.status
+        );
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn connection_refused(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("connection refused") || lower.contains("actively refused")
 }
 
 fn wait_for_daemon(endpoint: &LocalEndpoint) {
