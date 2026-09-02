@@ -2,8 +2,11 @@ use device_development_mesh::dashboard::audit::{
     AuditFilter, AuditStore, Redactor, RetentionPolicy,
 };
 use device_development_mesh::dashboard::event_log::{EventJournal, EventRead};
+use device_development_mesh::dashboard::policy::AccessRequest;
 use device_development_mesh::dashboard::policy::PolicyEngine;
-use device_development_mesh::dashboard::service::{DashboardService, DashboardServiceError};
+use device_development_mesh::dashboard::service::{
+    DashboardService, DashboardServiceError, ExistingJobs,
+};
 use device_development_mesh::dashboard::topology::TopologyProjector;
 use device_development_mesh::dashboard::{
     ActivityEvent, ActivityId, ActivityState, Authorization, DashboardScope, EventCursor, HostId,
@@ -125,6 +128,20 @@ fn event(state: ActivityState, sequence: u64, at: u64) -> ActivityEvent {
     }
 }
 
+fn access(activity: &str) -> AccessRequest {
+    AccessRequest {
+        activity_id: ActivityId::parse(activity).unwrap(),
+        principal_id: PrincipalId::parse("agent-1").unwrap(),
+        source_host_id: HostId::parse("windows").unwrap(),
+        target_host_id: HostId::parse("mac").unwrap(),
+        device_id: None,
+        operation: OperationId::parse("build").unwrap(),
+        resources: vec![ResourceClass::WorkspaceRead],
+        physical_device: false,
+        user_present: true,
+    }
+}
+
 #[test]
 fn cancellation_is_idempotent_and_audited_before_its_event() {
     let root = tempfile::tempdir().unwrap();
@@ -208,4 +225,145 @@ fn poisoned_audit_fails_closed_before_policy_mutation() {
     );
     assert_eq!(result, Err(DashboardServiceError::AuditUnavailable));
     assert!(service.policy_rules().is_empty());
+}
+
+#[test]
+fn subscriber_limit_is_stable_and_idle_housekeeping_frees_capacity() {
+    let root = tempfile::tempdir().unwrap();
+    let audit = Arc::new(Mutex::new(
+        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+    ));
+    let service = DashboardService::new(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(1, 0),
+        audit,
+        PolicyEngine::new(),
+    );
+    for index in 0..32 {
+        service
+            .acknowledge(
+                SubscriberId::parse(format!("subscriber-{index}")).unwrap(),
+                EventCursor {
+                    epoch: 1,
+                    sequence: 0,
+                },
+                1,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        service.acknowledge(
+            SubscriberId::parse("subscriber-33").unwrap(),
+            EventCursor {
+                epoch: 1,
+                sequence: 0
+            },
+            2,
+        ),
+        Err(DashboardServiceError::LimitExceeded)
+    );
+    service
+        .acknowledge(
+            SubscriberId::parse("subscriber-33").unwrap(),
+            EventCursor {
+                epoch: 1,
+                sequence: 0,
+            },
+            15_002,
+        )
+        .unwrap();
+}
+
+#[test]
+fn pause_finish_then_resume_accepts_new_approval_requests() {
+    let root = tempfile::tempdir().unwrap();
+    let audit = Arc::new(Mutex::new(
+        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+    ));
+    let mut service = DashboardService::new(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(1, 0),
+        audit,
+        PolicyEngine::new(),
+    );
+    service.pause(ExistingJobs::Finish, 10).unwrap();
+    assert_eq!(
+        service.request_approval(access("paused-job"), 60_000, 11),
+        Err(DashboardServiceError::PermissionDenied)
+    );
+    service.resume(12).unwrap();
+    assert!(
+        service
+            .request_approval(access("new-job"), 60_000, 13)
+            .is_ok()
+    );
+}
+
+#[test]
+fn persistent_service_reopen_reconciles_same_activity_id() {
+    let root = tempfile::tempdir().unwrap();
+    let audit_root = root.path().join("audit");
+    {
+        let audit = Arc::new(Mutex::new(
+            AuditStore::open(&audit_root, RetentionPolicy::default(), Redactor::default()).unwrap(),
+        ));
+        let mut service = DashboardService::new_persistent(
+            HostId::parse("mac").unwrap(),
+            TopologyProjector::new(),
+            EventJournal::new(1, 0),
+            audit,
+            PolicyEngine::new(),
+        )
+        .unwrap();
+        service
+            .record_activity(event(ActivityState::Running, 1, 10), "start")
+            .unwrap();
+    }
+    let audit = Arc::new(Mutex::new(
+        AuditStore::open(&audit_root, RetentionPolicy::default(), Redactor::default()).unwrap(),
+    ));
+    let service = DashboardService::new_persistent(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(2, 0),
+        audit,
+        PolicyEngine::new(),
+    )
+    .unwrap();
+    let snapshot = service.snapshot(DashboardScope::Local, 30);
+    assert_eq!(snapshot.activities.len(), 1);
+    assert_eq!(snapshot.activities[0].activity_id.as_str(), "job-1");
+    assert_eq!(snapshot.activities[0].state, ActivityState::Reconnecting);
+}
+
+#[test]
+fn approval_request_is_audited_before_pending_state_and_emits_live_event() {
+    let root = tempfile::tempdir().unwrap();
+    let audit = Arc::new(Mutex::new(
+        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+    ));
+    let mut service = DashboardService::new(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(1, 0),
+        audit,
+        PolicyEngine::new(),
+    );
+    service
+        .request_approval(access("approval-job"), 60_000, 10)
+        .unwrap();
+    assert_eq!(service.pending_approvals(11).len(), 1);
+    let audit = service
+        .audit_query(AuditFilter::default(), None, 10)
+        .unwrap();
+    assert_eq!(audit.items.len(), 1);
+    assert_eq!(
+        audit.items[0].result,
+        device_development_mesh::dashboard::AuditResult::Attempted
+    );
+    assert!(
+        matches!(service.events(EventCursor { epoch: 1, sequence: 0 }, 10), EventRead::Events { events, .. } if events.len() == 1 && events[0].state == ActivityState::AwaitingApproval)
+    );
 }

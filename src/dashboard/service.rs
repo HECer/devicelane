@@ -1,6 +1,9 @@
-use super::audit::{AuditError, AuditExport, AuditFilter, AuditSigner, AuditStore, RawAuditRecord};
+use super::audit::{
+    AuditError, AuditExport, AuditFilter, AuditSigner, AuditStore, RawAuditRecord,
+    read_activity_checkpoint, write_activity_checkpoint,
+};
 use super::event_log::{AcknowledgeError, EventJournal, EventRead, ReadLimit};
-use super::policy::{AccessRequest, ApprovalError, PolicyEngine};
+use super::policy::{AccessRequest, ApprovalError, PolicyDecision, PolicyEngine};
 use super::topology::TopologyProjector;
 use super::{
     ActivityEvent, ActivityId, ActivityState, ApprovalDecision, ApprovalId, ApprovalRequest,
@@ -8,7 +11,9 @@ use super::{
     MetricSnapshot, MetricValue, OperationId, PolicyEffect, PolicyRule, PrincipalId, RuleId,
     SafeCode, SubscriberId,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -61,6 +66,23 @@ pub struct DashboardService {
     activities: HashMap<ActivityId, ActivityEvent>,
     paused: bool,
     next_audit_sequence: u64,
+    checkpoint_path: Option<PathBuf>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityCheckpoint {
+    version: u16,
+    audit_sequence: u64,
+    activities: Vec<ActivityEvent>,
+    digest: String,
+}
+
+#[derive(serde::Serialize)]
+struct ActivityCheckpointPayload<'a> {
+    version: u16,
+    audit_sequence: u64,
+    activities: &'a [ActivityEvent],
 }
 
 impl DashboardService {
@@ -86,7 +108,62 @@ impl DashboardService {
             activities: HashMap::new(),
             paused: false,
             next_audit_sequence,
+            checkpoint_path: None,
         }
+    }
+
+    pub fn new_persistent(
+        local_host_id: HostId,
+        topology: TopologyProjector,
+        events: EventJournal,
+        audit: Arc<Mutex<AuditStore>>,
+        policy: PolicyEngine,
+    ) -> Result<Self, DashboardServiceError> {
+        let (checkpoint_path, audit_sequence) = {
+            let store = audit
+                .lock()
+                .map_err(|_| DashboardServiceError::AuditUnavailable)?;
+            (store.activity_checkpoint_path(), store.last_sequence())
+        };
+        let checkpoint = read_activity_checkpoint(&checkpoint_path)
+            .map_err(|_| DashboardServiceError::AuditUnavailable)?
+            .map(|bytes| {
+                serde_json::from_slice::<ActivityCheckpoint>(&bytes)
+                    .map_err(|_| DashboardServiceError::AuditUnavailable)
+            })
+            .transpose()?;
+        let mut service = Self::new(local_host_id, topology, events, audit, policy);
+        service.checkpoint_path = Some(checkpoint_path);
+        if let Some(checkpoint) = checkpoint {
+            if checkpoint.version != 1 || checkpoint.activities.len() > 1_000 {
+                return Err(DashboardServiceError::AuditUnavailable);
+            }
+            if checkpoint.audit_sequence > audit_sequence {
+                return Err(DashboardServiceError::AuditUnavailable);
+            }
+            if checkpoint_digest(checkpoint.audit_sequence, &checkpoint.activities)?
+                != checkpoint.digest
+            {
+                return Err(DashboardServiceError::AuditUnavailable);
+            }
+            for activity in checkpoint.activities {
+                activity
+                    .validate()
+                    .map_err(|_| DashboardServiceError::AuditUnavailable)?;
+                if service.activities.contains_key(&activity.activity_id) {
+                    return Err(DashboardServiceError::AuditUnavailable);
+                }
+                service
+                    .events
+                    .restore_activity_sequence(activity.activity_id.clone(), activity.sequence)
+                    .map_err(|_| DashboardServiceError::AuditUnavailable)?;
+                service
+                    .activities
+                    .insert(activity.activity_id.clone(), activity);
+            }
+            service.reconcile_after_restart(now_ms())?;
+        }
+        Ok(service)
     }
 
     pub fn local_host_id(&self) -> &HostId {
@@ -122,12 +199,11 @@ impl DashboardService {
         now_ms: u64,
     ) -> Result<(), DashboardServiceError> {
         self.events.expire_idle(now_ms);
-        if self
-            .events
-            .subscribe(subscriber_id.clone(), now_ms)
-            .is_err()
-        {
-            // An already registered subscriber is the normal acknowledgement path.
+        match self.events.subscribe(subscriber_id.clone(), now_ms) {
+            Ok(()) | Err(super::event_log::SubscribeError::AlreadyExists) => {}
+            Err(super::event_log::SubscribeError::LimitExceeded) => {
+                return Err(DashboardServiceError::LimitExceeded);
+            }
         }
         self.events
             .acknowledge(&subscriber_id, cursor, now_ms)
@@ -157,10 +233,25 @@ impl DashboardService {
         if self.paused || access.target_host_id != self.local_host_id {
             return Err(DashboardServiceError::PermissionDenied);
         }
-        let challenge = self
+        match self
             .policy
-            .create_approval(&access, now_ms, lifetime_ms)
-            .map_err(map_approval_error)?;
+            .evaluate(&access, now_ms)
+            .map_err(|_| DashboardServiceError::InvalidRequest)?
+        {
+            PolicyDecision::Denied { .. } => {
+                self.audit_access(&access, PolicyEffect::Deny, AuditResult::Denied, now_ms)?;
+                return Err(DashboardServiceError::PermissionDenied);
+            }
+            PolicyDecision::Allowed { .. } | PolicyDecision::ApprovalRequired { .. } => {}
+        }
+        self.audit_access(&access, PolicyEffect::Allow, AuditResult::Attempted, now_ms)?;
+        let challenge = match self.policy.create_approval(&access, now_ms, lifetime_ms) {
+            Ok(challenge) => challenge,
+            Err(error) => {
+                self.audit_access(&access, PolicyEffect::Allow, AuditResult::Failed, now_ms)?;
+                return Err(map_approval_error(error));
+            }
+        };
         let id = ApprovalId::parse(format!("approval-{}", &challenge.nonce[..16]))
             .map_err(|_| DashboardServiceError::InvalidRequest)?;
         self.pending.insert(
@@ -168,7 +259,7 @@ impl DashboardService {
             Pending {
                 nonce: challenge.nonce.clone(),
                 request: ApprovalRequest {
-                    id,
+                    id: id.clone(),
                     activity_id: access.activity_id.clone(),
                     principal_id: access.principal_id.clone(),
                     source_host_id: access.source_host_id.clone(),
@@ -181,9 +272,42 @@ impl DashboardService {
                     risk: super::SafeCode::parse("target_confirmation")
                         .expect("constant safe code"),
                 },
-                access,
+                access: access.clone(),
             },
         );
+        let sequence = self
+            .activities
+            .get(&access.activity_id)
+            .map_or(1, |event| event.sequence.saturating_add(1));
+        if let Err(error) = self.record_activity(
+            ActivityEvent {
+                activity_id: access.activity_id.clone(),
+                sequence,
+                occurred_at_ms: now_ms,
+                principal_id: access.principal_id.clone(),
+                source_host_id: access.source_host_id.clone(),
+                target_host_id: access.target_host_id.clone(),
+                device_id: access.device_id.clone(),
+                operation: access.operation.clone(),
+                resources: access.resources.clone(),
+                authorization: Authorization {
+                    effect: PolicyEffect::Allow,
+                    rule_id: None,
+                    approval_id: Some(id.clone()),
+                },
+                state: ActivityState::AwaitingApproval,
+                message: None,
+                metrics: unavailable_metrics(),
+                started_at_ms: None,
+                finished_at_ms: None,
+            },
+            &format!("approval-request:{}", challenge.nonce),
+        ) {
+            self.pending.remove(&id);
+            self.policy.discard_approval(&challenge.nonce);
+            self.audit_access(&access, PolicyEffect::Allow, AuditResult::Failed, now_ms)?;
+            return Err(error);
+        }
         Ok((challenge.nonce, challenge.expires_at_ms))
     }
 
@@ -209,11 +333,14 @@ impl DashboardService {
         } else {
             PolicyEffect::Allow
         };
-        self.audit_access(access, effect, AuditResult::Succeeded, now_ms)?;
-        let outcome = self
-            .policy
-            .decide(nonce, session, access, decision, now_ms)
-            .map_err(map_approval_error)?;
+        self.audit_access(access, effect, AuditResult::Attempted, now_ms)?;
+        let outcome = match self.policy.decide(nonce, session, access, decision, now_ms) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.audit_access(access, effect, AuditResult::Failed, now_ms)?;
+                return Err(map_approval_error(error));
+            }
+        };
         let approval_id = pending_id.clone();
         if let Some(id) = pending_id {
             self.pending.remove(&id);
@@ -264,10 +391,13 @@ impl DashboardService {
         rule: PolicyRule,
         now_ms: u64,
     ) -> Result<(), DashboardServiceError> {
-        self.audit_local("policy-put", AuditResult::Succeeded, now_ms)?;
-        self.policy
-            .put_user_rule(rule)
-            .map_err(|_| DashboardServiceError::PermissionDenied)
+        self.audit_local("policy-put", AuditResult::Attempted, now_ms)?;
+        if self.policy.put_user_rule(rule).is_err() {
+            self.audit_local("policy-put", AuditResult::Failed, now_ms)?;
+            return Err(DashboardServiceError::PermissionDenied);
+        }
+        self.append_local_event("policy-put", now_ms)?;
+        Ok(())
     }
 
     pub fn delete_policy_rule(
@@ -275,10 +405,16 @@ impl DashboardService {
         id: &RuleId,
         now_ms: u64,
     ) -> Result<bool, DashboardServiceError> {
-        self.audit_local("policy-delete", AuditResult::Succeeded, now_ms)?;
-        self.policy
-            .delete_user_rule(id)
-            .map_err(|_| DashboardServiceError::PermissionDenied)
+        self.audit_local("policy-delete", AuditResult::Attempted, now_ms)?;
+        let deleted = match self.policy.delete_user_rule(id) {
+            Ok(deleted) => deleted,
+            Err(_) => {
+                self.audit_local("policy-delete", AuditResult::Failed, now_ms)?;
+                return Err(DashboardServiceError::PermissionDenied);
+            }
+        };
+        self.append_local_event("policy-delete", now_ms)?;
+        Ok(deleted)
     }
 
     pub fn audit_query(
@@ -311,10 +447,13 @@ impl DashboardService {
         event: ActivityEvent,
         idempotency_key: &str,
     ) -> Result<(), DashboardServiceError> {
+        let mut next = self.activities.clone();
+        next.insert(event.activity_id.clone(), event.clone());
+        self.persist_activities(&next)?;
         self.events
             .append(idempotency_key, event.clone())
             .map_err(|_| DashboardServiceError::LimitExceeded)?;
-        self.activities.insert(event.activity_id.clone(), event);
+        self.activities = next;
         Ok(())
     }
 
@@ -363,6 +502,7 @@ impl DashboardService {
             event.sequence = event.sequence.saturating_add(1);
             event.occurred_at_ms = now_ms;
             event.state = ActivityState::Reconnecting;
+            event.started_at_ms.get_or_insert(now_ms);
             event.finished_at_ms = None;
             let key = format!("restart:{}:{}", event.activity_id.as_str(), event.sequence);
             self.record_activity(event, &key)?;
@@ -375,19 +515,35 @@ impl DashboardService {
         existing: ExistingJobs,
         now_ms: u64,
     ) -> Result<(), DashboardServiceError> {
-        self.audit_local("remote-access-pause", AuditResult::Succeeded, now_ms)?;
+        self.audit_local("remote-access-pause", AuditResult::Attempted, now_ms)?;
         self.paused = true;
         if existing == ExistingJobs::Cancel {
             let ids: Vec<_> = self.activities.keys().cloned().collect();
             for id in ids {
-                self.cancel_activity(&id, now_ms)?;
+                if let Err(error) = self.cancel_activity(&id, now_ms) {
+                    self.paused = false;
+                    self.audit_local("remote-access-pause", AuditResult::Failed, now_ms)?;
+                    return Err(error);
+                }
             }
+        }
+        if let Err(error) = self.append_local_event("remote-access-pause", now_ms) {
+            self.paused = false;
+            self.audit_local("remote-access-pause", AuditResult::Failed, now_ms)?;
+            return Err(error);
         }
         Ok(())
     }
 
-    pub fn resume(&mut self) {
+    pub fn resume(&mut self, now_ms: u64) -> Result<(), DashboardServiceError> {
+        self.audit_local("remote-access-resume", AuditResult::Attempted, now_ms)?;
         self.paused = false;
+        if let Err(error) = self.append_local_event("remote-access-resume", now_ms) {
+            self.paused = true;
+            self.audit_local("remote-access-resume", AuditResult::Failed, now_ms)?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn audit_access(
@@ -485,6 +641,83 @@ impl DashboardService {
             .ok_or(DashboardServiceError::AuditUnavailable)?;
         Ok(())
     }
+
+    fn persist_activities(
+        &self,
+        activities: &HashMap<ActivityId, ActivityEvent>,
+    ) -> Result<(), DashboardServiceError> {
+        let Some(path) = &self.checkpoint_path else {
+            return Ok(());
+        };
+        let mut values: Vec<_> = activities.values().cloned().collect();
+        values.sort_by(|left, right| left.activity_id.cmp(&right.activity_id));
+        if values.len() > 1_000 {
+            return Err(DashboardServiceError::LimitExceeded);
+        }
+        let audit_sequence = self.next_audit_sequence.saturating_sub(1);
+        let checkpoint = ActivityCheckpoint {
+            version: 1,
+            audit_sequence,
+            digest: checkpoint_digest(audit_sequence, &values)?,
+            activities: values,
+        };
+        let bytes =
+            serde_json::to_vec(&checkpoint).map_err(|_| DashboardServiceError::AuditUnavailable)?;
+        write_activity_checkpoint(path, &bytes).map_err(|_| DashboardServiceError::AuditUnavailable)
+    }
+
+    fn append_local_event(
+        &mut self,
+        operation: &str,
+        now_ms: u64,
+    ) -> Result<(), DashboardServiceError> {
+        let activity_id = ActivityId::parse(format!(
+            "admin-{}-{operation}",
+            self.next_audit_sequence.saturating_sub(1)
+        ))
+        .map_err(|_| DashboardServiceError::InvalidRequest)?;
+        let host = self.local_host_id.clone();
+        self.record_activity(
+            ActivityEvent {
+                activity_id: activity_id.clone(),
+                sequence: 1,
+                occurred_at_ms: now_ms,
+                principal_id: PrincipalId::parse("local-user").expect("constant id"),
+                source_host_id: host.clone(),
+                target_host_id: host,
+                device_id: None,
+                operation: OperationId::parse(operation).expect("constant id"),
+                resources: Vec::new(),
+                authorization: Authorization {
+                    effect: PolicyEffect::Allow,
+                    rule_id: None,
+                    approval_id: None,
+                },
+                state: ActivityState::Succeeded,
+                message: None,
+                metrics: unavailable_metrics(),
+                started_at_ms: Some(now_ms),
+                finished_at_ms: Some(now_ms),
+            },
+            &format!("local-mutation:{}:{operation}", activity_id.as_str()),
+        )
+    }
+}
+
+fn checkpoint_digest(
+    audit_sequence: u64,
+    activities: &[ActivityEvent],
+) -> Result<String, DashboardServiceError> {
+    let payload = serde_json::to_vec(&ActivityCheckpointPayload {
+        version: 1,
+        audit_sequence,
+        activities,
+    })
+    .map_err(|_| DashboardServiceError::AuditUnavailable)?;
+    Ok(Sha256::digest(payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn map_approval_error(error: ApprovalError) -> DashboardServiceError {

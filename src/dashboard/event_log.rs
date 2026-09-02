@@ -338,6 +338,32 @@ impl EventJournal {
         Ok(())
     }
 
+    pub fn restore_activity_sequence(
+        &self,
+        activity_id: ActivityId,
+        sequence: u64,
+    ) -> Result<(), AppendError> {
+        if sequence == 0 || sequence == u64::MAX {
+            return Err(AppendError::SequenceOverflow);
+        }
+        let mut inner = self.lock();
+        if inner.activity_sequences.len() >= MAX_EVENTS
+            && !inner.activity_sequences.contains_key(&activity_id)
+        {
+            return Err(AppendError::LimitExceeded {
+                serialized_bytes: 0,
+                maximum_bytes: MAX_EVENTS,
+            });
+        }
+        match inner.activity_sequences.get(&activity_id) {
+            Some(existing) if *existing != sequence => Err(AppendError::IdempotencyConflict),
+            _ => {
+                inner.activity_sequences.insert(activity_id, sequence);
+                Ok(())
+            }
+        }
+    }
+
     pub fn acknowledge(
         &self,
         id: &SubscriberId,

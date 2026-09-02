@@ -349,6 +349,7 @@ pub enum PolicyOrigin {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuditResult {
+    Attempted,
     Succeeded,
     Failed,
     Denied,

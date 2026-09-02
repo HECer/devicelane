@@ -138,13 +138,16 @@ fn run() -> Result<(), String> {
         Redactor::default(),
     )
     .map_err(|error| format!("cannot open dashboard audit: {error}"))?;
-    daemon_state.enable_dashboard(DashboardService::new(
-        local_host_id,
-        TopologyProjector::new(),
-        EventJournal::new(1, 0),
-        Arc::new(Mutex::new(audit)),
-        policy_engine,
-    ));
+    daemon_state.enable_dashboard(
+        DashboardService::new_persistent(
+            local_host_id,
+            TopologyProjector::new(),
+            EventJournal::new(1, 0),
+            Arc::new(Mutex::new(audit)),
+            policy_engine,
+        )
+        .map_err(|error| format!("cannot restore dashboard activities: {}", error.code()))?,
+    );
     let state = Arc::new(Mutex::new(daemon_state));
     if args.foreground {
         eprintln!("devicelane-service: listening on {}", args.listen);

@@ -513,6 +513,13 @@ impl DaemonState {
                 Ok(LocalResponse::Acknowledged)
             }
             LocalRequest::ResumeRemoteAccess { .. } => {
+                if let Some(service) = self.dashboard.as_mut() {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|_| LocalProtocolError::Io)?
+                        .as_millis() as u64;
+                    service.resume(now_ms).map_err(map_dashboard_error)?;
+                }
                 self.snapshot.remote_access_paused = false;
                 Ok(LocalResponse::Acknowledged)
             }

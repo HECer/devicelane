@@ -1,5 +1,8 @@
+use device_development_mesh::dashboard::audit::AuditFilter;
+use device_development_mesh::dashboard::service::ExistingJobs;
 use device_development_mesh::dashboard::{
-    ActivityId, ApprovalDecision, HostId, OperationId, PrincipalId, ResourceClass,
+    ActivityId, ActivityState, ApprovalDecision, DashboardScope, EventCursor, HostId, OperationId,
+    PolicyEffect, PolicyOrigin, PolicyRule, PrincipalId, ResourceClass, RuleId, SubscriberId,
     policy::AccessRequest,
 };
 
@@ -16,6 +19,28 @@ fn approval_access(target: &str) -> AccessRequest {
         user_present: true,
     }
 }
+
+fn user_rule() -> PolicyRule {
+    PolicyRule {
+        id: RuleId::parse("ipc-rule").unwrap(),
+        revision: 1,
+        effect: PolicyEffect::Allow,
+        principal_id: Some(PrincipalId::parse("local-client").unwrap()),
+        source_host_id: Some(HostId::parse("source").unwrap()),
+        target_host_id: Some(HostId::parse("identity").unwrap()),
+        device_id: None,
+        operation: Some(OperationId::parse("workspace.write").unwrap()),
+        resources: vec![ResourceClass::WorkspaceWrite],
+        expires_at_ms: None,
+        require_user_presence: false,
+        user_presence: None,
+        physical_device: None,
+        match_device_exact: false,
+        match_resources_exact: true,
+        enabled: true,
+        origin: PolicyOrigin::User,
+    }
+}
 use device_development_mesh::local_ipc::{
     Authorizer, AutostartAdapter, ConnectionState, DaemonRole, DaemonSnapshot, DaemonState,
     DiagnosticItem, LocalProtocolError, LocalProtocolVersion, LocalRequest, LocalResponse,
@@ -24,6 +49,20 @@ use device_development_mesh::local_ipc::{
     windows_pipe_security_sddl, write_frame,
 };
 use std::sync::{Arc, Mutex};
+
+#[cfg(windows)]
+fn send_eventually(
+    endpoint: &device_development_mesh::local_ipc::LocalEndpoint,
+    request: &LocalRequest,
+) -> LocalResponse {
+    for _ in 0..100 {
+        if let Ok(response) = send_local_request(endpoint, request) {
+            return response;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("local IPC request never became available: {request:?}");
+}
 
 #[test]
 fn unix_transport_does_not_swallow_timeout_or_arbitrary_socket_probe_errors() {
@@ -388,6 +427,141 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         .unwrap(),
         LocalResponse::ApprovalDecided { .. }
     ));
+    assert!(
+        matches!(send_local_request(&endpoint, &LocalRequest::PendingApprovals { version: LocalProtocolVersion::CURRENT }).unwrap(), LocalResponse::PendingApprovals(items) if items.is_empty())
+    );
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::PolicyRules {
+                version: LocalProtocolVersion::CURRENT
+            }
+        )
+        .unwrap(),
+        LocalResponse::PolicyRules(_)
+    ));
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::PutPolicyRule {
+                version: LocalProtocolVersion::CURRENT,
+                rule: user_rule()
+            }
+        )
+        .unwrap(),
+        LocalResponse::Acknowledged
+    ));
+    let mut expiring = approval_access("identity");
+    expiring.activity_id = ActivityId::parse("ipc-expiring").unwrap();
+    let expiring_nonce = match send_local_request(
+        &endpoint,
+        &LocalRequest::RequestApproval {
+            version: LocalProtocolVersion::CURRENT,
+            access: expiring.clone(),
+            lifetime_ms: 1,
+        },
+    )
+    .unwrap()
+    {
+        LocalResponse::ApprovalCreated { nonce, .. } => nonce,
+        response => panic!("unexpected expiring approval response: {response:?}"),
+    };
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    assert!(
+        matches!(send_local_request(&endpoint, &LocalRequest::DecideApproval { version: LocalProtocolVersion::CURRENT, nonce: expiring_nonce, access: expiring, decision: ApprovalDecision::AllowOnce }).unwrap(), LocalResponse::Error { code, .. } if code == "approval_expired")
+    );
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::DeletePolicyRule {
+                version: LocalProtocolVersion::CURRENT,
+                rule_id: RuleId::parse("ipc-rule").unwrap()
+            }
+        )
+        .unwrap(),
+        LocalResponse::RuleDeleted { deleted: true }
+    ));
+    assert!(
+        matches!(send_local_request(&endpoint, &LocalRequest::AuditQuery { version: LocalProtocolVersion::CURRENT, filter: AuditFilter::default(), cursor: None, limit: 32 }).unwrap(), LocalResponse::AuditRecords(page) if !page.items.is_empty())
+    );
+    assert!(
+        matches!(send_eventually(&endpoint, &LocalRequest::AuditExport { version: LocalProtocolVersion::CURRENT, filter: AuditFilter::default() }), LocalResponse::AuditExport(export) if !export.records.is_empty())
+    );
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::CancelActivity {
+                version: LocalProtocolVersion::CURRENT,
+                activity_id: ActivityId::parse("ipc-approval").unwrap()
+            }
+        )
+        .unwrap(),
+        LocalResponse::Cancellation { cancelled: true }
+    ));
+    let events = send_local_request(
+        &endpoint,
+        &LocalRequest::ActivityEvents {
+            version: LocalProtocolVersion::CURRENT,
+            cursor: EventCursor {
+                epoch: 1,
+                sequence: 0,
+            },
+            limit: 32,
+        },
+    )
+    .unwrap();
+    let cursor = match events {
+        LocalResponse::ActivityEvents(
+            device_development_mesh::dashboard::event_log::EventRead::Events {
+                next_cursor, ..
+            },
+        ) => next_cursor,
+        response => panic!("unexpected event response: {response:?}"),
+    };
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::AcknowledgeEvents {
+                version: LocalProtocolVersion::CURRENT,
+                subscriber_id: SubscriberId::parse("ipc-ui").unwrap(),
+                cursor
+            }
+        )
+        .unwrap(),
+        LocalResponse::Acknowledged
+    ));
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::DashboardSnapshot {
+                version: LocalProtocolVersion::CURRENT,
+                scope: DashboardScope::Local
+            }
+        )
+        .unwrap(),
+        LocalResponse::DashboardSnapshot(_)
+    ));
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::PauseRemoteAccessWithJobs {
+                version: LocalProtocolVersion::CURRENT,
+                existing_jobs: ExistingJobs::Finish
+            }
+        )
+        .unwrap(),
+        LocalResponse::Acknowledged
+    ));
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::ResumeRemoteAccess {
+                version: LocalProtocolVersion::CURRENT
+            }
+        )
+        .unwrap(),
+        LocalResponse::Acknowledged
+    ));
     let mut spoofed = access;
     spoofed.target_host_id = HostId::parse("claimed-target").unwrap();
     assert!(matches!(
@@ -436,6 +610,80 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
     );
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn production_service_restart_reconciles_one_durable_activity_id() {
+    let pipe = format!(r"\\.\pipe\devicelane-restart-{}", std::process::id());
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("identity");
+    let runtime = temp.path().join("runtime");
+    let logs = temp.path().join("logs");
+    std::fs::create_dir(&runtime).unwrap();
+    let args = [
+        "--identity",
+        identity.to_str().unwrap(),
+        "--runtime-dir",
+        runtime.to_str().unwrap(),
+        "--role",
+        "workstation",
+        "--listen",
+        &pipe,
+        "--log-dir",
+        logs.to_str().unwrap(),
+    ];
+    let endpoint = device_development_mesh::local_ipc::LocalEndpoint::NamedPipe(pipe.clone());
+    let mut first = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+        .args(args)
+        .spawn()
+        .unwrap();
+    let status = LocalRequest::Status {
+        version: LocalProtocolVersion::CURRENT,
+    };
+    (0..100)
+        .find_map(|_| {
+            send_local_request(&endpoint, &status).ok().or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            })
+        })
+        .expect("first service did not bind");
+    send_local_request(
+        &endpoint,
+        &LocalRequest::RequestApproval {
+            version: LocalProtocolVersion::CURRENT,
+            access: approval_access("identity"),
+            lifetime_ms: 60_000,
+        },
+    )
+    .unwrap();
+    first.kill().unwrap();
+    first.wait().unwrap();
+
+    let mut second = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+        .args(args)
+        .spawn()
+        .unwrap();
+    let snapshot_request = LocalRequest::DashboardSnapshot {
+        version: LocalProtocolVersion::CURRENT,
+        scope: DashboardScope::Local,
+    };
+    let response = (0..100)
+        .find_map(|_| {
+            send_local_request(&endpoint, &snapshot_request)
+                .ok()
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                })
+        })
+        .expect("restarted service did not bind");
+    assert!(
+        matches!(response, LocalResponse::DashboardSnapshot(snapshot) if snapshot.activities.len() == 1 && snapshot.activities[0].activity_id.as_str() == "ipc-approval" && snapshot.activities[0].state == ActivityState::Reconnecting)
+    );
+    second.kill().unwrap();
+    second.wait().unwrap();
 }
 
 #[test]

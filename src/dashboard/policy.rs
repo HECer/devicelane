@@ -240,6 +240,10 @@ impl PolicyEngine {
         Ok(before != self.rules.len())
     }
 
+    pub(crate) fn discard_approval(&mut self, nonce: &str) {
+        self.approvals.remove(nonce);
+    }
+
     pub fn evaluate(
         &self,
         request: &AccessRequest,

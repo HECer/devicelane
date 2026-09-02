@@ -16,6 +16,7 @@ const MAX_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_EXPORT_RECORDS: usize = 256;
 const MAX_EXPORT_BYTES: usize = 8 * 1024 * 1024;
 const HASH_BYTES: usize = 32;
+const MAX_ACTIVITY_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum AuditError {
@@ -809,6 +810,9 @@ impl AuditStore {
     pub fn last_sequence(&self) -> u64 {
         self.records.last().map_or(0, |record| record.sequence)
     }
+    pub fn activity_checkpoint_path(&self) -> PathBuf {
+        self.root.join("activity-state.json")
+    }
     fn segment_path(&self, number: u64) -> PathBuf {
         self.root.join(format!("segment-{number:020}.audit"))
     }
@@ -839,6 +843,38 @@ impl AuditStore {
         drop(file);
         atomic_replace(&tmp, &self.root.join("index.json"), &self.root)
     }
+}
+
+pub fn read_activity_checkpoint(path: &Path) -> Result<Option<Vec<u8>>, AuditError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    validate_private_file(path)?;
+    let bytes = fs::read(path)?;
+    if bytes.len() > MAX_ACTIVITY_CHECKPOINT_BYTES {
+        return Err(AuditError::LimitExceeded);
+    }
+    Ok(Some(bytes))
+}
+
+pub fn write_activity_checkpoint(path: &Path, bytes: &[u8]) -> Result<(), AuditError> {
+    if bytes.len() > MAX_ACTIVITY_CHECKPOINT_BYTES {
+        return Err(AuditError::LimitExceeded);
+    }
+    let root = path.parent().ok_or(AuditError::InsecureStorage)?;
+    validate_private_dir(root)?;
+    let temporary = root.join("activity-state.tmp");
+    if temporary.exists() {
+        validate_private_file(&temporary)?;
+        fs::remove_file(&temporary)?;
+    }
+    let mut file = create_private_file(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    validate_private_file(&temporary)?;
+    atomic_replace(&temporary, path, root)?;
+    sync_directory(root)
 }
 
 fn cursor_page_encoded_len(items_bytes: usize, cursor: &EventCursor) -> Result<usize, AuditError> {
