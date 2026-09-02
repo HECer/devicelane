@@ -1545,7 +1545,7 @@ mod windows_private {
     impl Security {
         fn current_user() -> Result<Self, AuditError> {
             let sid = current_sid()?;
-            let sddl = format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
+            let sddl = private_sddl(&sid);
             let text: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
             let mut descriptor = std::ptr::null_mut();
             if unsafe {
@@ -1568,6 +1568,10 @@ mod windows_private {
                 },
             })
         }
+    }
+
+    pub(super) fn private_sddl(sid: &str) -> String {
+        format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)")
     }
     impl Drop for Security {
         fn drop(&mut self) {
@@ -1619,6 +1623,18 @@ mod windows_private {
     }
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_security_tests {
+    #[test]
+    fn private_storage_descriptor_binds_owner_to_the_authenticated_user() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        assert_eq!(
+            super::windows_private::private_sddl(sid),
+            "O:S-1-5-21-1-2-3-1001D:P(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)"
+        );
     }
 }
 fn sync_directory(path: &Path) -> Result<(), AuditError> {
