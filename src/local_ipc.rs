@@ -7,7 +7,7 @@ use crate::dashboard::model::{
     MetricValue, PolicyEffect, ResourceClass, RuleId, SafeCode, SubscriberId,
 };
 use crate::dashboard::model::{ApprovalDecision, ApprovalRequest, PolicyRule};
-use crate::dashboard::policy::{AccessRequest, PolicyEngine};
+use crate::dashboard::policy::{AccessRequest, PolicyEngine, RemoteOperationGrant};
 use crate::dashboard::service::{AdminMutation, DashboardService, ExistingJobs};
 use crate::network_processes::{LeaseRequest, Request as MeshRequest, Response as MeshResponse};
 use crate::remote_apple_protocol::{AppleOperation, AppleRequest, RemoteProtocolVersion};
@@ -560,20 +560,113 @@ pub trait MeshRpcBoundary: Send + Sync {
         config: &RemoteExecutionConfig,
         request: &MeshRequest,
     ) -> Result<MeshResponse, RemoteExecutionFailure>;
+
+    fn uses_persistent_session(&self) -> bool {
+        false
+    }
 }
 
-struct ProductionMeshRpcBoundary;
+pub struct PersistentMeshRpcBoundary {
+    state: Mutex<PersistentMeshState>,
+}
 
-impl MeshRpcBoundary for ProductionMeshRpcBoundary {
+#[derive(Default)]
+struct PersistentMeshState {
+    transport: Option<CachedMeshTransport>,
+    session: Option<CachedMeshSession>,
+}
+
+struct CachedMeshTransport {
+    identity_path: PathBuf,
+    client_id: String,
+    transport: SecureTransport,
+}
+
+struct CachedMeshSession {
+    registry_address: String,
+    registry_peer_id: String,
+    stream: rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+}
+
+impl Default for PersistentMeshRpcBoundary {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(PersistentMeshState::default()),
+        }
+    }
+}
+
+impl PersistentMeshRpcBoundary {
+    fn call_once(
+        state: &mut PersistentMeshState,
+        config: &RemoteExecutionConfig,
+        request: &MeshRequest,
+    ) -> Result<MeshResponse, LocalProtocolError> {
+        let transport_matches = state.transport.as_ref().is_some_and(|cached| {
+            cached.identity_path == config.identity_path && cached.client_id == config.client_id
+        });
+        if !transport_matches {
+            state.session = None;
+            state.transport = Some(CachedMeshTransport {
+                identity_path: config.identity_path.clone(),
+                client_id: config.client_id.clone(),
+                transport: SecureTransport::load_or_create(
+                    &config.identity_path,
+                    &config.client_id,
+                )
+                .map_err(|_| LocalProtocolError::RemoteUnavailable)?,
+            });
+        }
+        let session_matches = state.session.as_ref().is_some_and(|cached| {
+            cached.registry_address == config.registry_address
+                && cached.registry_peer_id == config.registry_peer_id
+        });
+        if !session_matches {
+            let transport = &state
+                .transport
+                .as_ref()
+                .ok_or(LocalProtocolError::RemoteUnavailable)?
+                .transport;
+            state.session = Some(open_mesh_session(config, transport)?);
+        }
+        let stream = &mut state
+            .session
+            .as_mut()
+            .ok_or(LocalProtocolError::RemoteUnavailable)?
+            .stream;
+        write_frame(stream, request)?;
+        stream
+            .flush()
+            .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
+        read_frame(&mut std::io::BufReader::new(stream))
+    }
+}
+
+impl MeshRpcBoundary for PersistentMeshRpcBoundary {
     fn call(
         &self,
         config: &RemoteExecutionConfig,
         request: &MeshRequest,
     ) -> Result<MeshResponse, RemoteExecutionFailure> {
-        let transport = SecureTransport::load_or_create(&config.identity_path, &config.client_id)
+        let mut state = self
+            .state
+            .lock()
             .map_err(|_| RemoteExecutionFailure::RegistryDisconnected)?;
-        mesh_rpc(config, &transport, request)
-            .map_err(|_| RemoteExecutionFailure::RegistryDisconnected)
+        for attempt in 0..2 {
+            match Self::call_once(&mut state, config, request) {
+                Ok(response) => return Ok(response),
+                Err(_) if attempt == 0 => {
+                    state.session = None;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return Err(RemoteExecutionFailure::RegistryDisconnected),
+            }
+        }
+        Err(RemoteExecutionFailure::RegistryDisconnected)
+    }
+
+    fn uses_persistent_session(&self) -> bool {
+        true
     }
 }
 
@@ -673,7 +766,7 @@ impl DaemonState {
 
     pub fn enable_remote_execution(&mut self, config: RemoteExecutionConfig) {
         self.remote_execution = Some(config);
-        self.remote_execution_boundary = Some(Arc::new(ProductionMeshRpcBoundary));
+        self.remote_execution_boundary = Some(Arc::new(PersistentMeshRpcBoundary::default()));
         self.remote_execution_timeout = Duration::from_secs(30);
     }
 
@@ -713,12 +806,27 @@ impl DaemonState {
             .activity(&activity_id)
             .cloned()
             .ok_or(LocalProtocolError::PermissionDenied)?;
+        let candidate_grant = RemoteOperationGrant::new(
+            request_id.clone(),
+            workspace_path.clone(),
+            activity.device_id.clone(),
+            AppleOperation::InstallApp {
+                app_path: app_path.clone(),
+            },
+        )
+        .map_err(|_| LocalProtocolError::PermissionDenied)?;
         if activity.state != ActivityState::Queued
             || activity.authorization.effect != PolicyEffect::Allow
             || activity.target_host_id != *session.local_host_id()
             || activity.device_id.is_none()
+            || activity.operation.as_str() != "apple.install_app"
             || !activity.resources.contains(&ResourceClass::WorkspaceRead)
             || !activity.resources.contains(&ResourceClass::DeviceLease)
+            || !activity
+                .resources
+                .contains(&ResourceClass::ApplicationInstall)
+            || activity.remote_operation_sha256.as_deref()
+                != Some(candidate_grant.canonical_sha256())
         {
             return Err(LocalProtocolError::PermissionDenied);
         }
@@ -1239,30 +1347,32 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn mesh_rpc(
+fn open_mesh_session(
     config: &RemoteExecutionConfig,
     transport: &SecureTransport,
-    request: &MeshRequest,
-) -> Result<MeshResponse, LocalProtocolError> {
+) -> Result<CachedMeshSession, LocalProtocolError> {
     let address = config
         .registry_address
         .to_socket_addrs()
         .map_err(|_| LocalProtocolError::RemoteUnavailable)?
         .next()
         .ok_or(LocalProtocolError::RemoteUnavailable)?;
-    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+    let stream = TcpStream::connect_timeout(&address, Duration::from_millis(500))
         .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
+        .set_read_timeout(Some(Duration::from_millis(250)))
         .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(3)))
+        .set_write_timeout(Some(Duration::from_millis(250)))
         .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
-    let mut stream = transport
+    let stream = transport
         .connect_tls(stream, &config.registry_peer_id)
         .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
-    write_frame(&mut stream, request)?;
-    read_frame(&mut std::io::BufReader::new(stream))
+    Ok(CachedMeshSession {
+        registry_address: config.registry_address.clone(),
+        registry_peer_id: config.registry_peer_id.clone(),
+        stream,
+    })
 }
 
 fn transition_execution(
@@ -1323,6 +1433,16 @@ fn interruptible_rpc(
     job: &RemoteExecutionJob,
     request: MeshRequest,
 ) -> Result<MeshResponse, RemoteExecutionFailure> {
+    if job.boundary.uses_persistent_session() {
+        if job.cancelled.load(Ordering::Acquire) {
+            return Err(RemoteExecutionFailure::Cancelled);
+        }
+        let result = job.boundary.call(&job.config, &request);
+        if job.cancelled.load(Ordering::Acquire) {
+            return Err(RemoteExecutionFailure::Cancelled);
+        }
+        return result;
+    }
     let boundary = Arc::clone(&job.boundary);
     let config = job.config.clone();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -1353,21 +1473,44 @@ fn bounded_cleanup_rpc(job: &RemoteExecutionJob, request: MeshRequest) {
     let _ = receiver.recv_timeout(Duration::from_millis(500));
 }
 
-fn cancel_remote_job(job: &RemoteExecutionJob, job_id: &str, lease_id: &str) {
-    bounded_cleanup_rpc(
-        job,
-        MeshRequest::AppleCancel {
-            job_id: job_id.to_owned(),
-        },
-    );
-    bounded_cleanup_rpc(
-        job,
-        MeshRequest::Lease {
-            operation: LeaseRequest::Release {
-                lease_id: lease_id.to_owned(),
+struct RemoteCleanupGuard<'a> {
+    job: &'a RemoteExecutionJob,
+    lease_id: String,
+    dispatched_job_id: Option<String>,
+}
+
+impl<'a> RemoteCleanupGuard<'a> {
+    fn new(job: &'a RemoteExecutionJob, lease_id: String) -> Self {
+        Self {
+            job,
+            lease_id,
+            dispatched_job_id: None,
+        }
+    }
+
+    fn dispatched(&mut self, job_id: &str) {
+        self.dispatched_job_id = Some(job_id.to_owned());
+    }
+
+    fn completed(&mut self) {
+        self.dispatched_job_id = None;
+    }
+}
+
+impl Drop for RemoteCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(job_id) = self.dispatched_job_id.take() {
+            bounded_cleanup_rpc(self.job, MeshRequest::AppleCancel { job_id });
+        }
+        bounded_cleanup_rpc(
+            self.job,
+            MeshRequest::Lease {
+                operation: LeaseRequest::Release {
+                    lease_id: self.lease_id.clone(),
+                },
             },
-        },
-    );
+        );
+    }
 }
 
 fn execute_remote_job(
@@ -1402,15 +1545,8 @@ fn execute_remote_job(
     let grant = lease
         .lease_grant
         .ok_or_else(|| classify_remote_rejection(lease.error.as_deref()))?;
+    let mut cleanup = RemoteCleanupGuard::new(job, grant.lease_id.clone());
     if job.cancelled.load(Ordering::Acquire) {
-        bounded_cleanup_rpc(
-            job,
-            MeshRequest::Lease {
-                operation: LeaseRequest::Release {
-                    lease_id: grant.lease_id,
-                },
-            },
-        );
         return Err(RemoteExecutionFailure::Cancelled);
     }
     {
@@ -1451,8 +1587,8 @@ fn execute_remote_job(
         return Err(classify_remote_rejection(accepted.error.as_deref()));
     }
     .ok_or(RemoteExecutionFailure::AgentIncompatible)?;
+    cleanup.dispatched(&job_id);
     if job.cancelled.load(Ordering::Acquire) {
-        cancel_remote_job(job, &job_id, &grant.lease_id);
         return Err(RemoteExecutionFailure::Cancelled);
     }
     transition_execution(
@@ -1512,19 +1648,11 @@ fn execute_remote_job(
                     };
                     transition_execution(state, &job.activity.activity_id, terminal_state, message)
                         .map_err(map_transition_failure)?;
-                    let _ = job.boundary.call(
-                        &job.config,
-                        &MeshRequest::Lease {
-                            operation: LeaseRequest::Release {
-                                lease_id: grant.lease_id,
-                            },
-                        },
-                    );
+                    cleanup.completed();
                     return Ok(());
                 }
             }
             Err(RemoteExecutionFailure::Cancelled) => {
-                cancel_remote_job(job, &job_id, &grant.lease_id);
                 return Err(RemoteExecutionFailure::Cancelled);
             }
             Err(failure) if !reconnecting => {

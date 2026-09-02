@@ -6,6 +6,26 @@ use std::thread;
 use std::time::Duration;
 
 #[test]
+fn revoked_peer_cannot_verify_an_previously_valid_signature() {
+    let directory = tempfile::tempdir().unwrap();
+    let signer =
+        SecureTransport::load_or_create(directory.path().join("signer"), "signer").unwrap();
+    let mut verifier =
+        SecureTransport::load_or_create(directory.path().join("verifier"), "verifier").unwrap();
+    verifier.trust("signer", signer.certificate_der()).unwrap();
+    let signature = signer.sign(b"bound-message").unwrap();
+    verifier
+        .verify_peer_signature("signer", b"bound-message", &signature)
+        .unwrap();
+
+    verifier.revoke("signer").unwrap();
+    assert_eq!(
+        verifier.verify_peer_signature("signer", b"bound-message", &signature),
+        Err(TransportError::RevokedPeer)
+    );
+}
+
+#[test]
 fn persists_distinct_identities_and_completes_real_mutual_tls_over_loopback() {
     let directory = tempfile::tempdir().unwrap();
     let mut server =

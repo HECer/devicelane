@@ -15,6 +15,7 @@ fn approval_access(target: &str) -> AccessRequest {
         device_id: None,
         operation: OperationId::parse("workspace.write").unwrap(),
         resources: vec![ResourceClass::WorkspaceWrite],
+        remote_operation: None,
         physical_device: false,
         user_present: true,
     }
@@ -34,6 +35,7 @@ fn admin_access(
         device_id: None,
         operation: OperationId::parse(operation).unwrap(),
         resources: vec![resource],
+        remote_operation: None,
         physical_device: false,
         user_present: true,
     }
@@ -241,6 +243,72 @@ use std::io::Write;
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
 use std::process::Command;
+
+#[test]
+fn production_mesh_boundary_reuses_one_authenticated_tls_session_for_polling() {
+    use device_development_mesh::local_ipc::{
+        MeshRpcBoundary, PersistentMeshRpcBoundary, RemoteExecutionConfig,
+    };
+    use device_development_mesh::network_processes::{Request as MeshRequest, Response};
+    use device_development_mesh::secure_transport::SecureTransport;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = tempfile::tempdir().unwrap();
+    let registry_root = root.path().join("registry");
+    let client_root = root.path().join("client");
+    let mut registry = SecureTransport::load_or_create(&registry_root, "registry").unwrap();
+    let mut client = SecureTransport::load_or_create(&client_root, "client").unwrap();
+    registry.trust("client", client.certificate_der()).unwrap();
+    client
+        .trust("registry", registry.certificate_der())
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handshakes = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&handshakes);
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        observed.fetch_add(1, Ordering::SeqCst);
+        let mut stream = registry.accept_tls(stream).unwrap();
+        for _ in 0..2 {
+            let _: MeshRequest = read_frame(&mut BufReader::new(&mut stream)).unwrap();
+            write_frame(
+                &mut stream,
+                &Response {
+                    accepted: true,
+                    hosts: vec![],
+                    job_id: None,
+                    events: vec![],
+                    audit: vec![],
+                    artifact: None,
+                    error: None,
+                    operation: None,
+                    apple_operation: None,
+                    cancel_jobs: vec![],
+                    artifact_metadata: None,
+                    artifact_chunk: None,
+                    confirmed_offset: None,
+                    lease_grant: None,
+                    lease_status: None,
+                },
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        }
+    });
+    let boundary = PersistentMeshRpcBoundary::default();
+    let config = RemoteExecutionConfig {
+        registry_address: address.to_string(),
+        registry_peer_id: "registry".into(),
+        identity_path: client_root,
+        client_id: "client".into(),
+    };
+    assert!(boundary.call(&config, &MeshRequest::List).unwrap().accepted);
+    assert!(boundary.call(&config, &MeshRequest::List).unwrap().accepted);
+    server.join().unwrap();
+    assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+}
 
 fn snapshot() -> DaemonSnapshot {
     DaemonSnapshot {

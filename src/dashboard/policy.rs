@@ -4,6 +4,7 @@ use super::model::{
     PolicyRule, PrincipalId, ResourceClass, RuleId, ValidationError,
 };
 use crate::local_ipc::AuthenticatedTargetSession;
+use crate::remote_apple_protocol::AppleOperation;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,6 +16,125 @@ pub const MAX_PENDING_APPROVALS: usize = super::model::MAX_COLLECTION_ITEMS;
 const NONCE_GENERATION_ATTEMPTS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteOperationGrant {
+    pub request_id: String,
+    pub workspace_path: String,
+    pub device_id: Option<DeviceId>,
+    pub operation: AppleOperation,
+    canonical_sha256: String,
+}
+
+#[derive(Serialize)]
+struct RemoteOperationEnvelope<'a> {
+    request_id: &'a str,
+    workspace_path: &'a str,
+    device_id: &'a Option<DeviceId>,
+    operation: &'a AppleOperation,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteOperationGrantWire {
+    request_id: String,
+    workspace_path: String,
+    device_id: Option<DeviceId>,
+    operation: AppleOperation,
+    canonical_sha256: String,
+}
+
+impl RemoteOperationGrant {
+    pub fn new(
+        request_id: impl Into<String>,
+        workspace_path: impl Into<String>,
+        device_id: Option<DeviceId>,
+        operation: AppleOperation,
+    ) -> Result<Self, PolicyError> {
+        let mut grant = Self {
+            request_id: request_id.into(),
+            workspace_path: workspace_path.into(),
+            device_id,
+            operation,
+            canonical_sha256: String::new(),
+        };
+        grant.validate_fields()?;
+        grant.canonical_sha256 = grant.compute_digest();
+        Ok(grant)
+    }
+
+    pub fn canonical_sha256(&self) -> &str {
+        &self.canonical_sha256
+    }
+
+    fn validate(&self) -> Result<(), PolicyError> {
+        self.validate_fields()?;
+        (self.canonical_sha256 == self.compute_digest())
+            .then_some(())
+            .ok_or(PolicyError::InvalidRequest)
+    }
+
+    fn validate_fields(&self) -> Result<(), PolicyError> {
+        if self.request_id.is_empty()
+            || self.request_id.len() > 128
+            || !self
+                .request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !valid_relative_remote_path(&self.workspace_path)
+            || self.operation.requires_device() != self.device_id.is_some()
+        {
+            return Err(PolicyError::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    fn compute_digest(&self) -> String {
+        let encoded = serde_json::to_vec(&RemoteOperationEnvelope {
+            request_id: &self.request_id,
+            workspace_path: &self.workspace_path,
+            device_id: &self.device_id,
+            operation: &self.operation,
+        })
+        .expect("typed remote operation serializes");
+        hex(&Sha256::digest(encoded))
+    }
+}
+
+impl Serialize for RemoteOperationGrant {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        RemoteOperationGrantWire {
+            request_id: self.request_id.clone(),
+            workspace_path: self.workspace_path.clone(),
+            device_id: self.device_id.clone(),
+            operation: self.operation.clone(),
+            canonical_sha256: self.canonical_sha256.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteOperationGrant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = RemoteOperationGrantWire::deserialize(deserializer)?;
+        let grant = Self {
+            request_id: wire.request_id,
+            workspace_path: wire.workspace_path,
+            device_id: wire.device_id,
+            operation: wire.operation,
+            canonical_sha256: wire.canonical_sha256,
+        };
+        grant.validate().map_err(serde::de::Error::custom)?;
+        Ok(grant)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessRequest {
     pub activity_id: ActivityId,
     pub principal_id: PrincipalId,
@@ -23,6 +143,7 @@ pub struct AccessRequest {
     pub device_id: Option<DeviceId>,
     pub operation: OperationId,
     pub resources: Vec<ResourceClass>,
+    pub remote_operation: Option<RemoteOperationGrant>,
     pub physical_device: bool,
     pub user_present: bool,
 }
@@ -37,6 +158,8 @@ struct AccessRequestWire {
     device_id: Option<DeviceId>,
     operation: OperationId,
     resources: Vec<ResourceClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_operation: Option<RemoteOperationGrant>,
     physical_device: bool,
     user_present: bool,
 }
@@ -51,6 +174,7 @@ impl From<&AccessRequest> for AccessRequestWire {
             device_id: value.device_id.clone(),
             operation: value.operation.clone(),
             resources: value.resources.clone(),
+            remote_operation: value.remote_operation.clone(),
             physical_device: value.physical_device,
             user_present: value.user_present,
         }
@@ -69,6 +193,7 @@ impl TryFrom<AccessRequestWire> for AccessRequest {
             device_id: value.device_id,
             operation: value.operation,
             resources: value.resources,
+            remote_operation: value.remote_operation,
             physical_device: value.physical_device,
             user_present: value.user_present,
         };
@@ -454,7 +579,44 @@ fn validate_request(request: &AccessRequest) -> Result<(), PolicyError> {
     if unique.len() != request.resources.len() {
         return Err(PolicyError::InvalidRequest);
     }
+    if let Some(remote) = &request.remote_operation {
+        remote.validate()?;
+        let expected_operation = match remote.operation {
+            AppleOperation::InstallApp { .. } => "apple.install_app",
+            AppleOperation::LaunchApp { .. } => "apple.launch_app",
+            AppleOperation::ReadAppLogs { .. } => "apple.read_app_logs",
+            AppleOperation::BuildApp { .. } => "apple.build_app",
+            AppleOperation::RunXcTest { .. } => "apple.run_xctest",
+            AppleOperation::HardwareGate { .. } => "apple.hardware_gate",
+            AppleOperation::Discovery => "apple.discovery",
+            AppleOperation::PhysicalDevice => "apple.physical_device",
+            AppleOperation::Diagnostics => "apple.diagnostics",
+            AppleOperation::DiscoverProject { .. } => "apple.discover_project",
+            AppleOperation::DiscoverSimulator => "apple.discover_simulator",
+        };
+        if request.operation.as_str() != expected_operation
+            || request.device_id != remote.device_id
+            || matches!(remote.operation, AppleOperation::InstallApp { .. })
+                && (!request.resources.contains(&ResourceClass::WorkspaceRead)
+                    || !request.resources.contains(&ResourceClass::DeviceLease)
+                    || !request
+                        .resources
+                        .contains(&ResourceClass::ApplicationInstall))
+        {
+            return Err(PolicyError::InvalidRequest);
+        }
+    }
     Ok(())
+}
+
+fn valid_relative_remote_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1024
+        && !value.starts_with(['/', '\\'])
+        && !value.contains('\0')
+        && value
+            .split(['/', '\\'])
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn validate_rule_set(
@@ -655,6 +817,7 @@ mod tests {
             device_id: None,
             operation: OperationId::parse("workspace.write").unwrap(),
             resources,
+            remote_operation: None,
             physical_device: false,
             user_present: false,
         }

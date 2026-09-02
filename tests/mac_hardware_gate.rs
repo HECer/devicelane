@@ -30,7 +30,14 @@ fn hardware_gate_requires_real_device_signing_and_complete_evidence() {
         "--controller-session-assertion",
         "--controller-session-challenge",
         "--mesh-identity",
+        "--mesh-target-host",
+        "--mesh-device-id",
+        "--mesh-operation",
+        "--mesh-resources",
+        "--mesh-operation-sha256",
         "controller-session",
+        "consume",
+        "--replay-cache",
         "controller_session_mismatch",
     ] {
         assert!(

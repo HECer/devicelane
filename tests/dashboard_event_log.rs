@@ -52,6 +52,7 @@ fn event(activity: &str, sequence: u64) -> ActivityEvent {
         device_id: None,
         operation: id("build", OperationId::parse),
         resources: vec![ResourceClass::WorkspaceRead],
+        remote_operation_sha256: None,
         authorization: Authorization {
             effect: PolicyEffect::Allow,
             rule_id: None,

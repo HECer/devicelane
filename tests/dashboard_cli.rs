@@ -190,6 +190,7 @@ fn observed_watch_service() -> (tempfile::TempDir, String, EventJournal) {
                 device_id: None,
                 operation: OperationId::parse("build").unwrap(),
                 resources: vec![ResourceClass::WorkspaceRead],
+                remote_operation_sha256: None,
                 authorization: Authorization {
                     effect: PolicyEffect::Allow,
                     rule_id: None,

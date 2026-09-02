@@ -385,6 +385,10 @@ impl DashboardService {
                 device_id: access.device_id.clone(),
                 operation: access.operation.clone(),
                 resources: access.resources.clone(),
+                remote_operation_sha256: access
+                    .remote_operation
+                    .as_ref()
+                    .map(|grant| grant.canonical_sha256().to_owned()),
                 authorization: Authorization {
                     effect: PolicyEffect::Deny,
                     rule_id: None,
@@ -496,6 +500,10 @@ impl DashboardService {
                         device_id: access.device_id.clone(),
                         operation: access.operation.clone(),
                         resources: access.resources.clone(),
+                        remote_operation_sha256: access
+                            .remote_operation
+                            .as_ref()
+                            .map(|grant| grant.canonical_sha256().to_owned()),
                         authorization: Authorization {
                             effect: PolicyEffect::Deny,
                             rule_id: None,
@@ -541,6 +549,10 @@ impl DashboardService {
                 device_id: access.device_id.clone(),
                 operation: access.operation.clone(),
                 resources: access.resources.clone(),
+                remote_operation_sha256: access
+                    .remote_operation
+                    .as_ref()
+                    .map(|grant| grant.canonical_sha256().to_owned()),
                 requested_at_ms: now_ms,
                 expires_at_ms: challenge.expires_at_ms,
                 risk: super::SafeCode::parse("target_confirmation").expect("constant safe code"),
@@ -566,6 +578,10 @@ impl DashboardService {
                 device_id: access.device_id.clone(),
                 operation: access.operation.clone(),
                 resources: access.resources.clone(),
+                remote_operation_sha256: access
+                    .remote_operation
+                    .as_ref()
+                    .map(|grant| grant.canonical_sha256().to_owned()),
                 authorization: Authorization {
                     effect: PolicyEffect::Allow,
                     rule_id: None,
@@ -605,6 +621,7 @@ impl DashboardService {
             operation: OperationId::parse(operation)
                 .map_err(|_| DashboardServiceError::InvalidRequest)?,
             resources: vec![resource],
+            remote_operation: None,
             physical_device: false,
             user_present: true,
         };
@@ -749,6 +766,10 @@ impl DashboardService {
                 device_id: access.device_id.clone(),
                 operation: access.operation.clone(),
                 resources: access.resources.clone(),
+                remote_operation_sha256: access
+                    .remote_operation
+                    .as_ref()
+                    .map(|grant| grant.canonical_sha256().to_owned()),
                 authorization: Authorization {
                     effect,
                     rule_id: outcome.created_rule.as_ref().map(|rule| rule.id.clone()),
@@ -1332,6 +1353,7 @@ impl DashboardService {
             operation: OperationId::parse(operation)
                 .map_err(|_| DashboardServiceError::InvalidRequest)?,
             resources: vec![resource],
+            remote_operation: None,
             physical_device: false,
             user_present: true,
         };
@@ -1531,6 +1553,7 @@ impl DashboardService {
                 device_id: None,
                 operation: OperationId::parse(operation).expect("constant id"),
                 resources: Vec::new(),
+                remote_operation_sha256: None,
                 authorization: Authorization {
                     effect: PolicyEffect::Allow,
                     rule_id: None,

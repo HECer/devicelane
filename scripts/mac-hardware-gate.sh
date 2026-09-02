@@ -17,6 +17,11 @@ ARCHIVE_STDOUT=false
 MESH_CONTROLLER=
 MESH_ENDPOINT=
 MESH_ACTIVITY_ID=
+MESH_TARGET_HOST=
+MESH_DEVICE_ID=
+MESH_OPERATION=
+MESH_RESOURCES=
+MESH_OPERATION_SHA256=
 MESH_TIMEOUT_SECONDS=300
 DEVICELANE_BINARY=
 DEVICELANE_SHA256=
@@ -45,6 +50,11 @@ while [ "$#" -gt 0 ]; do
         --mesh-controller) shift; MESH_CONTROLLER=${1:-} ;;
         --mesh-endpoint) shift; MESH_ENDPOINT=${1:-} ;;
         --mesh-activity-id) shift; MESH_ACTIVITY_ID=${1:-} ;;
+        --mesh-target-host) shift; MESH_TARGET_HOST=${1:-} ;;
+        --mesh-device-id) shift; MESH_DEVICE_ID=${1:-} ;;
+        --mesh-operation) shift; MESH_OPERATION=${1:-} ;;
+        --mesh-resources) shift; MESH_RESOURCES=${1:-} ;;
+        --mesh-operation-sha256) shift; MESH_OPERATION_SHA256=${1:-} ;;
         --mesh-timeout-seconds) shift; MESH_TIMEOUT_SECONDS=${1:-} ;;
         --devicelane-binary) shift; DEVICELANE_BINARY=${1:-} ;;
         --devicelane-sha256) shift; DEVICELANE_SHA256=${1:-} ;;
@@ -61,8 +71,8 @@ done
 
 run_mesh_gate() {
     [ "${DEVICELANE_REAL_MESH_GATE:-0}" = 1 ] || repair mesh_gate_not_authorized "Set DEVICELANE_REAL_MESH_GATE=1 only for a real paired Windows-to-Mac run."
-    for value in "$MESH_CONTROLLER" "$MESH_ENDPOINT" "$MESH_ACTIVITY_ID" "$CONTROLLER_PEER_ID" "$CONTROLLER_SESSION_ASSERTION" "$CONTROLLER_SESSION_CHALLENGE" "$MESH_IDENTITY"; do
-        [ -n "$value" ] || repair mesh_gate_argument_missing "Pass the documented controller, endpoint, activity, controller-peer, signed-session, challenge, and mesh-identity arguments."
+    for value in "$MESH_CONTROLLER" "$MESH_ENDPOINT" "$MESH_ACTIVITY_ID" "$MESH_TARGET_HOST" "$MESH_DEVICE_ID" "$MESH_OPERATION" "$MESH_RESOURCES" "$MESH_OPERATION_SHA256" "$CONTROLLER_PEER_ID" "$CONTROLLER_SESSION_ASSERTION" "$CONTROLLER_SESSION_CHALLENGE" "$MESH_IDENTITY"; do
+        [ -n "$value" ] || repair mesh_gate_argument_missing "Pass the documented controller, endpoint, exact activity/target/device/operation/resources/digest, controller-peer, signed-session, challenge, and mesh-identity arguments."
     done
     [ -f "$CONTROLLER_SESSION_ASSERTION" ] && [ ! -L "$CONTROLLER_SESSION_ASSERTION" ] || repair controller_session_missing "Copy the short-lived signed controller-session assertion from the paired Windows controller."
     [ -d "$MESH_IDENTITY" ] && [ ! -L "$MESH_IDENTITY" ] || repair mesh_identity_missing "Use the paired Mac DeviceLane identity directory."
@@ -84,15 +94,19 @@ run_mesh_gate() {
     # The command spellings below are also the operator contract for the physical gate:
     # devicelane mesh status --local --json; devicelane activities watch --local --json;
     # devicelane approvals list --local --json; devicelane audit list --local --json.
-    "$PYTHON3" - "$DEVICELANE_CLI" "$MESH_ENDPOINT" "$MESH_CONTROLLER" "$CONTROLLER_PEER_ID" "$CONTROLLER_SESSION_ASSERTION" "$CONTROLLER_SESSION_CHALLENGE" "$MESH_IDENTITY" "$MESH_ACTIVITY_ID" "$MESH_TIMEOUT_SECONDS" "$DEVICELANE_SHA256" "$DEVICELANE_VERSION" "$RUN_DIR/evidence/mesh-evidence.json" <<'PY'
+    "$PYTHON3" - "$DEVICELANE_CLI" "$MESH_ENDPOINT" "$MESH_CONTROLLER" "$CONTROLLER_PEER_ID" "$CONTROLLER_SESSION_ASSERTION" "$CONTROLLER_SESSION_CHALLENGE" "$MESH_IDENTITY" "$MESH_ACTIVITY_ID" "$MESH_TARGET_HOST" "$MESH_DEVICE_ID" "$MESH_OPERATION" "$MESH_RESOURCES" "$MESH_OPERATION_SHA256" "$MESH_TIMEOUT_SECONDS" "$DEVICELANE_SHA256" "$DEVICELANE_VERSION" "$RUN_DIR/evidence/mesh-evidence.json" <<'PY'
 import hashlib, json, select, subprocess, sys, time
 
-cli, endpoint, controller, controller_peer, assertion, challenge, identity, activity_id, timeout_raw, binary_sha256, binary_version, output = sys.argv[1:]
+cli, endpoint, controller, controller_peer, assertion, challenge, identity, activity_id, expected_target, expected_device, expected_operation, expected_resources_raw, expected_operation_sha256, timeout_raw, binary_sha256, binary_version, output = sys.argv[1:]
 timeout = int(timeout_raw)
+expected_resources = sorted(set(expected_resources_raw.split(",")))
 
 def fail(code, message):
     print(f"hardware_gate_failed={code}\nnext_step={message}", file=sys.stderr)
     raise SystemExit(1)
+
+if not expected_resources or any(not value for value in expected_resources):
+    fail("mesh_resources_invalid", "Pass a comma-separated exact resource set without empty values.")
 
 def run(*parts):
     command = [cli, *parts, "--local", "--json", "--endpoint", endpoint]
@@ -103,9 +117,10 @@ def run(*parts):
     except Exception: fail("mesh_invalid_json", f"DeviceLane returned invalid JSON: {' '.join(parts)}")
 
 verified_process = subprocess.run([
-    cli, "controller-session", "verify", "--identity", identity,
+    cli, "controller-session", "consume", "--identity", identity,
     "--assertion", assertion, "--mesh-controller", controller,
-    "--controller-peer-id", controller_peer, "--challenge", challenge, "--json",
+    "--controller-peer-id", controller_peer, "--challenge", challenge,
+    "--replay-cache", identity + "/controller-session-replay.json", "--json",
 ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
 if verified_process.returncode:
     fail("controller_session_mismatch", "Issue a fresh assertion on the paired Windows controller for this exact endpoint, peer, and Mac challenge.")
@@ -160,10 +175,14 @@ while time.monotonic() < deadline:
 
     approvals = run("approvals", "list")
     for item in approvals.get("payload", []):
-        resources = item.get("resources", [])
+        resources = sorted(item.get("resources", []))
         if (item.get("activity_id") == activity_id and item.get("principal_id") == principal
                 and item.get("source_host_id") == source
-                and {"workspace_read", "device_lease"}.issubset(set(resources))):
+                and item.get("target_host_id") == expected_target
+                and item.get("device_id") == expected_device
+                and item.get("operation") == expected_operation
+                and resources == expected_resources
+                and item.get("remote_operation_sha256") == expected_operation_sha256):
             seen["approval"] = True
 
     activities = run("activities", "list", "--cursor", cursor, "--limit", "256")
@@ -190,8 +209,13 @@ while time.monotonic() < deadline:
             fail("watch_resync_without_cursor", "Recover resync through activities list so the snapshot revision and replacement epoch are explicit.")
     for event in [*payload.get("events", []), *streamed_events]:
         if event.get("activity_id") != activity_id: continue
-        resources = set(event.get("resources", []))
-        if not {"workspace_read", "device_lease"}.issubset(resources): continue
+        resources = sorted(event.get("resources", []))
+        if (event.get("target_host_id") != expected_target
+                or event.get("device_id") != expected_device
+                or event.get("operation") != expected_operation
+                or resources != expected_resources
+                or event.get("remote_operation_sha256") != expected_operation_sha256):
+            continue
         state = event.get("state")
         seen["running"] |= state == "running"
         seen["reconnecting"] |= state == "reconnecting"
@@ -226,9 +250,10 @@ expected_audit = {
     "activity_id": activity_id,
     "principal_id": principal,
     "source_host_id": source,
-    "target_host_id": terminal_event.get("target_host_id"),
-    "operation": terminal_event.get("operation"),
-    "resources": sorted(terminal_event.get("resources", [])),
+    "target_host_id": expected_target,
+    "device_id": expected_device,
+    "operation": expected_operation,
+    "resources": expected_resources,
     "decision": decision,
     "terminal": terminal_event.get("state"),
     "redaction": None,
@@ -238,6 +263,7 @@ actual_audit = {
     "principal_id": terminal_audit.get("principal_id"),
     "source_host_id": terminal_audit.get("source_host_id"),
     "target_host_id": terminal_audit.get("target_host_id"),
+    "device_id": terminal_audit.get("device_id"),
     "operation": terminal_audit.get("operation"),
     "resources": sorted(terminal_audit.get("resources", [])),
     "decision": terminal_audit.get("decision"),
@@ -258,7 +284,9 @@ evidence = {
     "source_host": pseudonym(source),
     "controller_session": pseudonym(session_id),
     "activity_id": pseudonym(activity_id),
-    "resources": ["workspace_read", "device_lease"],
+    "operation": expected_operation,
+    "resources": expected_resources,
+    "remote_operation_digest": "sha256:" + expected_operation_sha256,
     "decision": decision,
     "states_observed": sorted(k for k, value in seen.items() if value),
     "metric_status": metric_state,

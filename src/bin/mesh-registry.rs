@@ -369,632 +369,647 @@ fn handle(
     let Ok(peer_id) = transport.peer_id(peer_certificate.as_ref()) else {
         return;
     };
-    let mut line = String::new();
-    if BufReader::new(&mut stream)
-        .take(512 * 1024)
-        .read_line(&mut line)
-        .is_err()
-    {
-        return;
-    }
-    let Ok(request) = serde_json::from_str(&line) else {
-        return;
-    };
-    if let Some(error) = state.lock().unwrap().recovery_error.clone()
-        && !read_only_during_recovery(&request)
-    {
-        return write_response(&mut stream, error_response(&error));
-    }
-    let response = match request {
-        Request::Heartbeat { mut host } => {
-            if !agent_peers.contains(&peer_id) {
-                return write_response(&mut stream, error_response("agent_access_denied"));
-            }
-            let connected: HashSet<_> = host
-                .devices
-                .iter()
-                .filter(|device| device.state == "connected")
-                .map(|device| device.id.clone())
-                .collect();
-            {
-                let mut state = state.lock().unwrap();
-                if state
-                    .host_peers
-                    .get(&host.id)
-                    .is_some_and(|owner| owner != &peer_id)
-                    || connected.iter().any(|device| {
-                        state
-                            .device_peers
-                            .get(device)
-                            .is_some_and(|owner| owner != &peer_id)
-                    })
-                {
-                    return write_response(&mut stream, error_response("agent_identity_mismatch"));
+    loop {
+        let mut line = String::new();
+        let read = BufReader::new(&mut stream)
+            .take(512 * 1024)
+            .read_line(&mut line);
+        if !matches!(read, Ok(bytes) if bytes > 0) {
+            return;
+        }
+        let Ok(request) = serde_json::from_str(&line) else {
+            return;
+        };
+        if let Some(error) = state.lock().unwrap().recovery_error.clone()
+            && !read_only_during_recovery(&request)
+        {
+            return write_response(&mut stream, error_response(&error));
+        }
+        let response = match request {
+            Request::Heartbeat { mut host } => {
+                if !agent_peers.contains(&peer_id) {
+                    return write_response(&mut stream, error_response("agent_access_denied"));
                 }
-                let detached: Vec<_> = state
-                    .device_peers
+                let connected: HashSet<_> = host
+                    .devices
                     .iter()
-                    .filter(|(device, owner)| *owner == &peer_id && !connected.contains(*device))
-                    .map(|(device, _)| device.clone())
+                    .filter(|device| device.state == "connected")
+                    .map(|device| device.id.clone())
                     .collect();
-                state.host_peers.insert(host.id.clone(), peer_id.clone());
-                for device in &connected {
-                    state.device_peers.insert(device.clone(), peer_id.clone());
-                }
-                let mut leases = leases.lock().unwrap();
-                for device in &connected {
-                    leases.pending_detach.remove(device);
-                }
-                for device in &detached {
-                    let writer_active = leases.writers.contains_key(device);
-                    leases.detach_inventory(device);
-                    if !writer_active {
-                        state.device_peers.remove(device);
+                {
+                    let mut state = state.lock().unwrap();
+                    if state
+                        .host_peers
+                        .get(&host.id)
+                        .is_some_and(|owner| owner != &peer_id)
+                        || connected.iter().any(|device| {
+                            state
+                                .device_peers
+                                .get(device)
+                                .is_some_and(|owner| owner != &peer_id)
+                        })
+                    {
+                        return write_response(
+                            &mut stream,
+                            error_response("agent_identity_mismatch"),
+                        );
+                    }
+                    let detached: Vec<_> = state
+                        .device_peers
+                        .iter()
+                        .filter(|(device, owner)| {
+                            *owner == &peer_id && !connected.contains(*device)
+                        })
+                        .map(|(device, _)| device.clone())
+                        .collect();
+                    state.host_peers.insert(host.id.clone(), peer_id.clone());
+                    for device in &connected {
+                        state.device_peers.insert(device.clone(), peer_id.clone());
+                    }
+                    let mut leases = leases.lock().unwrap();
+                    for device in &connected {
+                        leases.pending_detach.remove(device);
+                    }
+                    for device in &detached {
+                        let writer_active = leases.writers.contains_key(device);
+                        leases.detach_inventory(device);
+                        if !writer_active {
+                            state.device_peers.remove(device);
+                        }
+                    }
+                    if leases.persist().is_err() {
+                        return write_response(&mut stream, error_response("persistence_failed"));
                     }
                 }
-                if leases.persist().is_err() {
-                    return write_response(&mut stream, error_response("persistence_failed"));
-                }
-            }
-            {
-                let mut leases = leases.lock().unwrap();
-                leases.expire();
-                if leases.persist().is_err() {
-                    return write_response(&mut stream, error_response("persistence_failed"));
-                }
-            }
-            host.status = "online".into();
-            let host_id = host.id.clone();
-            entries.lock().unwrap().insert(
-                host.id.clone(),
-                Entry {
-                    host: host.clone(),
-                    heartbeat: Instant::now(),
-                },
-            );
-            let mut response = response();
-            let mut state = state.lock().unwrap();
-            if let Some((job_id, operation)) = state
-                .pending
-                .iter()
-                .find(|(job_id, operation)| {
-                    operation.host_id == host_id && !state.dispatched.contains(*job_id)
-                })
-                .map(|(job_id, operation)| (job_id.clone(), operation.clone()))
-            {
-                state.dispatched.insert(job_id.clone());
-                response.operation = Some(operation);
-                response.job_id = Some(job_id);
-            }
-            if let Some((job_id, operation)) = state
-                .apple_pending
-                .iter()
-                .find(|(job_id, _)| {
-                    state.apple_hosts.get(*job_id) == Some(&host_id)
-                        && !state.acknowledged.contains(*job_id)
-                        && state.apple_pending.get(*job_id).is_none_or(|operation| {
-                            !operation.operation.mutates_device()
-                                || operation.device_id.as_ref().is_none_or(|device_id| {
-                                    leases
-                                        .lock()
-                                        .unwrap()
-                                        .writers
-                                        .get(device_id)
-                                        .is_none_or(|writer| &writer.job_id == *job_id)
-                                })
-                        })
-                })
-                .map(|(job_id, operation)| (job_id.clone(), operation.clone()))
-            {
-                response.apple_operation = Some(operation);
-                response.job_id = Some(job_id);
-                let mut dispatch = true;
-                if let Some(request) = response.apple_operation.as_ref()
-                    && request.operation.mutates_device()
-                    && let (Some(device_id), Some(lease_id)) =
-                        (request.device_id.as_ref(), request.lease_id.as_ref())
                 {
                     let mut leases = leases.lock().unwrap();
                     leases.expire();
-                    if let Some(lease) = leases.active.get(device_id)
-                        && &lease.id == lease_id
-                        && state.job_clients.get(response.job_id.as_ref().unwrap())
-                            == Some(&lease.client_id)
+                    if leases.persist().is_err() {
+                        return write_response(&mut stream, error_response("persistence_failed"));
+                    }
+                }
+                host.status = "online".into();
+                let host_id = host.id.clone();
+                entries.lock().unwrap().insert(
+                    host.id.clone(),
+                    Entry {
+                        host: host.clone(),
+                        heartbeat: Instant::now(),
+                    },
+                );
+                let mut response = response();
+                let mut state = state.lock().unwrap();
+                if let Some((job_id, operation)) = state
+                    .pending
+                    .iter()
+                    .find(|(job_id, operation)| {
+                        operation.host_id == host_id && !state.dispatched.contains(*job_id)
+                    })
+                    .map(|(job_id, operation)| (job_id.clone(), operation.clone()))
+                {
+                    state.dispatched.insert(job_id.clone());
+                    response.operation = Some(operation);
+                    response.job_id = Some(job_id);
+                }
+                if let Some((job_id, operation)) = state
+                    .apple_pending
+                    .iter()
+                    .find(|(job_id, _)| {
+                        state.apple_hosts.get(*job_id) == Some(&host_id)
+                            && !state.acknowledged.contains(*job_id)
+                            && state.apple_pending.get(*job_id).is_none_or(|operation| {
+                                !operation.operation.mutates_device()
+                                    || operation.device_id.as_ref().is_none_or(|device_id| {
+                                        leases
+                                            .lock()
+                                            .unwrap()
+                                            .writers
+                                            .get(device_id)
+                                            .is_none_or(|writer| &writer.job_id == *job_id)
+                                    })
+                            })
+                    })
+                    .map(|(job_id, operation)| (job_id.clone(), operation.clone()))
+                {
+                    response.apple_operation = Some(operation);
+                    response.job_id = Some(job_id);
+                    let mut dispatch = true;
+                    if let Some(request) = response.apple_operation.as_ref()
+                        && request.operation.mutates_device()
+                        && let (Some(device_id), Some(lease_id)) =
+                            (request.device_id.as_ref(), request.lease_id.as_ref())
                     {
-                        let mut grant = LeaseGrant {
-                            lease_id: lease.id.clone(),
-                            device_id: lease.device_id.clone(),
-                            client_id: lease.client_id.clone(),
-                            job_id: response.job_id.clone().unwrap(),
-                            expires_at_ms: lease.expires_at_ms.saturating_sub(unix_time_ms()),
-                            signature: Vec::new(),
-                        };
-                        grant.signature = transport.sign(&grant.signed_payload()).unwrap();
-                        leases.writers.insert(
-                            device_id.clone(),
-                            DeviceWriter {
+                        let mut leases = leases.lock().unwrap();
+                        leases.expire();
+                        if let Some(lease) = leases.active.get(device_id)
+                            && &lease.id == lease_id
+                            && state.job_clients.get(response.job_id.as_ref().unwrap())
+                                == Some(&lease.client_id)
+                        {
+                            let mut grant = LeaseGrant {
+                                lease_id: lease.id.clone(),
+                                device_id: lease.device_id.clone(),
+                                client_id: lease.client_id.clone(),
                                 job_id: response.job_id.clone().unwrap(),
-                            },
-                        );
-                        if leases.persist().is_err() {
-                            return write_response(
-                                &mut stream,
-                                error_response("persistence_failed"),
+                                expires_at_ms: lease.expires_at_ms.saturating_sub(unix_time_ms()),
+                                signature: Vec::new(),
+                            };
+                            grant.signature = transport.sign(&grant.signed_payload()).unwrap();
+                            leases.writers.insert(
+                                device_id.clone(),
+                                DeviceWriter {
+                                    job_id: response.job_id.clone().unwrap(),
+                                },
                             );
+                            if leases.persist().is_err() {
+                                return write_response(
+                                    &mut stream,
+                                    error_response("persistence_failed"),
+                                );
+                            }
+                            response.lease_grant = Some(grant);
+                        } else {
+                            let rejected_job = response.job_id.clone().unwrap();
+                            response.apple_operation = None;
+                            state.apple_pending.remove(&rejected_job);
+                            state
+                                .jobs
+                                .entry(rejected_job)
+                                .or_default()
+                                .push(NetworkEvent {
+                                    sequence: 1,
+                                    kind: "rejected".into(),
+                                    payload: "lease_inactive".into(),
+                                });
+                            dispatch = false;
                         }
-                        response.lease_grant = Some(grant);
-                    } else {
-                        let rejected_job = response.job_id.clone().unwrap();
-                        response.apple_operation = None;
-                        state.apple_pending.remove(&rejected_job);
-                        state
-                            .jobs
-                            .entry(rejected_job)
-                            .or_default()
-                            .push(NetworkEvent {
-                                sequence: 1,
-                                kind: "rejected".into(),
-                                payload: "lease_inactive".into(),
-                            });
-                        dispatch = false;
+                    }
+                    if dispatch {
+                        state.dispatched.insert(response.job_id.clone().unwrap());
                     }
                 }
-                if dispatch {
-                    state.dispatched.insert(response.job_id.clone().unwrap());
-                }
-            }
-            response.cancel_jobs = state.cancelled.iter().cloned().collect();
-            if persist_state(state_path, &state).is_err() {
-                if let Some(job_id) = response.job_id.as_ref() {
-                    state.dispatched.remove(job_id);
-                    let mut leases = leases.lock().unwrap();
-                    reconcile_runtime_state(&mut state, &mut leases);
-                    let _ = leases.persist();
-                }
-                return write_response(&mut stream, error_response("persistence_failed"));
-            }
-            response
-        }
-        Request::Complete {
-            job_id,
-            artifact,
-            events,
-        } => {
-            let mut state = state.lock().unwrap();
-            if let Some(operation) = state.pending.remove(&job_id) {
-                let succeeded = events
-                    .last()
-                    .is_some_and(|event| event.kind == "exit" && event.payload == "0");
-                state.jobs.insert(job_id.clone(), events);
-                state.artifacts.insert(job_id.clone(), artifact);
-                state.audit.push(AuditRecord {
-                    principal_id: operation.principal_id,
-                    host_id: operation.host_id,
-                    device_id: operation.device_id,
-                    workspace_id: operation.workspace_id,
-                    job_id,
-                    result: if succeeded { "succeeded" } else { "failed" }.into(),
-                });
-                persist_state(state_path, &state).unwrap();
-            }
-            response()
-        }
-        Request::List => {
-            let now = Instant::now();
-            let mut hosts: Vec<_> = entries
-                .lock()
-                .unwrap()
-                .values()
-                .map(|entry| {
-                    let mut host = entry.host.clone();
-                    host.status = if now.duration_since(entry.heartbeat) >= offline {
-                        "offline"
-                    } else {
-                        "online"
+                response.cancel_jobs = state.cancelled.iter().cloned().collect();
+                if persist_state(state_path, &state).is_err() {
+                    if let Some(job_id) = response.job_id.as_ref() {
+                        state.dispatched.remove(job_id);
+                        let mut leases = leases.lock().unwrap();
+                        reconcile_runtime_state(&mut state, &mut leases);
+                        let _ = leases.persist();
                     }
-                    .into();
-                    host
-                })
-                .collect();
-            hosts.sort_by(|a, b| a.id.cmp(&b.id));
-            Response {
-                hosts,
-                ..response()
+                    return write_response(&mut stream, error_response("persistence_failed"));
+                }
+                response
             }
-        }
-        Request::AuthenticateDashboardAccess {
-            claim,
-            client_signature,
-        } => {
-            if agent_peers.contains(&peer_id) {
-                return write_response(&mut stream, error_response("controller_identity_required"));
+            Request::Complete {
+                job_id,
+                artifact,
+                events,
+            } => {
+                let mut state = state.lock().unwrap();
+                if let Some(operation) = state.pending.remove(&job_id) {
+                    let succeeded = events
+                        .last()
+                        .is_some_and(|event| event.kind == "exit" && event.payload == "0");
+                    state.jobs.insert(job_id.clone(), events);
+                    state.artifacts.insert(job_id.clone(), artifact);
+                    state.audit.push(AuditRecord {
+                        principal_id: operation.principal_id,
+                        host_id: operation.host_id,
+                        device_id: operation.device_id,
+                        workspace_id: operation.workspace_id,
+                        job_id,
+                        result: if succeeded { "succeeded" } else { "failed" }.into(),
+                    });
+                    persist_state(state_path, &state).unwrap();
+                }
+                response()
             }
-            match issue_mesh_approval(
-                transport,
-                &peer_id,
-                claim,
-                &client_signature,
-                unix_time_ms(),
-                60_000,
-            ) {
-                Ok(assertion) => Response {
-                    accepted: true,
-                    events: vec![NetworkEvent {
-                        sequence: 1,
-                        kind: "authenticated_dashboard_access".into(),
-                        payload: serde_json::to_string(&assertion).unwrap(),
-                    }],
-                    ..response()
-                },
-                Err(_) => error_response("mesh_identity_mismatch"),
-            }
-        }
-        Request::Run { operation } => {
-            if let Some(error) = &state.lock().unwrap().recovery_error {
+            Request::List => {
+                let now = Instant::now();
+                let mut hosts: Vec<_> = entries
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .map(|entry| {
+                        let mut host = entry.host.clone();
+                        host.status = if now.duration_since(entry.heartbeat) >= offline {
+                            "offline"
+                        } else {
+                            "online"
+                        }
+                        .into();
+                        host
+                    })
+                    .collect();
+                hosts.sort_by(|a, b| a.id.cmp(&b.id));
                 Response {
-                    accepted: false,
-                    error: Some(error.clone()),
+                    hosts,
                     ..response()
                 }
-            } else {
-                run(operation, &state, state_path)
             }
-        }
-        Request::Events { job_id, after } => {
-            let state = state.lock().unwrap();
-            if let Some(error) = &state.recovery_error {
-                return write_response(
-                    &mut stream,
+            Request::AuthenticateDashboardAccess {
+                claim,
+                client_signature,
+            } => {
+                if agent_peers.contains(&peer_id) {
+                    return write_response(
+                        &mut stream,
+                        error_response("controller_identity_required"),
+                    );
+                }
+                match issue_mesh_approval(
+                    transport,
+                    &peer_id,
+                    claim,
+                    &client_signature,
+                    unix_time_ms(),
+                    60_000,
+                ) {
+                    Ok(assertion) => Response {
+                        accepted: true,
+                        events: vec![NetworkEvent {
+                            sequence: 1,
+                            kind: "authenticated_dashboard_access".into(),
+                            payload: serde_json::to_string(&assertion).unwrap(),
+                        }],
+                        ..response()
+                    },
+                    Err(_) => error_response("mesh_identity_mismatch"),
+                }
+            }
+            Request::Run { operation } => {
+                if let Some(error) = &state.lock().unwrap().recovery_error {
                     Response {
                         accepted: false,
                         error: Some(error.clone()),
                         ..response()
-                    },
-                );
-            }
-            Response {
-                job_id: Some(job_id.clone()),
-                events: state
-                    .jobs
-                    .get(&job_id)
-                    .into_iter()
-                    .flatten()
-                    .filter(|event| event.sequence > after)
-                    .cloned()
-                    .collect(),
-                audit: state
-                    .audit
-                    .iter()
-                    .filter(|event| event.job_id == job_id)
-                    .cloned()
-                    .collect(),
-                artifact: state.artifacts.get(&job_id).cloned(),
-                ..response()
-            }
-        }
-        Request::AppleRun { operation } => {
-            if let Err(error) = validate_request_envelope(&operation) {
-                return write_response(
-                    &mut stream,
-                    Response {
-                        accepted: false,
-                        error: Some(error.code().into()),
-                        ..response()
-                    },
-                );
-            }
-            if operation.operation.mutates_device() {
-                let mut leases = leases.lock().unwrap();
-                leases.expire();
-                let active = operation.device_id.as_ref().is_some_and(|device_id| {
-                    leases.active.get(device_id).is_some_and(|lease| {
-                        operation.lease_id.as_ref() == Some(&lease.id) && lease.client_id == peer_id
-                    })
-                });
-                if leases.persist().is_err() {
-                    return write_response(&mut stream, error_response("persistence_failed"));
-                }
-                if !active {
-                    return write_response(&mut stream, error_response("lease_inactive"));
+                    }
+                } else {
+                    run(operation, &state, state_path)
                 }
             }
-            let mut state = state.lock().unwrap();
-            let job_id = if let Some(job_id) = state.apple_requests.get(&operation.idempotency_key)
-            {
-                if state
-                    .apple_operations
-                    .get(&operation.idempotency_key)
-                    .is_some_and(|existing| existing != &operation)
-                {
+            Request::Events { job_id, after } => {
+                let state = state.lock().unwrap();
+                if let Some(error) = &state.recovery_error {
                     return write_response(
                         &mut stream,
                         Response {
                             accepted: false,
-                            error: Some("idempotency_conflict".into()),
+                            error: Some(error.clone()),
                             ..response()
                         },
                     );
                 }
-                job_id.clone()
-            } else {
-                let target = entries
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .find(|entry| {
-                        entry.host.capabilities.contains(&operation.capability)
-                            && operation.device_id.as_ref().is_none_or(|device_id| {
-                                entry.host.devices.iter().any(|device| {
-                                    &device.id == device_id && device.state == "connected"
-                                })
-                            })
-                    })
-                    .map(|entry| entry.host.id.clone());
-                let Some(target) = target else {
+                Response {
+                    job_id: Some(job_id.clone()),
+                    events: state
+                        .jobs
+                        .get(&job_id)
+                        .into_iter()
+                        .flatten()
+                        .filter(|event| event.sequence > after)
+                        .cloned()
+                        .collect(),
+                    audit: state
+                        .audit
+                        .iter()
+                        .filter(|event| event.job_id == job_id)
+                        .cloned()
+                        .collect(),
+                    artifact: state.artifacts.get(&job_id).cloned(),
+                    ..response()
+                }
+            }
+            Request::AppleRun { operation } => {
+                if let Err(error) = validate_request_envelope(&operation) {
                     return write_response(
                         &mut stream,
                         Response {
                             accepted: false,
-                            error: Some("no_eligible_host".into()),
+                            error: Some(error.code().into()),
                             ..response()
                         },
                     );
-                };
-                let job_id = format!(
-                    "apple-{:x}",
-                    Sha256::digest(operation.idempotency_key.as_bytes())
-                );
-                state
-                    .apple_requests
-                    .insert(operation.idempotency_key.clone(), job_id.clone());
-                state
-                    .apple_operations
-                    .insert(operation.idempotency_key.clone(), operation.clone());
-                state.apple_pending.insert(job_id.clone(), operation);
-                state.apple_hosts.insert(job_id.clone(), target);
-                state.job_clients.insert(job_id.clone(), peer_id.clone());
-                if let Some(agent) = state
-                    .apple_hosts
-                    .get(&job_id)
-                    .and_then(|host| state.host_peers.get(host))
-                    .cloned()
-                {
-                    state.job_agents.insert(job_id.clone(), agent);
                 }
-                state.jobs.insert(job_id.clone(), Vec::new());
-                persist_state(state_path, &state).unwrap();
-                job_id
-            };
-            Response {
-                job_id: Some(job_id),
-                ..response()
-            }
-        }
-        Request::AppleProgress {
-            job_id,
-            events,
-            terminal,
-        } => {
-            let mut state = state.lock().unwrap();
-            if state.job_agents.get(&job_id) != Some(&peer_id) {
-                return write_response(&mut stream, error_response("apple_progress_access_denied"));
-            }
-            let restored_writer = if terminal {
-                false
-            } else {
-                let mut leases = leases.lock().unwrap();
-                match restore_acknowledged_writer(&state, &mut leases, &job_id) {
-                    Ok(restored) => {
-                        if leases.persist().is_err() {
+                if operation.operation.mutates_device() {
+                    let mut leases = leases.lock().unwrap();
+                    leases.expire();
+                    let active = operation.device_id.as_ref().is_some_and(|device_id| {
+                        leases.active.get(device_id).is_some_and(|lease| {
+                            operation.lease_id.as_ref() == Some(&lease.id)
+                                && lease.client_id == peer_id
+                        })
+                    });
+                    if leases.persist().is_err() {
+                        return write_response(&mut stream, error_response("persistence_failed"));
+                    }
+                    if !active {
+                        return write_response(&mut stream, error_response("lease_inactive"));
+                    }
+                }
+                let mut state = state.lock().unwrap();
+                let job_id =
+                    if let Some(job_id) = state.apple_requests.get(&operation.idempotency_key) {
+                        if state
+                            .apple_operations
+                            .get(&operation.idempotency_key)
+                            .is_some_and(|existing| existing != &operation)
+                        {
                             return write_response(
                                 &mut stream,
-                                error_response("persistence_failed"),
+                                Response {
+                                    accepted: false,
+                                    error: Some("idempotency_conflict".into()),
+                                    ..response()
+                                },
                             );
                         }
-                        restored
-                    }
-                    Err(error) => {
-                        let _ = leases.persist();
-                        return write_response(&mut stream, error_response(error));
-                    }
-                }
-            };
-            let existing = state.jobs.entry(job_id.clone()).or_default();
-            for event in events {
-                if !existing
-                    .iter()
-                    .any(|current| current.sequence == event.sequence)
-                {
-                    existing.push(event);
-                }
-            }
-            if !terminal {
-                state.acknowledged.insert(job_id.clone());
-            }
-            if terminal {
-                let mut leases = leases.lock().unwrap();
-                let finished_devices: Vec<_> = leases
-                    .writers
-                    .iter()
-                    .filter(|(_, writer)| writer.job_id == job_id)
-                    .map(|(device, _)| device.clone())
-                    .collect();
-                for device in finished_devices {
-                    leases.writers.remove(&device);
-                    if leases.pending_release.remove(&device) {
-                        leases.release_device(&device);
-                    }
-                    if leases.pending_detach.remove(&device) {
-                        state.device_peers.remove(&device);
-                    }
-                }
-                state.apple_pending.remove(&job_id);
-                state.cancelled.remove(&job_id);
-            }
-            if persist_state(state_path, &state).is_err() {
-                if restored_writer {
-                    let mut leases = leases.lock().unwrap();
-                    leases.writers.retain(|_, writer| writer.job_id != job_id);
-                    let _ = leases.persist();
-                }
-                return write_response(&mut stream, error_response("persistence_failed"));
-            }
-            if terminal && leases.lock().unwrap().persist().is_err() {
-                return write_response(&mut stream, error_response("persistence_failed"));
-            }
-            response()
-        }
-        Request::AppleCancel { job_id } => {
-            let mut state = state.lock().unwrap();
-            if state.job_clients.get(&job_id) != Some(&peer_id) {
-                error_response("apple_cancel_access_denied")
-            } else if state.apple_pending.contains_key(&job_id) {
-                if state.dispatched.contains(&job_id) {
-                    state.cancelled.insert(job_id);
-                } else {
-                    state.apple_pending.remove(&job_id);
-                    state.jobs.entry(job_id).or_default().push(NetworkEvent {
-                        sequence: 1,
-                        kind: "cancelled".into(),
-                        payload: String::new(),
-                    });
-                }
-                persist_state(state_path, &state).unwrap();
-                response()
-            } else {
+                        job_id.clone()
+                    } else {
+                        let target = entries
+                            .lock()
+                            .unwrap()
+                            .values()
+                            .find(|entry| {
+                                entry.host.capabilities.contains(&operation.capability)
+                                    && operation.device_id.as_ref().is_none_or(|device_id| {
+                                        entry.host.devices.iter().any(|device| {
+                                            &device.id == device_id && device.state == "connected"
+                                        })
+                                    })
+                            })
+                            .map(|entry| entry.host.id.clone());
+                        let Some(target) = target else {
+                            return write_response(
+                                &mut stream,
+                                Response {
+                                    accepted: false,
+                                    error: Some("no_eligible_host".into()),
+                                    ..response()
+                                },
+                            );
+                        };
+                        let job_id = format!(
+                            "apple-{:x}",
+                            Sha256::digest(operation.idempotency_key.as_bytes())
+                        );
+                        state
+                            .apple_requests
+                            .insert(operation.idempotency_key.clone(), job_id.clone());
+                        state
+                            .apple_operations
+                            .insert(operation.idempotency_key.clone(), operation.clone());
+                        state.apple_pending.insert(job_id.clone(), operation);
+                        state.apple_hosts.insert(job_id.clone(), target);
+                        state.job_clients.insert(job_id.clone(), peer_id.clone());
+                        if let Some(agent) = state
+                            .apple_hosts
+                            .get(&job_id)
+                            .and_then(|host| state.host_peers.get(host))
+                            .cloned()
+                        {
+                            state.job_agents.insert(job_id.clone(), agent);
+                        }
+                        state.jobs.insert(job_id.clone(), Vec::new());
+                        persist_state(state_path, &state).unwrap();
+                        job_id
+                    };
                 Response {
-                    accepted: false,
-                    error: Some("unknown_job".into()),
+                    job_id: Some(job_id),
                     ..response()
                 }
             }
-        }
-        Request::ArtifactRegister {
-            job_id,
-            name,
-            media_type,
-            total_size,
-            sha256,
-        } => {
-            let state = state.lock().unwrap();
-            let host_peer = state.job_agents.get(&job_id);
-            if host_peer != Some(&peer_id) {
-                error_response("artifact_access_denied")
-            } else if total_size == 0
-                || sha256.len() != 64
-                || !valid_id(&name)
-                || media_type.is_empty()
-            {
-                error_response("invalid_artifact_metadata")
-            } else {
-                let id = format!(
-                    "{:x}",
-                    Sha256::digest(format!("{job_id}\0{name}\0{sha256}").as_bytes())
-                );
-                let mut participants = HashSet::from([peer_id.clone()]);
-                if let Some(client) = state.job_clients.get(&job_id) {
-                    participants.insert(client.clone());
+            Request::AppleProgress {
+                job_id,
+                events,
+                terminal,
+            } => {
+                let mut state = state.lock().unwrap();
+                if state.job_agents.get(&job_id) != Some(&peer_id) {
+                    return write_response(
+                        &mut stream,
+                        error_response("apple_progress_access_denied"),
+                    );
                 }
-                drop(state);
-                let metadata = NetworkArtifactMetadata {
-                    id: id.clone(),
-                    job_id,
-                    name,
-                    media_type,
-                    total_size,
-                    sha256,
+                let restored_writer = if terminal {
+                    false
+                } else {
+                    let mut leases = leases.lock().unwrap();
+                    match restore_acknowledged_writer(&state, &mut leases, &job_id) {
+                        Ok(restored) => {
+                            if leases.persist().is_err() {
+                                return write_response(
+                                    &mut stream,
+                                    error_response("persistence_failed"),
+                                );
+                            }
+                            restored
+                        }
+                        Err(error) => {
+                            let _ = leases.persist();
+                            return write_response(&mut stream, error_response(error));
+                        }
+                    }
                 };
-                let mut artifacts = artifacts.lock().unwrap();
-                artifacts
-                    .entries
-                    .entry(id)
-                    .and_modify(|entry| entry.participants.extend(participants.clone()))
-                    .or_insert_with(|| NetworkArtifact {
-                        metadata: metadata.clone(),
-                        participants,
-                        confirmed_offset: 0,
-                        published: false,
-                    });
-                if artifacts.persist().is_err() {
-                    error_response("persistence_failed")
+                let existing = state.jobs.entry(job_id.clone()).or_default();
+                for event in events {
+                    if !existing
+                        .iter()
+                        .any(|current| current.sequence == event.sequence)
+                    {
+                        existing.push(event);
+                    }
+                }
+                if !terminal {
+                    state.acknowledged.insert(job_id.clone());
+                }
+                if terminal {
+                    let mut leases = leases.lock().unwrap();
+                    let finished_devices: Vec<_> = leases
+                        .writers
+                        .iter()
+                        .filter(|(_, writer)| writer.job_id == job_id)
+                        .map(|(device, _)| device.clone())
+                        .collect();
+                    for device in finished_devices {
+                        leases.writers.remove(&device);
+                        if leases.pending_release.remove(&device) {
+                            leases.release_device(&device);
+                        }
+                        if leases.pending_detach.remove(&device) {
+                            state.device_peers.remove(&device);
+                        }
+                    }
+                    state.apple_pending.remove(&job_id);
+                    state.cancelled.remove(&job_id);
+                }
+                if persist_state(state_path, &state).is_err() {
+                    if restored_writer {
+                        let mut leases = leases.lock().unwrap();
+                        leases.writers.retain(|_, writer| writer.job_id != job_id);
+                        let _ = leases.persist();
+                    }
+                    return write_response(&mut stream, error_response("persistence_failed"));
+                }
+                if terminal && leases.lock().unwrap().persist().is_err() {
+                    return write_response(&mut stream, error_response("persistence_failed"));
+                }
+                response()
+            }
+            Request::AppleCancel { job_id } => {
+                let mut state = state.lock().unwrap();
+                if state.job_clients.get(&job_id) != Some(&peer_id) {
+                    error_response("apple_cancel_access_denied")
+                } else if state.apple_pending.contains_key(&job_id) {
+                    if state.dispatched.contains(&job_id) {
+                        state.cancelled.insert(job_id);
+                    } else {
+                        state.apple_pending.remove(&job_id);
+                        state.jobs.entry(job_id).or_default().push(NetworkEvent {
+                            sequence: 1,
+                            kind: "cancelled".into(),
+                            payload: String::new(),
+                        });
+                    }
+                    persist_state(state_path, &state).unwrap();
+                    response()
                 } else {
                     Response {
-                        artifact_metadata: Some(metadata),
+                        accepted: false,
+                        error: Some("unknown_job".into()),
                         ..response()
                     }
                 }
             }
-        }
-        Request::ArtifactWrite {
-            artifact_id,
-            offset,
-            total_size,
-            sha256,
-            chunk_sha256,
-            bytes,
-        } => write_artifact(
-            &mut artifacts.lock().unwrap(),
-            &peer_id,
-            &artifact_id,
-            offset,
-            ArtifactWrite {
+            Request::ArtifactRegister {
+                job_id,
+                name,
+                media_type,
                 total_size,
-                sha256: &sha256,
-                chunk_sha256: &chunk_sha256,
-                bytes: &bytes,
-            },
-        ),
-        Request::ArtifactRead {
-            artifact_id,
-            offset,
-            length,
-            total_size,
-            sha256,
-        } => read_artifact(
-            &artifacts.lock().unwrap(),
-            &peer_id,
-            &artifact_id,
-            offset,
-            length,
-            total_size,
-            &sha256,
-        ),
-        Request::ArtifactInfo { artifact_id } => {
-            let artifacts = artifacts.lock().unwrap();
-            let Some(entry) = artifacts.entries.get(&artifact_id) else {
-                return write_response(&mut stream, error_response("unknown_artifact"));
-            };
-            if !entry.participants.contains(&peer_id) {
-                error_response("artifact_access_denied")
-            } else if !entry.published {
-                error_response("artifact_not_published")
-            } else {
-                Response {
-                    artifact_metadata: Some(entry.metadata.clone()),
-                    ..response()
+                sha256,
+            } => {
+                let state = state.lock().unwrap();
+                let host_peer = state.job_agents.get(&job_id);
+                if host_peer != Some(&peer_id) {
+                    error_response("artifact_access_denied")
+                } else if total_size == 0
+                    || sha256.len() != 64
+                    || !valid_id(&name)
+                    || media_type.is_empty()
+                {
+                    error_response("invalid_artifact_metadata")
+                } else {
+                    let id = format!(
+                        "{:x}",
+                        Sha256::digest(format!("{job_id}\0{name}\0{sha256}").as_bytes())
+                    );
+                    let mut participants = HashSet::from([peer_id.clone()]);
+                    if let Some(client) = state.job_clients.get(&job_id) {
+                        participants.insert(client.clone());
+                    }
+                    drop(state);
+                    let metadata = NetworkArtifactMetadata {
+                        id: id.clone(),
+                        job_id,
+                        name,
+                        media_type,
+                        total_size,
+                        sha256,
+                    };
+                    let mut artifacts = artifacts.lock().unwrap();
+                    artifacts
+                        .entries
+                        .entry(id)
+                        .and_modify(|entry| entry.participants.extend(participants.clone()))
+                        .or_insert_with(|| NetworkArtifact {
+                            metadata: metadata.clone(),
+                            participants,
+                            confirmed_offset: 0,
+                            published: false,
+                        });
+                    if artifacts.persist().is_err() {
+                        error_response("persistence_failed")
+                    } else {
+                        Response {
+                            artifact_metadata: Some(metadata),
+                            ..response()
+                        }
+                    }
                 }
             }
-        }
-        Request::Lease { operation } => {
-            let mut state = state.lock().unwrap();
-            let mut leases = leases.lock().unwrap();
-            let response = lease(
-                operation,
+            Request::ArtifactWrite {
+                artifact_id,
+                offset,
+                total_size,
+                sha256,
+                chunk_sha256,
+                bytes,
+            } => write_artifact(
+                &mut artifacts.lock().unwrap(),
                 &peer_id,
-                &agent_peers,
-                &mut state.device_peers,
-                &mut leases,
-                transport,
-            );
-            if leases.persist().is_err() || persist_state(state_path, &state).is_err() {
-                error_response("persistence_failed")
-            } else {
-                response
+                &artifact_id,
+                offset,
+                ArtifactWrite {
+                    total_size,
+                    sha256: &sha256,
+                    chunk_sha256: &chunk_sha256,
+                    bytes: &bytes,
+                },
+            ),
+            Request::ArtifactRead {
+                artifact_id,
+                offset,
+                length,
+                total_size,
+                sha256,
+            } => read_artifact(
+                &artifacts.lock().unwrap(),
+                &peer_id,
+                &artifact_id,
+                offset,
+                length,
+                total_size,
+                &sha256,
+            ),
+            Request::ArtifactInfo { artifact_id } => {
+                let artifacts = artifacts.lock().unwrap();
+                let Some(entry) = artifacts.entries.get(&artifact_id) else {
+                    return write_response(&mut stream, error_response("unknown_artifact"));
+                };
+                if !entry.participants.contains(&peer_id) {
+                    error_response("artifact_access_denied")
+                } else if !entry.published {
+                    error_response("artifact_not_published")
+                } else {
+                    Response {
+                        artifact_metadata: Some(entry.metadata.clone()),
+                        ..response()
+                    }
+                }
             }
+            Request::Lease { operation } => {
+                let mut state = state.lock().unwrap();
+                let mut leases = leases.lock().unwrap();
+                let response = lease(
+                    operation,
+                    &peer_id,
+                    &agent_peers,
+                    &mut state.device_peers,
+                    &mut leases,
+                    transport,
+                );
+                if leases.persist().is_err() || persist_state(state_path, &state).is_err() {
+                    error_response("persistence_failed")
+                } else {
+                    response
+                }
+            }
+        };
+        let _ = serde_json::to_writer(&mut stream, &response);
+        if stream.write_all(b"\n").is_err() || stream.flush().is_err() {
+            return;
         }
-    };
-    let _ = serde_json::to_writer(&mut stream, &response);
-    let _ = stream.write_all(b"\n");
+    }
 }
 
 fn read_only_during_recovery(request: &Request) -> bool {

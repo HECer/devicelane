@@ -1,9 +1,14 @@
 use device_development_mesh::controller_session::{
-    ControllerSessionAssertion, MeshApprovalAssertion, issue_controller_session,
-    sign_mesh_access_claim, verify_controller_session,
+    ControllerSessionAssertion, ControllerSessionReplayCache, MeshApprovalAssertion,
+    issue_controller_session, sign_mesh_access_claim, verify_and_consume_controller_session,
+    verify_controller_session,
 };
 use device_development_mesh::dashboard::{
-    audit::AuditFilter, event_log::EventRead, policy::AccessRequest, service::AdminMutation, *,
+    audit::AuditFilter,
+    event_log::EventRead,
+    policy::{AccessRequest, RemoteOperationGrant},
+    service::AdminMutation,
+    *,
 };
 use device_development_mesh::local_ipc::{
     LocalEndpoint, LocalProtocolVersion, LocalRequest, LocalResponse, local_endpoint,
@@ -12,6 +17,7 @@ use device_development_mesh::local_ipc::{
 use device_development_mesh::network_processes::{
     Request as MeshRequest, Response as MeshResponse,
 };
+use device_development_mesh::remote_apple_protocol::AppleOperation;
 use device_development_mesh::secure_transport::SecureTransport;
 use std::{
     collections::BTreeMap,
@@ -139,19 +145,52 @@ fn access(p: &P) -> Result<AccessRequest, String> {
     if r.is_empty() {
         return Err("at least one --resource is required".into());
     }
+    let device_id = one(p, "--device-id")?
+        .map(|x| id(x, DeviceId::parse))
+        .transpose()?;
+    let operation = id(req(p, "--operation")?, OperationId::parse)?;
+    let remote_operation = remote_operation(p, &operation, device_id.clone())?;
     Ok(AccessRequest {
         activity_id: id(req(p, "--activity-id")?, ActivityId::parse)?,
         principal_id: id(req(p, "--principal-id")?, PrincipalId::parse)?,
         source_host_id: id(req(p, "--source-host-id")?, HostId::parse)?,
         target_host_id: id(req(p, "--target-host-id")?, HostId::parse)?,
-        device_id: one(p, "--device-id")?
-            .map(|x| id(x, DeviceId::parse))
-            .transpose()?,
-        operation: id(req(p, "--operation")?, OperationId::parse)?,
+        device_id,
+        operation,
         resources: r,
+        remote_operation,
         physical_device: p.f.contains_key("--physical-device"),
         user_present: p.f.contains_key("--user-present"),
     })
+}
+
+fn remote_operation(
+    parsed: &P,
+    operation: &OperationId,
+    device_id: Option<DeviceId>,
+) -> Result<Option<RemoteOperationGrant>, String> {
+    let remote_flags_present = [
+        "--remote-request-id",
+        "--remote-workspace-path",
+        "--remote-app-path",
+    ]
+    .iter()
+    .any(|flag| parsed.f.contains_key(*flag));
+    if operation.as_str() != "apple.install_app" {
+        return (!remote_flags_present)
+            .then_some(None)
+            .ok_or_else(|| "remote_operation_mismatch".to_owned());
+    }
+    let grant = RemoteOperationGrant::new(
+        req(parsed, "--remote-request-id")?,
+        req(parsed, "--remote-workspace-path")?,
+        device_id,
+        AppleOperation::InstallApp {
+            app_path: req(parsed, "--remote-app-path")?.to_owned(),
+        },
+    )
+    .map_err(|_| "invalid_remote_operation".to_owned())?;
+    Ok(Some(grant))
 }
 fn filter(p: &P) -> Result<AuditFilter, String> {
     Ok(AuditFilter {
@@ -941,16 +980,20 @@ fn mesh_approval_command(args: &[String]) -> Result<(), String> {
     let peer_id = transport
         .identity_id()
         .map_err(|_| "mesh_identity_invalid".to_owned())?;
+    let device_id = one(&parsed, "--device-id")?
+        .map(|value| id(value, DeviceId::parse))
+        .transpose()?;
+    let operation = id(req(&parsed, "--operation")?, OperationId::parse)?;
+    let remote_operation = remote_operation(&parsed, &operation, device_id.clone())?;
     let access = AccessRequest {
         activity_id: id(req(&parsed, "--activity-id")?, ActivityId::parse)?,
         principal_id: id(&peer_id, PrincipalId::parse)?,
         source_host_id: id(&peer_id, HostId::parse)?,
         target_host_id: id(req(&parsed, "--target-host-id")?, HostId::parse)?,
-        device_id: one(&parsed, "--device-id")?
-            .map(|value| id(value, DeviceId::parse))
-            .transpose()?,
-        operation: id(req(&parsed, "--operation")?, OperationId::parse)?,
+        device_id,
+        operation,
         resources: resources(&parsed)?,
+        remote_operation,
         physical_device: parsed.f.contains_key("--physical-device"),
         user_present: parsed.f.contains_key("--user-present"),
     };
@@ -1064,6 +1107,29 @@ fn controller_session_command(args: &[String]) -> Result<(), String> {
             .map_err(|error| format!("controller_session_verification_failed: {error:?}"))?;
             json(&verified).map_err(|error| error.to_string())
         }
-        _ => Err("controller-session requires issue or verify".into()),
+        "consume" => {
+            let assertion: ControllerSessionAssertion = serde_json::from_slice(
+                &fs::read(controller_session_value(args, "--assertion")?)
+                    .map_err(|_| "controller_session_assertion_unreadable".to_owned())?,
+            )
+            .map_err(|_| "controller_session_assertion_invalid".to_owned())?;
+            let cache = ControllerSessionReplayCache::open(
+                controller_session_value(args, "--replay-cache")?,
+                4_096,
+            )
+            .map_err(|error| format!("controller_session_replay_cache_failed: {error:?}"))?;
+            let verified = verify_and_consume_controller_session(
+                &identity,
+                &cache,
+                &assertion,
+                endpoint,
+                controller_session_value(args, "--controller-peer-id")?,
+                challenge,
+                now_ms,
+            )
+            .map_err(|error| format!("controller_session_verification_failed: {error:?}"))?;
+            json(&verified).map_err(|error| error.to_string())
+        }
+        _ => Err("controller-session requires issue, verify, or consume".into()),
     }
 }

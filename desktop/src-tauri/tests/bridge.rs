@@ -1,7 +1,7 @@
 use device_development_mesh::controller_session::current_os_principal;
 use device_development_mesh::dashboard::audit::{AuditFilter, ExportManifest, ExportSignature};
 use device_development_mesh::dashboard::event_log::EventRead;
-use device_development_mesh::dashboard::policy::AccessRequest;
+use device_development_mesh::dashboard::policy::{AccessRequest, RemoteOperationGrant};
 use device_development_mesh::dashboard::{
     ActivityId, ApprovalDecision, AuditRecord, AuditResult, DashboardScope, DashboardSnapshot,
     EventCursor, HostId, MetricValue, OperationId, PolicyEffect, PrincipalId, ResourceClass,
@@ -11,6 +11,7 @@ use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, LocalEndpoint, LocalProtocolVersion, LocalRequest,
     LocalResponse, local_endpoint, send_local_request,
 };
+use device_development_mesh::remote_apple_protocol::AppleOperation;
 use devicelane_desktop::{
     DaemonTransport, DesktopBridge, JavaScriptWire, RepairProcess, WireEventCursor, repair_spec,
     run_smoke_probe_with_transport, sha256_file, validate_bundle_asset,
@@ -314,6 +315,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
                 ),
                 operation: OperationId::parse("workspace.read").unwrap(),
                 resources: vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease],
+                remote_operation: None,
                 physical_device: true,
                 user_present: true,
             },
@@ -328,14 +330,30 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     wait_for_mesh_host(&registry_address, &service_identity, "mac-agent");
 
     let denied_activity_id = "real-windows-to-mac-denied";
+    let denied_device = device_development_mesh::dashboard::DeviceId::parse("iphone-1").unwrap();
     let denied_access = AccessRequest {
         activity_id: ActivityId::parse(denied_activity_id).unwrap(),
         principal_id: PrincipalId::parse(current_os_principal().unwrap()).unwrap(),
         source_host_id: HostId::parse("windows-client").unwrap(),
         target_host_id: HostId::parse("mac-agent").unwrap(),
-        device_id: Some(device_development_mesh::dashboard::DeviceId::parse("iphone-1").unwrap()),
-        operation: OperationId::parse("workspace.read").unwrap(),
-        resources: vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease],
+        device_id: Some(denied_device.clone()),
+        operation: OperationId::parse("apple.install_app").unwrap(),
+        resources: vec![
+            ResourceClass::WorkspaceRead,
+            ResourceClass::DeviceLease,
+            ResourceClass::ApplicationInstall,
+        ],
+        remote_operation: Some(
+            RemoteOperationGrant::new(
+                "request-denied",
+                "project",
+                Some(denied_device),
+                AppleOperation::InstallApp {
+                    app_path: "build/Mesh.app".into(),
+                },
+            )
+            .unwrap(),
+        ),
         physical_device: true,
         user_present: true,
     };
@@ -357,11 +375,19 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
             "--device-id",
             "iphone-1",
             "--operation",
-            "workspace.read",
+            "apple.install_app",
             "--resource",
             "workspace_read",
             "--resource",
             "device_lease",
+            "--resource",
+            "application_install",
+            "--remote-request-id",
+            "request-denied",
+            "--remote-workspace-path",
+            "project",
+            "--remote-app-path",
+            "build/Mesh.app",
             "--physical-device",
             "--user-present",
         ],
@@ -380,35 +406,86 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     else {
         panic!("first approval request did not return a challenge")
     };
-    assert!(matches!(
-        send_local_request(
-            &endpoint,
-            &LocalRequest::DecideApproval {
-                version: LocalProtocolVersion::CURRENT,
-                nonce,
-                access: denied_access,
-                decision: ApprovalDecision::DenyOnce,
-            }
-        )
-        .unwrap(),
-        LocalResponse::ApprovalDecided {
+    let denied_digest = denied_access
+        .remote_operation
+        .as_ref()
+        .unwrap()
+        .canonical_sha256()
+        .to_owned();
+    let LocalResponse::PendingApprovals(pending) = send_local_request(
+        &endpoint,
+        &LocalRequest::PendingApprovals {
+            version: LocalProtocolVersion::CURRENT,
+        },
+    )
+    .unwrap() else {
+        panic!("pending approval snapshot missing")
+    };
+    let pending_denial = pending
+        .iter()
+        .find(|item| item.activity_id.as_str() == denied_activity_id)
+        .unwrap();
+    assert_eq!(
+        pending_denial.remote_operation_sha256.as_deref(),
+        Some(denied_digest.as_str())
+    );
+    assert_eq!(pending_denial.operation, denied_access.operation);
+    assert_eq!(pending_denial.resources, denied_access.resources);
+    let denied_decision = send_local_request(
+        &endpoint,
+        &LocalRequest::DecideApproval {
+            version: LocalProtocolVersion::CURRENT,
+            nonce,
+            access: denied_access.clone(),
             decision: ApprovalDecision::DenyOnce,
-            ..
-        }
-    ));
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            denied_decision,
+            LocalResponse::ApprovalDecided {
+                decision: ApprovalDecision::DenyOnce,
+                ..
+            }
+        ),
+        "unexpected denied decision response: {denied_decision:?}"
+    );
 
     let activity_id = "real-windows-to-mac-activity";
+    let execution_device = device_development_mesh::dashboard::DeviceId::parse("iphone-1").unwrap();
     let access = AccessRequest {
         activity_id: ActivityId::parse(activity_id).unwrap(),
         principal_id: PrincipalId::parse(current_os_principal().unwrap()).unwrap(),
         source_host_id: HostId::parse("windows-client").unwrap(),
         target_host_id: HostId::parse("mac-agent").unwrap(),
-        device_id: Some(device_development_mesh::dashboard::DeviceId::parse("iphone-1").unwrap()),
-        operation: OperationId::parse("workspace.read").unwrap(),
-        resources: vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease],
+        device_id: Some(execution_device.clone()),
+        operation: OperationId::parse("apple.install_app").unwrap(),
+        resources: vec![
+            ResourceClass::WorkspaceRead,
+            ResourceClass::DeviceLease,
+            ResourceClass::ApplicationInstall,
+        ],
+        remote_operation: Some(
+            RemoteOperationGrant::new(
+                "request-1",
+                "project",
+                Some(execution_device),
+                AppleOperation::InstallApp {
+                    app_path: "build/Mesh.app".into(),
+                },
+            )
+            .unwrap(),
+        ),
         physical_device: true,
         user_present: true,
     };
+    let operation_digest = access
+        .remote_operation
+        .as_ref()
+        .unwrap()
+        .canonical_sha256()
+        .to_owned();
     let (resubmitted_pid, created) = devicelane_cli_process(
         &endpoint_text(&endpoint),
         &[
@@ -427,11 +504,19 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
             "--device-id",
             "iphone-1",
             "--operation",
-            "workspace.read",
+            "apple.install_app",
             "--resource",
             "workspace_read",
             "--resource",
             "device_lease",
+            "--resource",
+            "application_install",
+            "--remote-request-id",
+            "request-1",
+            "--remote-workspace-path",
+            "project",
+            "--remote-app-path",
+            "build/Mesh.app",
             "--physical-device",
             "--user-present",
         ],
@@ -455,7 +540,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
         &LocalRequest::DecideApproval {
             version: LocalProtocolVersion::CURRENT,
             nonce,
-            access,
+            access: access.clone(),
             decision: ApprovalDecision::AllowOnce,
         },
     )
@@ -492,7 +577,15 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
         .unwrap();
     assert_eq!(
         activity.resources,
-        vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease]
+        vec![
+            ResourceClass::WorkspaceRead,
+            ResourceClass::DeviceLease,
+            ResourceClass::ApplicationInstall,
+        ]
+    );
+    assert_eq!(
+        activity.remote_operation_sha256.as_deref(),
+        Some(operation_digest.as_str())
     );
     let occupancy_edges: std::collections::BTreeSet<_> = activity
         .resources
@@ -505,6 +598,10 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
         std::collections::BTreeSet::from([
             (activity.activity_id.clone(), ResourceClass::WorkspaceRead),
             (activity.activity_id.clone(), ResourceClass::DeviceLease),
+            (
+                activity.activity_id.clone(),
+                ResourceClass::ApplicationInstall
+            ),
         ]),
         "the running operation must expose one explicit activity-to-resource occupancy edge per resource"
     );
@@ -696,6 +793,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
         "principal_id": terminal_audit.principal_id.clone(),
         "source_host_id": terminal_audit.source_host_id.clone(),
         "target_host_id": terminal_audit.target_host_id.clone(),
+        "device_id": terminal_audit.device_id.clone(),
         "operation": terminal_audit.operation.clone(),
         "resources": terminal_audit.resources.clone(),
         "decision": terminal_audit.decision,
@@ -705,10 +803,11 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     assert_eq!(canonical["principal_id"], current_os_principal().unwrap());
     assert_eq!(canonical["source_host_id"], "windows-client");
     assert_eq!(canonical["target_host_id"], "mac-agent");
-    assert_eq!(canonical["operation"], "workspace.read");
+    assert_eq!(canonical["device_id"], "iphone-1");
+    assert_eq!(canonical["operation"], "apple.install_app");
     assert_eq!(
         canonical["resources"],
-        serde_json::json!(["workspace_read", "device_lease"])
+        serde_json::json!(["workspace_read", "device_lease", "application_install"])
     );
     assert_eq!(canonical["decision"], "allow");
     assert_eq!(canonical["terminal"], "succeeded");

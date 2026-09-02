@@ -2,7 +2,9 @@ use device_development_mesh::dashboard::audit::{
     AuditFilter, AuditStore, Redactor, RetentionPolicy,
 };
 use device_development_mesh::dashboard::event_log::{EventJournal, EventRead};
-use device_development_mesh::dashboard::policy::{AccessRequest, PolicyEngine};
+use device_development_mesh::dashboard::policy::{
+    AccessRequest, PolicyEngine, RemoteOperationGrant,
+};
 use device_development_mesh::dashboard::service::DashboardService;
 use device_development_mesh::dashboard::topology::TopologyProjector;
 use device_development_mesh::dashboard::{
@@ -19,6 +21,7 @@ use device_development_mesh::network_processes::{
     DeviceSnapshot, HostSnapshot, LeaseGrant, LeaseRequest, NetworkEvent, Request as MeshRequest,
     Response as MeshResponse,
 };
+use device_development_mesh::remote_apple_protocol::AppleOperation;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -367,14 +370,31 @@ fn terminal_audit(
 }
 
 fn approved_access(endpoint: &LocalEndpoint, id: &str) -> AccessRequest {
+    let request_id = id.replacen("failure-", "request-", 1);
+    let device = DeviceId::parse("simulator-1").unwrap();
     let access = AccessRequest {
         activity_id: ActivityId::parse(id).unwrap(),
         principal_id: PrincipalId::parse("windows-agent").unwrap(),
         source_host_id: HostId::parse("windows-client").unwrap(),
         target_host_id: HostId::parse("mac-agent").unwrap(),
-        device_id: Some(DeviceId::parse("simulator-1").unwrap()),
-        operation: OperationId::parse("apple.install-app").unwrap(),
-        resources: vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease],
+        device_id: Some(device.clone()),
+        operation: OperationId::parse("apple.install_app").unwrap(),
+        resources: vec![
+            ResourceClass::WorkspaceRead,
+            ResourceClass::DeviceLease,
+            ResourceClass::ApplicationInstall,
+        ],
+        remote_operation: Some(
+            RemoteOperationGrant::new(
+                request_id,
+                "project",
+                Some(device),
+                AppleOperation::InstallApp {
+                    app_path: "build/App.app".into(),
+                },
+            )
+            .unwrap(),
+        ),
         physical_device: false,
         user_present: true,
     };
@@ -403,6 +423,64 @@ fn approved_access(endpoint: &LocalEndpoint, id: &str) -> AccessRequest {
         LocalResponse::ApprovalDecided { .. }
     ));
     access
+}
+
+#[test]
+fn worker_rejects_an_install_that_does_not_exactly_match_the_approved_remote_operation() {
+    let fixture = fixture(ExternalFailureCase::CancellationRace);
+    let device = DeviceId::parse("simulator-1").unwrap();
+    let access = approved_access_for(
+        &fixture.endpoint,
+        AccessRequest {
+            activity_id: ActivityId::parse("exact-install-grant").unwrap(),
+            principal_id: PrincipalId::parse("windows-agent").unwrap(),
+            source_host_id: HostId::parse("windows-client").unwrap(),
+            target_host_id: HostId::parse("mac-agent").unwrap(),
+            device_id: Some(device.clone()),
+            operation: OperationId::parse("apple.install_app").unwrap(),
+            resources: vec![
+                ResourceClass::WorkspaceRead,
+                ResourceClass::DeviceLease,
+                ResourceClass::ApplicationInstall,
+            ],
+            remote_operation: Some(
+                RemoteOperationGrant::new(
+                    "request-exact",
+                    "project",
+                    Some(device),
+                    AppleOperation::InstallApp {
+                        app_path: "build/App.app".into(),
+                    },
+                )
+                .unwrap(),
+            ),
+            physical_device: false,
+            user_present: true,
+        },
+    );
+
+    assert!(matches!(
+        send_local_request(
+            &fixture.endpoint,
+            &LocalRequest::StartRemoteExecution {
+                version: LocalProtocolVersion::CURRENT,
+                activity_id: access.activity_id,
+                workspace_path: "project".into(),
+                request_id: "request-exact".into(),
+                app_path: "build/Other.app".into(),
+            }
+        )
+        .unwrap(),
+        LocalResponse::Error { code, .. } if code == "permission_denied"
+    ));
+    assert!(
+        !fixture
+            .mesh_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "lease_acquire")
+    );
 }
 
 #[test]
@@ -498,6 +576,41 @@ fn external_failure_matrix_terminates_the_real_worker_with_stable_identity_and_a
             .find(|record| record.activity_id.as_ref() == Some(&access.activity_id))
             .expect("terminal failure audit missing");
         assert_eq!(audit.redacted_message.unwrap().code, case.expected());
+        let calls = fixture.mesh_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "lease_release")
+                .count(),
+            1,
+            "{case:?} must release the acquired lease exactly once: {calls:?}"
+        );
+        let dispatched = !matches!(
+            case,
+            ExternalFailureCase::StaleLease | ExternalFailureCase::OldAgentOptionalMessage
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "apple_cancel")
+                .count(),
+            usize::from(dispatched),
+            "{case:?} must cancel exactly when AppleRun was dispatched: {calls:?}"
+        );
+        if dispatched {
+            let cancel = calls
+                .iter()
+                .position(|call| call == "apple_cancel")
+                .unwrap();
+            let release = calls
+                .iter()
+                .position(|call| call == "lease_release")
+                .unwrap();
+            assert!(
+                cancel < release,
+                "remote cancel must precede lease release: {calls:?}"
+            );
+        }
     }
 }
 
@@ -512,6 +625,7 @@ fn offline_target_terminates_before_approval_with_the_requested_activity_id() {
         device_id: Some(DeviceId::parse("simulator-1").unwrap()),
         operation: OperationId::parse("apple.install-app").unwrap(),
         resources: vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease],
+        remote_operation: None,
         physical_device: false,
         user_present: true,
     };
@@ -563,6 +677,7 @@ fn expired_approval_terminates_the_same_activity_with_actionable_audit() {
         device_id: Some(DeviceId::parse("simulator-1").unwrap()),
         operation: OperationId::parse("apple.install-app").unwrap(),
         resources: vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease],
+        remote_operation: None,
         physical_device: false,
         user_present: true,
     };
@@ -640,6 +755,7 @@ fn deny_override_records_a_terminal_activity_in_the_production_approval_path() {
         device_id: Some(DeviceId::parse("simulator-1").unwrap()),
         operation: OperationId::parse("apple.install-app").unwrap(),
         resources: vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease],
+        remote_operation: None,
         physical_device: false,
         user_present: true,
     };
@@ -681,7 +797,7 @@ fn cancellation_race_has_one_terminal_winner_and_preserves_activity_id() {
                 version: LocalProtocolVersion::CURRENT,
                 activity_id: access.activity_id.clone(),
                 workspace_path: "project".into(),
-                request_id: "request-cancel-race".into(),
+                request_id: "request-cancellation-race".into(),
                 app_path: "build/App.app".into(),
             }
         )
@@ -706,6 +822,7 @@ fn cancellation_race_has_one_terminal_winner_and_preserves_activity_id() {
         device_id: None,
         operation: OperationId::parse("devicelane.activity.cancel").unwrap(),
         resources: vec![ResourceClass::DeviceLaneService],
+        remote_operation: None,
         physical_device: false,
         user_present: true,
     };

@@ -18,6 +18,7 @@ fn request(operation: &str, resources: Vec<ResourceClass>) -> AccessRequest {
         device_id: None,
         operation: OperationId::parse(operation).unwrap(),
         resources,
+        remote_operation: None,
         physical_device: false,
         user_present: false,
     }

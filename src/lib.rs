@@ -4,6 +4,10 @@ pub mod controller_session {
     use crate::secure_transport::{SecureTransport, TransportError};
     use rand::{RngCore, rngs::OsRng};
     use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(deny_unknown_fields)]
@@ -44,6 +48,166 @@ pub mod controller_session {
         ControllerPeerMismatch,
         ChallengeMismatch,
         Expired,
+        ReplayDetected,
+        ReplayCacheUnavailable,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct ControllerSessionReplayCache {
+        path: PathBuf,
+        max_entries: usize,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReplayState {
+        version: u16,
+        entries: Vec<ReplayEntry>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReplayEntry {
+        key_sha256: String,
+        expires_at_ms: u64,
+    }
+
+    impl ControllerSessionReplayCache {
+        pub fn open(
+            path: impl AsRef<Path>,
+            max_entries: usize,
+        ) -> Result<Self, ControllerSessionError> {
+            let path = path.as_ref().to_owned();
+            if max_entries == 0 || max_entries > 65_536 || path.file_name().is_none() {
+                return Err(ControllerSessionError::InvalidInput);
+            }
+            let parent = path.parent().ok_or(ControllerSessionError::InvalidInput)?;
+            fs::create_dir_all(parent)
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?;
+            Ok(Self { path, max_entries })
+        }
+
+        fn consume(
+            &self,
+            session_id: &str,
+            challenge: &str,
+            expires_at_ms: u64,
+            now_ms: u64,
+        ) -> Result<(), ControllerSessionError> {
+            use fs2::FileExt;
+            let lock_path = self.path.with_extension("lock");
+            let lock = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?;
+            lock.lock_exclusive()
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?;
+            let result = self.consume_locked(session_id, challenge, expires_at_ms, now_ms);
+            let _ = FileExt::unlock(&lock);
+            result
+        }
+
+        fn consume_locked(
+            &self,
+            session_id: &str,
+            challenge: &str,
+            expires_at_ms: u64,
+            now_ms: u64,
+        ) -> Result<(), ControllerSessionError> {
+            let mut state = if self.path.exists() {
+                serde_json::from_slice::<ReplayState>(
+                    &fs::read(&self.path)
+                        .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?,
+                )
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?
+            } else {
+                ReplayState {
+                    version: 1,
+                    entries: Vec::new(),
+                }
+            };
+            if state.version != 1 {
+                return Err(ControllerSessionError::ReplayCacheUnavailable);
+            }
+            state.entries.retain(|entry| entry.expires_at_ms >= now_ms);
+            let key_sha256 = replay_key(session_id, challenge);
+            if state
+                .entries
+                .iter()
+                .any(|entry| entry.key_sha256 == key_sha256)
+            {
+                return Err(ControllerSessionError::ReplayDetected);
+            }
+            if state.entries.len() >= self.max_entries {
+                return Err(ControllerSessionError::ReplayCacheUnavailable);
+            }
+            state.entries.push(ReplayEntry {
+                key_sha256,
+                expires_at_ms,
+            });
+            let encoded = serde_json::to_vec(&state)
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?;
+            let temp = self
+                .path
+                .with_extension(format!("tmp-{}", std::process::id()));
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?;
+            let write_result = output.write_all(&encoded).and_then(|_| output.sync_all());
+            if write_result.is_err() {
+                let _ = fs::remove_file(&temp);
+                return Err(ControllerSessionError::ReplayCacheUnavailable);
+            }
+            drop(output);
+            if atomic_replace(&temp, &self.path).is_err() {
+                let _ = fs::remove_file(&temp);
+                return Err(ControllerSessionError::ReplayCacheUnavailable);
+            }
+            Ok(())
+        }
+    }
+
+    fn replay_key(session_id: &str, challenge: &str) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"devicelane.controller-session.replay.v1\0");
+        digest.update(session_id.as_bytes());
+        digest.update([0]);
+        digest.update(challenge.as_bytes());
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[cfg(not(windows))]
+    fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+        fs::rename(source, target)
+    }
+
+    #[cfg(windows)]
+    fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+        let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+        let moved = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        (moved != 0)
+            .then_some(())
+            .ok_or_else(std::io::Error::last_os_error)
     }
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -267,6 +431,32 @@ pub mod controller_session {
             session_id: payload.session_id.clone(),
             expires_at_ms: payload.expires_at_ms,
         })
+    }
+
+    pub fn verify_and_consume_controller_session(
+        verifier: &SecureTransport,
+        cache: &ControllerSessionReplayCache,
+        assertion: &ControllerSessionAssertion,
+        expected_endpoint: &str,
+        expected_peer_id: &str,
+        expected_challenge: &str,
+        now_ms: u64,
+    ) -> Result<VerifiedControllerSession, ControllerSessionError> {
+        let verified = verify_controller_session(
+            verifier,
+            assertion,
+            expected_endpoint,
+            expected_peer_id,
+            expected_challenge,
+            now_ms,
+        )?;
+        cache.consume(
+            &verified.session_id,
+            expected_challenge,
+            verified.expires_at_ms,
+            now_ms,
+        )?;
+        Ok(verified)
     }
 }
 
@@ -1044,6 +1234,10 @@ pub mod secure_transport {
             signature_bytes: &[u8],
         ) -> Result<(), TransportError> {
             use x509_parser::prelude::FromDer;
+            if self.revoked.contains(peer_id) {
+                self.reject("revoked_peer");
+                return Err(TransportError::RevokedPeer);
+            }
             let certificate = self
                 .trusted
                 .get(peer_id)

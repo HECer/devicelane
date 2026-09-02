@@ -122,6 +122,7 @@ fn event(state: ActivityState, sequence: u64, at: u64) -> ActivityEvent {
         device_id: None,
         operation: OperationId::parse("build").unwrap(),
         resources: vec![ResourceClass::WorkspaceRead],
+        remote_operation_sha256: None,
         authorization: Authorization {
             effect: PolicyEffect::Allow,
             rule_id: None,
@@ -202,6 +203,7 @@ fn access(activity: &str) -> AccessRequest {
         device_id: None,
         operation: OperationId::parse("build").unwrap(),
         resources: vec![ResourceClass::WorkspaceRead],
+        remote_operation: None,
         physical_device: false,
         user_present: true,
     }
@@ -548,6 +550,7 @@ fn local_admin_approval_request_is_accepted_but_does_not_authorize_before_decisi
         device_id: None,
         operation: OperationId::parse("devicelane.policy.put").unwrap(),
         resources: vec![ResourceClass::DeviceLanePolicy],
+        remote_operation: None,
         physical_device: false,
         user_present: true,
     };
