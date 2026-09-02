@@ -1,5 +1,5 @@
 use device_development_mesh::dashboard::{
-    audit::AuditFilter, event_log::EventRead, policy::AccessRequest, *,
+    audit::AuditFilter, event_log::EventRead, policy::AccessRequest, service::AdminMutation, *,
 };
 use device_development_mesh::local_ipc::{
     LocalEndpoint, LocalProtocolVersion, LocalRequest, LocalResponse, local_endpoint,
@@ -12,8 +12,8 @@ use std::{
     time::Duration,
 };
 
-const HELP: &str = "DeviceLane unified client\n\nUsage:\n  devicelane status --local [--json] [--endpoint ENDPOINT]\n  devicelane remote-access <pause|resume> --local\n  devicelane diagnostics --local\n  devicelane mesh <status|watch> --local [--scope local|mesh]\n  devicelane activities <list|watch|cancel> --local [--cursor EPOCH:SEQUENCE] [--limit 1..256]\n  devicelane approvals <list|request|decide> --local [typed access options]\n  devicelane policy <list|put|delete> --local [typed rule options]\n  devicelane audit <list|export> --local [filters]\n\nGrant flow:\n  approvals request --activity-id ID --principal-id ID --source-host-id ID --target-host-id ID --operation OP --resource RESOURCE\n  approvals decide --nonce NONCE [same exact access flags] --decision allow_once|allow_and_remember|deny_once|deny_and_block\n  then invoke the exact mutation before the five-minute grant expires.\n\nAdministrative operations: devicelane.policy.put, devicelane.policy.delete, devicelane.activity.cancel.\nResources: workspace_read, workspace_write, artifact_upload, artifact_download, device_lease, application_install, application_launch, debugger, signing, microphone, screen_capture, network_endpoint, device_lane_policy, device_lane_service.";
-const ADMIN_HELP: &str = "Admin grants: devicelane.policy.put -> device_lane_policy; devicelane.policy.delete -> device_lane_policy; devicelane.activity.cancel -> device_lane_service; devicelane.service.pause -> device_lane_service; devicelane.service.resume -> device_lane_service.";
+const HELP: &str = "DeviceLane unified client\n\nUsage:\n  devicelane status --local [--json] [--endpoint ENDPOINT]\n  devicelane remote-access <pause|resume> --local\n  devicelane diagnostics --local\n  devicelane mesh <status|watch> --local [--scope local|mesh]\n  devicelane activities <list|watch|cancel> --local [--cursor EPOCH:SEQUENCE] [--limit 1..256]\n  devicelane approvals <list|request|decide> --local [typed access options]\n  devicelane policy <list|put|delete> --local [typed rule options]\n  devicelane audit <list|export> --local [filters]\n\nGrant flow:\n  approvals request --activity-id ID --principal-id ID --source-host-id ID --target-host-id ID --operation OP --resource RESOURCE\n  approvals decide --nonce NONCE [same exact access flags] --decision allow_once|allow_and_remember|deny_once|deny_and_block\n  Exact policy mutation: approvals request --admin-mutation policy_put [same typed rule flags as policy put]\n  then approvals list, approvals decide --approval-id ID --decision allow_once, and invoke the exact policy put before expiry.\n\nAdministrative operations: devicelane.policy.put, devicelane.policy.delete, devicelane.activity.cancel.\nResources: workspace_read, workspace_write, artifact_upload, artifact_download, device_lease, application_install, application_launch, debugger, signing, microphone, screen_capture, network_endpoint, device_lane_policy, device_lane_service.";
+const ADMIN_HELP: &str = "Admin grants: devicelane.policy.put -> device_lane_policy; devicelane.policy.delete -> device_lane_policy; devicelane.activity.cancel -> device_lane_service; devicelane.service.pause -> device_lane_service; devicelane.service.resume -> device_lane_service. Exact deletion flow: approvals request --admin-mutation policy_delete --rule-id ID --expected-revision REV; approvals list; approvals decide --approval-id ID --decision allow_once; policy delete --rule-id ID --expected-revision REV.";
 
 #[derive(Default)]
 struct P {
@@ -216,6 +216,23 @@ fn rule(p: &P) -> Result<PolicyRule, String> {
     Ok(x)
 }
 
+fn admin_mutation(p: &P) -> Result<AdminMutation, String> {
+    match req(p, "--admin-mutation")? {
+        "policy_put" => {
+            let rule = rule(p)?;
+            Ok(AdminMutation::PolicyPut {
+                expected_revision: rule.revision.saturating_sub(1),
+                rule,
+            })
+        }
+        "policy_delete" => Ok(AdminMutation::PolicyDelete {
+            rule_id: id(req(p, "--rule-id")?, RuleId::parse)?,
+            expected_revision: num(p, "--expected-revision", 0)?,
+        }),
+        value => Err(format!("invalid value for --admin-mutation: {value}")),
+    }
+}
+
 fn reject_foreign_flags(p: &P, command: &[&str]) -> Result<(), String> {
     let allowed: &[&str] = match command {
         ["mesh", _] => &["--scope"],
@@ -228,6 +245,8 @@ fn reject_foreign_flags(p: &P, command: &[&str]) -> Result<(), String> {
         | ["remote-access", _] => &[],
         ["approvals", "request"] => &[
             "--lifetime-ms",
+            "--admin-mutation",
+            "--expected-revision",
             "--activity-id",
             "--principal-id",
             "--source-host-id",
@@ -237,9 +256,19 @@ fn reject_foreign_flags(p: &P, command: &[&str]) -> Result<(), String> {
             "--resource",
             "--physical-device",
             "--user-present",
+            "--rule-id",
+            "--revision",
+            "--effect",
+            "--expires-at-ms",
+            "--require-user-presence",
+            "--match-device-exact",
+            "--match-resources-exact",
+            "--enabled",
+            "--origin",
         ],
         ["approvals", "decide"] => &[
             "--nonce",
+            "--approval-id",
             "--decision",
             "--activity-id",
             "--principal-id",
@@ -268,7 +297,7 @@ fn reject_foreign_flags(p: &P, command: &[&str]) -> Result<(), String> {
             "--enabled",
             "--origin",
         ],
-        ["policy", "delete"] => &["--rule-id"],
+        ["policy", "delete"] => &["--rule-id", "--expected-revision"],
         ["audit", "list"] => &[
             "--from-ms",
             "--through-ms",
@@ -388,25 +417,62 @@ fn parse() -> Result<Option<Args>, String> {
             "pending approvals received",
             Watch::No,
         ),
-        ["approvals", "request"] => (
-            LocalRequest::RequestApproval {
-                version: z,
-                access: access(&p)?,
-                lifetime_ms: num(&p, "--lifetime-ms", 300000)?.min(300000),
-            },
-            "approval requested",
-            Watch::No,
-        ),
-        ["approvals", "decide"] => (
-            LocalRequest::DecideApproval {
-                version: z,
-                nonce: req(&p, "--nonce")?.into(),
-                access: access(&p)?,
-                decision: en(req(&p, "--decision")?, "--decision")?,
-            },
-            "approval decided",
-            Watch::No,
-        ),
+        ["approvals", "request"] => {
+            let lifetime_ms = num(&p, "--lifetime-ms", 300000)?.min(300000);
+            let request = if p.f.contains_key("--admin-mutation") {
+                for incompatible in ["--activity-id", "--physical-device", "--user-present"] {
+                    if p.f.contains_key(incompatible) {
+                        return Err(format!("{incompatible} is not valid with --admin-mutation"));
+                    }
+                }
+                LocalRequest::RequestAdminMutationApproval {
+                    version: z,
+                    mutation: admin_mutation(&p)?,
+                    lifetime_ms,
+                }
+            } else {
+                LocalRequest::RequestApproval {
+                    version: z,
+                    access: access(&p)?,
+                    lifetime_ms,
+                }
+            };
+            (request, "approval requested", Watch::No)
+        }
+        ["approvals", "decide"] => {
+            let decision = en(req(&p, "--decision")?, "--decision")?;
+            let request = if let Some(approval_id) = one(&p, "--approval-id")? {
+                for incompatible in [
+                    "--nonce",
+                    "--activity-id",
+                    "--principal-id",
+                    "--source-host-id",
+                    "--target-host-id",
+                    "--device-id",
+                    "--operation",
+                    "--resource",
+                    "--physical-device",
+                    "--user-present",
+                ] {
+                    if p.f.contains_key(incompatible) {
+                        return Err(format!("{incompatible} is not valid with --approval-id"));
+                    }
+                }
+                LocalRequest::DecidePendingApproval {
+                    version: z,
+                    approval_id: id(approval_id, ApprovalId::parse)?,
+                    decision,
+                }
+            } else {
+                LocalRequest::DecideApproval {
+                    version: z,
+                    nonce: req(&p, "--nonce")?.into(),
+                    access: access(&p)?,
+                    decision,
+                }
+            };
+            (request, "approval decided", Watch::No)
+        }
         ["policy", "list"] => (
             LocalRequest::PolicyRules { version: z },
             "policy rules received",
@@ -420,14 +486,21 @@ fn parse() -> Result<Option<Args>, String> {
             "policy rule stored",
             Watch::No,
         ),
-        ["policy", "delete"] => (
-            LocalRequest::DeletePolicyRule {
-                version: z,
-                rule_id: id(req(&p, "--rule-id")?, RuleId::parse)?,
-            },
-            "policy rule deleted",
-            Watch::No,
-        ),
+        ["policy", "delete"] => {
+            let rule_id = id(req(&p, "--rule-id")?, RuleId::parse)?;
+            let request = match one(&p, "--expected-revision")? {
+                Some(_) => LocalRequest::DeletePolicyRuleIfRevision {
+                    version: z,
+                    rule_id,
+                    expected_revision: num(&p, "--expected-revision", 0)?,
+                },
+                None => LocalRequest::DeletePolicyRule {
+                    version: z,
+                    rule_id,
+                },
+            };
+            (request, "policy rule deleted", Watch::No)
+        }
         ["audit", "list"] => (
             LocalRequest::AuditQuery {
                 version: z,

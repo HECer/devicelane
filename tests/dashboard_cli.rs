@@ -510,19 +510,17 @@ fn real_daemon_queries_match_direct_ipc_and_exact_grant_enables_mutation() {
             "request",
             "--local",
             "--json",
-            "--activity-id",
-            "cli-policy-grant",
-            "--principal-id",
-            "local-user",
-            "--source-host-id",
-            "identity.json",
-            "--target-host-id",
-            "identity.json",
+            "--admin-mutation",
+            "policy_put",
+            "--rule-id",
+            "cli-rule",
+            "--effect",
+            "deny",
             "--operation",
-            "devicelane.policy.put",
+            "build",
             "--resource",
-            "device_lane_policy",
-            "--user-present",
+            "workspace_write",
+            "--enabled",
         ],
     );
     assert!(
@@ -558,31 +556,29 @@ fn real_daemon_queries_match_direct_ipc_and_exact_grant_enables_mutation() {
         status.success(),
         "broken pipe should terminate cleanly without acknowledging unseen events"
     );
-    let LocalResponse::ApprovalCreated { nonce, .. } = created else {
+    let LocalResponse::ApprovalCreated { .. } = created else {
         panic!("approval not created")
     };
-    let mut decide = vec![
+    let pending = cli_endpoint(&endpoint_text, &["approvals", "list", "--local", "--json"]);
+    let LocalResponse::PendingApprovals(pending) = serde_json::from_slice(&pending.stdout).unwrap()
+    else {
+        panic!("pending approvals not returned")
+    };
+    let approval_id = pending
+        .iter()
+        .find(|approval| approval.operation.as_str() == "devicelane.policy.put")
+        .expect("exact policy mutation approval")
+        .id
+        .as_str();
+    let decide = vec![
         "approvals",
         "decide",
         "--local",
         "--json",
-        "--nonce",
-        &nonce,
+        "--approval-id",
+        approval_id,
         "--decision",
         "allow_once",
-        "--activity-id",
-        "cli-policy-grant",
-        "--principal-id",
-        "local-user",
-        "--source-host-id",
-        "identity.json",
-        "--target-host-id",
-        "identity.json",
-        "--operation",
-        "devicelane.policy.put",
-        "--resource",
-        "device_lane_policy",
-        "--user-present",
     ];
     let decided = cli_endpoint(&endpoint_text, &decide);
     assert!(
@@ -590,7 +586,6 @@ fn real_daemon_queries_match_direct_ipc_and_exact_grant_enables_mutation() {
         "{}",
         String::from_utf8_lossy(&decided.stderr)
     );
-    decide.clear();
     let put = cli_endpoint(
         &endpoint_text,
         &[
@@ -641,12 +636,47 @@ fn real_daemon_queries_match_direct_ipc_and_exact_grant_enables_mutation() {
         "{}",
         String::from_utf8_lossy(&cancelled.stderr)
     );
-    grant_once(
+    let delete_approval = cli_endpoint(
         &endpoint_text,
-        "cli-delete-grant",
-        "devicelane.policy.delete",
-        "device_lane_policy",
+        &[
+            "approvals",
+            "request",
+            "--local",
+            "--json",
+            "--admin-mutation",
+            "policy_delete",
+            "--rule-id",
+            "cli-rule",
+            "--expected-revision",
+            "1",
+        ],
     );
+    assert!(delete_approval.status.success());
+    let pending = cli_endpoint(&endpoint_text, &["approvals", "list", "--local", "--json"]);
+    let LocalResponse::PendingApprovals(pending) = serde_json::from_slice(&pending.stdout).unwrap()
+    else {
+        panic!("pending delete approval not returned")
+    };
+    let delete_approval_id = pending
+        .iter()
+        .find(|approval| approval.operation.as_str() == "devicelane.policy.delete")
+        .unwrap()
+        .id
+        .as_str();
+    let delete_decision = cli_endpoint(
+        &endpoint_text,
+        &[
+            "approvals",
+            "decide",
+            "--local",
+            "--json",
+            "--approval-id",
+            delete_approval_id,
+            "--decision",
+            "allow_once",
+        ],
+    );
+    assert!(delete_decision.status.success());
     let deleted = cli_endpoint(
         &endpoint_text,
         &[
@@ -656,6 +686,8 @@ fn real_daemon_queries_match_direct_ipc_and_exact_grant_enables_mutation() {
             "--json",
             "--rule-id",
             "cli-rule",
+            "--expected-revision",
+            "1",
         ],
     );
     assert!(
