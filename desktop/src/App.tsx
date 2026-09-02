@@ -1,6 +1,11 @@
-import { useEffect, useState } from "react";
-import type { DaemonClient, DaemonSnapshot } from "./api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ActivityEvent, DaemonClient, DaemonSnapshot, DashboardScope, DashboardSnapshot, EventCursor } from "./api";
 import { tauriDaemonClient } from "./api";
+import { ActivityFeed } from "./components/ActivityFeed";
+import { ResourceOccupancy } from "./components/ResourceOccupancy";
+import { ScopeSwitcher } from "./components/ScopeSwitcher";
+import { TopologyView } from "./components/TopologyView";
+import { activeOccupancies, mergeActivityEvents, messageCodeLabel, reconnectDelayMs } from "./dashboard-model";
 import { usePretext } from "./usePretext";
 
 const connectionLabels = {
@@ -19,7 +24,15 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   const [diagnostics, setDiagnostics] = useState<Awaited<ReturnType<DaemonClient["diagnostics"]>>["items"]>([]);
   const [busy, setBusy] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [streamError, setStreamError] = useState("");
+  const [scope, setScope] = useState<DashboardScope>("local");
+  const [dashboard, setDashboard] = useState<DashboardSnapshot>();
+  const [events, setEvents] = useState<ActivityEvent[]>([]);
+  const [selectedHostId, setSelectedHostId] = useState<string>();
+  const [streamReconnecting, setStreamReconnecting] = useState(false);
+  const subscriberId = useRef(`desktop-${globalThis.crypto?.randomUUID?.() ?? Date.now().toString(36)}`);
   usePretext();
+  const occupancies = useMemo(() => activeOccupancies(events), [events]);
 
   const refresh = async () => {
     try {
@@ -33,6 +46,95 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   useEffect(() => {
     void refresh();
   }, [client]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const updateSnapshot = async () => {
+      try {
+        const next = await client.dashboardSnapshot(scope, controller.signal);
+        if (controller.signal.aborted) return;
+        setDashboard(next);
+        setSelectedHostId((selected) => next.hosts.some((host) => host.id === selected)
+          ? selected
+          : next.hosts[0]?.id);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setErrorMessage(error instanceof Error ? error.message : String(error));
+        }
+      }
+    };
+    void updateSnapshot();
+    const interval = window.setInterval(() => void updateSnapshot(), 10_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [client, scope]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let timer: number | undefined;
+    let cursor: EventCursor = { epoch: 0, sequence: 0 };
+    let reconnectAttempt = 0;
+    let lastResyncRevision: number | undefined;
+
+    const schedule = (callback: () => void, delay: number) => {
+      timer = window.setTimeout(callback, delay);
+    };
+
+    const pump = async (): Promise<void> => {
+      try {
+        const page = await client.activityEvents(cursor, 100, controller.signal);
+        if (controller.signal.aborted) return;
+        switch (page.result) {
+          case "events":
+            setEvents((current) => mergeActivityEvents(current, page.events));
+            await client.acknowledgeEvents(subscriberId.current, page.next_cursor, controller.signal);
+            cursor = page.next_cursor;
+            reconnectAttempt = 0;
+            setStreamReconnecting(false);
+            setStreamError("");
+            schedule(() => void pump(), page.events.length === 100 ? 0 : 1_000);
+            return;
+          case "resync_required": {
+            if (lastResyncRevision === page.snapshot_revision) {
+              throw new Error("Aktivitätsstream benötigt erneut eine Synchronisierung");
+            }
+            lastResyncRevision = page.snapshot_revision;
+            const freshSnapshot = await client.dashboardSnapshot(scope, controller.signal);
+            if (controller.signal.aborted) return;
+            setDashboard(freshSnapshot);
+            setSelectedHostId((selected) => freshSnapshot.hosts.some((host) => host.id === selected)
+              ? selected
+              : freshSnapshot.hosts[0]?.id);
+            cursor = page.oldest_available;
+            await pump();
+            return;
+          }
+          case "cursor_ahead":
+            cursor = page.newest_available;
+            schedule(() => void pump(), 0);
+            return;
+          case "limit_exceeded":
+            throw new Error("Aktivitätsseite überschreitet das sichere Größenlimit");
+          default:
+            page satisfies never;
+        }
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setStreamReconnecting(true);
+        const delay = reconnectDelayMs(reconnectAttempt++);
+        setStreamError(error instanceof Error ? error.message : String(error));
+        schedule(() => void pump(), delay);
+      }
+    };
+
+    void pump();
+    return () => {
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [client, scope]);
 
   const run = async <T,>(action: () => Promise<T>, onSuccess?: (value: T) => void) => {
     setBusy(true);
@@ -64,6 +166,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   if (!snapshot) return <main className="shell shell--centered" aria-busy="true">DeviceLane wird geladen…</main>;
 
   const toggleRemoteAccess = snapshot.remote_access_paused ? client.resume : client.pause;
+  const meshAvailable = snapshot.connection !== "disconnected";
   return (
     <div className="app-frame">
       <aside className="sidebar" aria-label="Hauptnavigation">
@@ -73,12 +176,25 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
       </aside>
       <main className="shell" id="overview">
         {errorMessage && <p className="error-banner" role="alert" aria-live="assertive">{errorMessage}</p>}
+        {streamError && <p className="error-banner" role="alert" aria-live="assertive">{streamError}</p>}
         <header className="page-header">
           <div><p className="eyebrow">Lokales Netzwerk</p><h1 data-pretext>Geräteübersicht</h1></div>
           <span className={`connection-pill connection-pill--${snapshot.connection}`}>
             <span className="status-mark" aria-hidden="true" />{connectionLabels[snapshot.connection]}
           </span>
         </header>
+
+        <ScopeSwitcher scope={scope} meshAvailable={meshAvailable} onChange={setScope} />
+
+        <div id="mesh-dashboard-panel" role="tabpanel" className="dashboard-layout" aria-busy={!dashboard}>
+          {dashboard ? <>
+            <TopologyView hosts={dashboard.hosts} selectedHostId={selectedHostId} onSelectHost={setSelectedHostId} />
+            <div className="dashboard-side">
+              <ResourceOccupancy occupancies={occupancies} />
+              <ActivityFeed events={events} reconnecting={streamReconnecting} />
+            </div>
+          </> : <p className="dashboard-loading">Topologie wird geladen…</p>}
+        </div>
 
         <section className="host-card" aria-labelledby="host-title">
           <div className="host-icon" aria-hidden="true">{snapshot.os === "macOS" ? "M" : "PC"}</div>
@@ -93,6 +209,11 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
         {snapshot.warnings.length > 0 && <section className="warnings" aria-labelledby="warnings-title">
           <h2 id="warnings-title">Hinweise</h2>
           <ul>{snapshot.warnings.map((warning) => <li key={warning} data-pretext>{warning}</li>)}</ul>
+        </section>}
+
+        {dashboard && dashboard.warnings.length > 0 && <section className="warnings" aria-labelledby="mesh-warnings-title">
+          <h2 id="mesh-warnings-title">Mesh-Hinweise</h2>
+          <ul>{dashboard.warnings.map((warning) => <li key={`${warning.code}:${warning.host_id ?? "mesh"}`} data-pretext>{messageCodeLabel(warning.message.code)}</li>)}</ul>
         </section>}
 
         <section className="control-grid" aria-label="Diensteinstellungen">

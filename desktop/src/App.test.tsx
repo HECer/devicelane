@@ -1,8 +1,8 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import type { DaemonClient, DaemonSnapshot } from "./api";
+import type { ActivityEvent, DaemonClient, DaemonSnapshot, DashboardSnapshot } from "./api";
 
 const connected: DaemonSnapshot = {
   public_identity: "mac-agent",
@@ -20,6 +20,51 @@ const connected: DaemonSnapshot = {
   log_location: "/Users/hecer/Library/Logs/DeviceLane/service.log"
 };
 
+const dashboard: DashboardSnapshot = {
+  revision: 7,
+  generated_at_ms: 1_725_000_000_000,
+  scope: "mesh",
+  hosts: [{
+    id: "mac-agent",
+    display_name: "Hermanns MacBook Pro",
+    platform: "macos",
+    architecture: "arm64",
+    presence: "online",
+    freshness: "live",
+    trust: "trusted",
+    connection_path: "registry",
+    capabilities: ["xcode"],
+    permissions: ["workspace_read"],
+    devices: []
+  }],
+  activities: [],
+  pending_approvals: [],
+  warnings: []
+};
+
+const streamedEvent: ActivityEvent = {
+  activity_id: "activity-streamed",
+  sequence: 1,
+  occurred_at_ms: 1_725_000_000_100,
+  principal_id: "agent-codex",
+  source_host_id: "windows-workstation",
+  target_host_id: "mac-agent",
+  device_id: null,
+  operation: "xcode.build",
+  resources: ["workspace_read"],
+  authorization: { effect: "allow", rule_id: null, approval_id: "approval-1" },
+  state: "running",
+  message: null,
+  metrics: {
+    current_memory_bytes: { available: { value: 1024 } },
+    peak_memory_bytes: { available: { value: 2048 } },
+    cpu_time_ms: { unavailable: { reason: "observer_pending" } },
+    process_count: { available: { value: 1 } }
+  },
+  started_at_ms: 1_725_000_000_100,
+  finished_at_ms: null
+};
+
 function fakeClient(overrides: Partial<DaemonClient> = {}): DaemonClient {
   let state = { ...connected };
   const client: DaemonClient = {
@@ -32,6 +77,13 @@ function fakeClient(overrides: Partial<DaemonClient> = {}): DaemonClient {
       items: [{ code: "ready", message: "Lokaler Dienst ist bereit", healthy: true }]
     }),
     repair: vi.fn().mockResolvedValue(undefined),
+    dashboardSnapshot: vi.fn().mockResolvedValue(dashboard),
+    activityEvents: vi.fn().mockResolvedValue({
+      result: "events",
+      events: [],
+      next_cursor: { epoch: 1, sequence: 0 }
+    }),
+    acknowledgeEvents: vi.fn().mockResolvedValue(undefined),
     ...overrides
   };
   return client;
@@ -111,10 +163,67 @@ describe("DeviceLane desktop foundation", () => {
     await user.tab();
     expect(screen.getByRole("link", { name: "Geräte" })).toHaveFocus();
     await user.tab();
+    expect(screen.getByRole("tab", { name: "Dieser Computer" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: /Hermanns MacBook Pro/ })).toHaveFocus();
+    await user.tab();
     expect(screen.getByRole("button", { name: "Remotezugriff pausieren" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("switch", { name: "Beim Anmelden starten" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("button", { name: "Diagnosepaket erstellen" })).toHaveFocus();
   });
+
+  it("resyncs once, deduplicates replayed events and acknowledges the consumed cursor", async () => {
+    const activityEvents = vi.fn()
+      .mockResolvedValueOnce({
+        result: "resync_required",
+        oldest_available: { epoch: 4, sequence: 8 },
+        snapshot_revision: 8
+      })
+      .mockResolvedValueOnce({
+        result: "events",
+        events: [streamedEvent, streamedEvent],
+        next_cursor: { epoch: 4, sequence: 9 }
+      })
+      .mockResolvedValue({
+        result: "events",
+        events: [],
+        next_cursor: { epoch: 4, sequence: 9 }
+      });
+    const client = fakeClient({ activityEvents });
+
+    render(<App client={client} />);
+
+    expect(await screen.findByText("Hermanns MacBook Pro")).toBeVisible();
+    expect(await screen.findByText("activity-streamed")).toBeVisible();
+    expect(screen.getByRole("list", { name: "Aktivitätsereignisse" }).children).toHaveLength(1);
+    await waitFor(() => expect(client.acknowledgeEvents).toHaveBeenCalledWith(
+      expect.any(String),
+      { epoch: 4, sequence: 9 },
+      expect.any(AbortSignal)
+    ));
+    expect(client.dashboardSnapshot).toHaveBeenCalledTimes(2);
+    expect(activityEvents).toHaveBeenNthCalledWith(1, { epoch: 0, sequence: 0 }, 100, expect.any(AbortSignal));
+    expect(activityEvents).toHaveBeenNthCalledWith(2, { epoch: 4, sequence: 8 }, 100, expect.any(AbortSignal));
+  });
+
+  it("shows a reconnect state and clears the transient error after the stream recovers", async () => {
+    const activityEvents = vi.fn()
+      .mockRejectedValueOnce(new Error("stream interrupted"))
+      .mockResolvedValue({
+        result: "events",
+        events: [streamedEvent],
+        next_cursor: { epoch: 1, sequence: 1 }
+      });
+    render(<App client={fakeClient({ activityEvents })} />);
+
+    expect(await screen.findByText("Stream verbindet erneut")).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("stream interrupted");
+    await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 1_050)); });
+
+    expect(await screen.findByText("activity-streamed")).toBeVisible();
+    expect(screen.queryByText("Stream verbindet erneut")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  }, 4_000);
 });
