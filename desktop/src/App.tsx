@@ -158,6 +158,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
         if (controller.signal.aborted) return;
         switch (page.result) {
           case "events":
+            lastResyncRevision = undefined;
             setEvents((current) => mergeActivityEvents(current, page.events));
             await client.acknowledgeEvents(subscriberId.current, page.next_cursor, controller.signal);
             cursor = page.next_cursor;

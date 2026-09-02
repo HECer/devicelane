@@ -98,7 +98,7 @@ export function TopologyView({ hosts, leases, selectedHostId, onSelectHost }: To
                 <TagList label="Fähigkeiten" values={host.capabilities} />
                 <TagList label="Berechtigungen" values={host.permissions} />
                 {host.devices.length > 0 && <ul className="device-list" aria-label={`Geräte an ${host.display_name}`}>
-                  {host.devices.map((device) => <DeviceRow key={device.id} device={device} leases={leases.filter((lease) => lease.device_id === device.id)} />)}
+                  {host.devices.map((device) => <DeviceRow key={device.id} device={device} leases={leases.filter((lease) => lease.owner_host_id === host.id && lease.device_id === device.id)} />)}
                 </ul>}
               </div>
             </li>

@@ -211,6 +211,33 @@ describe("DeviceLane desktop foundation", () => {
     expect(activityEvents).toHaveBeenNthCalledWith(2, { epoch: "4", sequence: "8" }, 100, expect.any(AbortSignal));
   });
 
+  it("allows the same resync revision again after a successful events page", async () => {
+    const activityEvents = vi.fn()
+      .mockResolvedValueOnce({
+        result: "resync_required",
+        oldest_available: { epoch: "4", sequence: "8" },
+        snapshot_revision: "8"
+      })
+      .mockResolvedValueOnce({
+        result: "events",
+        events: [streamedEvent],
+        next_cursor: { epoch: "4", sequence: "9" }
+      })
+      .mockResolvedValueOnce({
+        result: "resync_required",
+        oldest_available: { epoch: "4", sequence: "9" },
+        snapshot_revision: "8"
+      })
+      .mockImplementation(() => new Promise<never>(() => undefined));
+    const client = fakeClient({ activityEvents });
+    render(<App client={client} />);
+
+    expect(await screen.findByText("activity-streamed")).toBeVisible();
+    await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 1_050)); });
+    await waitFor(() => expect(client.dashboardSnapshot).toHaveBeenCalledTimes(3));
+    expect(screen.queryByText(/erneut eine Synchronisierung/)).not.toBeInTheDocument();
+  }, 4_000);
+
   it("shows a reconnect state and clears the transient error after the stream recovers", async () => {
     const activityEvents = vi.fn()
       .mockRejectedValueOnce(new Error("stream interrupted"))

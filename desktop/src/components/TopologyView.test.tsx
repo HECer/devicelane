@@ -78,4 +78,22 @@ describe("TopologyView", () => {
     expect(screen.getAllByText("xcode").length).toBeGreaterThan(0);
     expect(screen.getAllByText("workspace_read").length).toBeGreaterThan(0);
   });
+
+  it("does not attach a lease to the same device id on a different host", () => {
+    const owner = host("busy", 3);
+    const other = {
+      ...owner,
+      id: "host-other",
+      display_name: "Anderer Host",
+      devices: owner.devices.map((device) => ({ ...device, host_id: "host-other" }))
+    };
+    render(<TopologyView
+      hosts={[owner, other]}
+      leases={[{ id: "lease-1", owner_host_id: owner.id, device_id: "iphone-1", state: "active" }]}
+      selectedHostId={owner.id}
+      onSelectHost={vi.fn()}
+    />);
+
+    expect(screen.getAllByText("Inhaber: host-3 · Gerät: iphone-1")).toHaveLength(1);
+  });
 });
