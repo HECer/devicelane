@@ -251,6 +251,51 @@ impl EventJournal {
         Ok(AppendOutcome::Appended)
     }
 
+    pub fn preflight_append(
+        &self,
+        idempotency_key: &str,
+        event: &ActivityEvent,
+    ) -> Result<(), AppendError> {
+        event
+            .validate()
+            .map_err(|error| AppendError::InvalidEvent(error.code().to_owned()))?;
+        if idempotency_key.trim().is_empty() {
+            return Err(AppendError::EmptyIdempotencyKey);
+        }
+        if idempotency_key.len() > 256 {
+            return Err(AppendError::IdempotencyKeyTooLong);
+        }
+        let event_json = serde_json::to_vec(event)
+            .map_err(|error| AppendError::InvalidEvent(error.to_string()))?;
+        if event.sequence == u64::MAX {
+            return Err(AppendError::SequenceOverflow);
+        }
+        let inner = self.lock();
+        if inner.max_events == 0 || event_json.len() > inner.max_bytes {
+            return Err(AppendError::LimitExceeded {
+                serialized_bytes: event_json.len(),
+                maximum_bytes: inner.max_bytes,
+            });
+        }
+        if let Some(existing) = inner.idempotency.get(idempotency_key) {
+            let digest: [u8; 32] = Sha256::digest(&event_json).into();
+            return if existing.event_digest == digest {
+                Ok(())
+            } else {
+                Err(AppendError::IdempotencyConflict)
+            };
+        }
+        let expected = inner
+            .activity_sequences
+            .get(&event.activity_id)
+            .map_or(Some(1), |value| value.checked_add(1))
+            .ok_or(AppendError::SequenceOverflow)?;
+        if event.sequence != expected {
+            return Err(AppendError::NonMonotonicSequence { expected });
+        }
+        Ok(())
+    }
+
     pub fn read(&self, cursor: EventCursor, limit: ReadLimit) -> EventRead {
         let inner = self.lock();
         let oldest_event = inner.events.front().map(|entry| entry.cursor_sequence);

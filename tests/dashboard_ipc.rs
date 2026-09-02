@@ -10,8 +10,8 @@ use device_development_mesh::dashboard::service::{
 use device_development_mesh::dashboard::topology::TopologyProjector;
 use device_development_mesh::dashboard::{
     ActivityEvent, ActivityId, ActivityState, Authorization, DashboardScope, EventCursor, HostId,
-    MetricSnapshot, MetricValue, OperationId, PolicyEffect, PrincipalId, ResourceClass, SafeCode,
-    SubscriberId,
+    MetricSnapshot, MetricValue, OperationId, PolicyEffect, PolicyOrigin, PolicyRule, PrincipalId,
+    ResourceClass, RuleId, SafeCode, SubscriberId,
 };
 use device_development_mesh::local_ipc::{
     DiagnosticItem, LocalProtocolError, LocalProtocolVersion, LocalRequest, LocalResponse,
@@ -139,6 +139,33 @@ fn access(activity: &str) -> AccessRequest {
         resources: vec![ResourceClass::WorkspaceRead],
         physical_device: false,
         user_present: true,
+    }
+}
+
+fn admin_rule(
+    id: &str,
+    effect: PolicyEffect,
+    operation: &str,
+    resource: ResourceClass,
+) -> PolicyRule {
+    PolicyRule {
+        id: RuleId::parse(id).unwrap(),
+        revision: 1,
+        effect,
+        principal_id: Some(PrincipalId::parse("local-user").unwrap()),
+        source_host_id: Some(HostId::parse("mac").unwrap()),
+        target_host_id: Some(HostId::parse("mac").unwrap()),
+        device_id: None,
+        operation: Some(OperationId::parse(operation).unwrap()),
+        resources: vec![resource],
+        expires_at_ms: None,
+        require_user_presence: false,
+        user_presence: None,
+        physical_device: None,
+        match_device_exact: true,
+        match_resources_exact: true,
+        enabled: true,
+        origin: PolicyOrigin::User,
     }
 }
 
@@ -365,5 +392,188 @@ fn approval_request_is_audited_before_pending_state_and_emits_live_event() {
     );
     assert!(
         matches!(service.events(EventCursor { epoch: 1, sequence: 0 }, 10), EventRead::Events { events, .. } if events.len() == 1 && events[0].state == ActivityState::AwaitingApproval)
+    );
+}
+
+#[test]
+fn explicit_admin_deny_prevents_policy_mutation_despite_local_authentication() {
+    let root = tempfile::tempdir().unwrap();
+    let audit = Arc::new(Mutex::new(
+        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+    ));
+    let deny = admin_rule(
+        "deny-admin",
+        PolicyEffect::Deny,
+        "devicelane.policy.put",
+        ResourceClass::DeviceLanePolicy,
+    );
+    let mut service = DashboardService::new(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(1, 0),
+        audit,
+        PolicyEngine::with_rules(vec![deny]).unwrap(),
+    );
+    let candidate = admin_rule(
+        "candidate",
+        PolicyEffect::Allow,
+        "build",
+        ResourceClass::WorkspaceRead,
+    );
+    assert_eq!(
+        service.put_policy_rule(candidate, 10),
+        Err(DashboardServiceError::PermissionDenied)
+    );
+    assert_eq!(service.policy_rules().len(), 1);
+}
+
+#[test]
+fn event_sequence_failure_does_not_leak_into_durable_checkpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let audit_root = root.path().join("audit");
+    {
+        let audit = Arc::new(Mutex::new(
+            AuditStore::open(&audit_root, RetentionPolicy::default(), Redactor::default()).unwrap(),
+        ));
+        let mut service = DashboardService::new_persistent(
+            HostId::parse("mac").unwrap(),
+            TopologyProjector::new(),
+            EventJournal::new(1, 0),
+            audit,
+            PolicyEngine::new(),
+        )
+        .unwrap();
+        let invalid_sequence = event(ActivityState::Running, 2, 10);
+        assert_eq!(
+            service.record_activity(invalid_sequence, "bad-sequence"),
+            Err(DashboardServiceError::LimitExceeded)
+        );
+        assert!(
+            service
+                .snapshot(DashboardScope::Local, 10)
+                .activities
+                .is_empty()
+        );
+    }
+    let audit = Arc::new(Mutex::new(
+        AuditStore::open(&audit_root, RetentionPolicy::default(), Redactor::default()).unwrap(),
+    ));
+    let reopened = DashboardService::new_persistent(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(2, 0),
+        audit,
+        PolicyEngine::new(),
+    )
+    .unwrap();
+    assert!(
+        reopened
+            .snapshot(DashboardScope::Local, 20)
+            .activities
+            .is_empty()
+    );
+}
+
+fn break_checkpoint(root: &std::path::Path) {
+    let path = root.join("activity-state.json");
+    if path.is_file() {
+        std::fs::remove_file(&path).unwrap();
+    }
+    std::fs::create_dir(&path).unwrap();
+}
+
+fn persistent_service(root: &std::path::Path, policy: PolicyEngine) -> DashboardService {
+    let audit = Arc::new(Mutex::new(
+        AuditStore::open(root, RetentionPolicy::default(), Redactor::default()).unwrap(),
+    ));
+    DashboardService::new_persistent(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(1, 0),
+        audit,
+        policy,
+    )
+    .unwrap()
+}
+
+#[test]
+fn checkpoint_failure_rolls_back_each_staged_mutation() {
+    let request_root = tempfile::tempdir().unwrap();
+    let mut request_service = persistent_service(request_root.path(), PolicyEngine::new());
+    break_checkpoint(request_root.path());
+    assert!(
+        request_service
+            .request_approval(access("request"), 1_000, 10)
+            .is_err()
+    );
+    assert!(request_service.pending_approvals(11).is_empty());
+
+    let put_root = tempfile::tempdir().unwrap();
+    let mut put_service = persistent_service(put_root.path(), PolicyEngine::new());
+    break_checkpoint(put_root.path());
+    assert!(
+        put_service
+            .put_policy_rule(
+                admin_rule(
+                    "put",
+                    PolicyEffect::Allow,
+                    "build",
+                    ResourceClass::WorkspaceRead
+                ),
+                10
+            )
+            .is_err()
+    );
+    assert!(put_service.policy_rules().is_empty());
+
+    let delete_root = tempfile::tempdir().unwrap();
+    let existing = admin_rule(
+        "delete",
+        PolicyEffect::Allow,
+        "build",
+        ResourceClass::WorkspaceRead,
+    );
+    let mut delete_service = persistent_service(
+        delete_root.path(),
+        PolicyEngine::with_rules(vec![existing]).unwrap(),
+    );
+    break_checkpoint(delete_root.path());
+    assert!(
+        delete_service
+            .delete_policy_rule(&RuleId::parse("delete").unwrap(), 10)
+            .is_err()
+    );
+    assert_eq!(delete_service.policy_rules().len(), 1);
+
+    let pause_root = tempfile::tempdir().unwrap();
+    let mut pause_service = persistent_service(pause_root.path(), PolicyEngine::new());
+    break_checkpoint(pause_root.path());
+    assert!(pause_service.pause(ExistingJobs::Finish, 10).is_err());
+    assert!(!pause_service.remote_access_paused());
+
+    let resume_root = tempfile::tempdir().unwrap();
+    let mut resume_service = persistent_service(resume_root.path(), PolicyEngine::new());
+    resume_service.pause(ExistingJobs::Finish, 10).unwrap();
+    break_checkpoint(resume_root.path());
+    assert!(resume_service.resume(11).is_err());
+    assert!(resume_service.remote_access_paused());
+
+    let cancel_root = tempfile::tempdir().unwrap();
+    let mut cancel_service = persistent_service(cancel_root.path(), PolicyEngine::new());
+    cancel_service
+        .record_activity(event(ActivityState::Running, 1, 10), "start")
+        .unwrap();
+    break_checkpoint(cancel_root.path());
+    assert!(
+        cancel_service
+            .cancel_activity(&ActivityId::parse("job-1").unwrap(), 11)
+            .is_err()
+    );
+    assert_eq!(
+        cancel_service
+            .snapshot(DashboardScope::Local, 11)
+            .activities[0]
+            .state,
+        ActivityState::Running
     );
 }

@@ -158,7 +158,7 @@ struct PendingApproval {
     used: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PolicyEngine {
     rules: Vec<PolicyRule>,
     approvals: HashMap<String, PendingApproval>,
@@ -238,10 +238,6 @@ impl PolicyEngine {
         let before = self.rules.len();
         self.rules.retain(|rule| &rule.id != id);
         Ok(before != self.rules.len())
-    }
-
-    pub(crate) fn discard_approval(&mut self, nonce: &str) {
-        self.approvals.remove(nonce);
     }
 
     pub fn evaluate(

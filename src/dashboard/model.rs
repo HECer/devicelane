@@ -290,6 +290,8 @@ pub enum ResourceClass {
     Microphone,
     ScreenCapture,
     NetworkEndpoint,
+    DeviceLanePolicy,
+    DeviceLaneService,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

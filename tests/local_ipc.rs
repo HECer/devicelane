@@ -386,7 +386,7 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         .spawn()
         .unwrap();
 
-    let endpoint = device_development_mesh::local_ipc::LocalEndpoint::NamedPipe(pipe);
+    let endpoint = device_development_mesh::local_ipc::LocalEndpoint::NamedPipe(pipe.clone());
     let request = LocalRequest::Status {
         version: LocalProtocolVersion::CURRENT,
     };
@@ -684,6 +684,71 @@ fn production_service_restart_reconciles_one_durable_activity_id() {
     );
     second.kill().unwrap();
     second.wait().unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn failed_decision_checkpoint_keeps_pending_policy_and_activity_unchanged() {
+    let pipe = format!(r"\\.\pipe\devicelane-decision-fault-{}", std::process::id());
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("identity");
+    let runtime = temp.path().join("runtime");
+    let logs = temp.path().join("logs");
+    std::fs::create_dir(&runtime).unwrap();
+    let args = [
+        "--identity",
+        identity.to_str().unwrap(),
+        "--runtime-dir",
+        runtime.to_str().unwrap(),
+        "--role",
+        "workstation",
+        "--listen",
+        &pipe,
+        "--log-dir",
+        logs.to_str().unwrap(),
+    ];
+    let endpoint = device_development_mesh::local_ipc::LocalEndpoint::NamedPipe(pipe.clone());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+        .args(args)
+        .spawn()
+        .unwrap();
+    let status = LocalRequest::Status {
+        version: LocalProtocolVersion::CURRENT,
+    };
+    (0..100)
+        .find_map(|_| {
+            send_local_request(&endpoint, &status).ok().or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            })
+        })
+        .expect("service did not bind");
+    let access = approval_access("identity");
+    let nonce = match send_eventually(
+        &endpoint,
+        &LocalRequest::RequestApproval {
+            version: LocalProtocolVersion::CURRENT,
+            access: access.clone(),
+            lifetime_ms: 60_000,
+        },
+    ) {
+        LocalResponse::ApprovalCreated { nonce, .. } => nonce,
+        response => panic!("unexpected approval response: {response:?}"),
+    };
+    let checkpoint = logs.join("audit").join("activity-state.json");
+    std::fs::remove_file(&checkpoint).unwrap();
+    std::fs::create_dir(&checkpoint).unwrap();
+    assert!(
+        matches!(send_eventually(&endpoint, &LocalRequest::DecideApproval { version: LocalProtocolVersion::CURRENT, nonce, access, decision: ApprovalDecision::AllowOnce }), LocalResponse::Error { code, .. } if code == "audit_unavailable")
+    );
+    assert!(
+        matches!(send_eventually(&endpoint, &LocalRequest::PendingApprovals { version: LocalProtocolVersion::CURRENT }), LocalResponse::PendingApprovals(items) if items.len() == 1)
+    );
+    assert!(
+        matches!(send_eventually(&endpoint, &LocalRequest::DashboardSnapshot { version: LocalProtocolVersion::CURRENT, scope: DashboardScope::Local }), LocalResponse::DashboardSnapshot(snapshot) if snapshot.activities.len() == 1 && snapshot.activities[0].state == ActivityState::AwaitingApproval)
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 #[test]

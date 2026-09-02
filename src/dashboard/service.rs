@@ -8,8 +8,8 @@ use super::topology::TopologyProjector;
 use super::{
     ActivityEvent, ActivityId, ActivityState, ApprovalDecision, ApprovalId, ApprovalRequest,
     AuditResult, Authorization, CursorPage, DashboardScope, DashboardSnapshot, EventCursor, HostId,
-    MetricSnapshot, MetricValue, OperationId, PolicyEffect, PolicyRule, PrincipalId, RuleId,
-    SafeCode, SubscriberId,
+    MetricSnapshot, MetricValue, OperationId, PolicyEffect, PolicyRule, PrincipalId, ResourceClass,
+    RuleId, SafeCode, SubscriberId,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -170,6 +170,10 @@ impl DashboardService {
         &self.local_host_id
     }
 
+    pub fn remote_access_paused(&self) -> bool {
+        self.paused
+    }
+
     pub fn snapshot(&self, scope: DashboardScope, now_ms: u64) -> DashboardSnapshot {
         let mut snapshot = self.topology.snapshot(now_ms);
         if scope == DashboardScope::Local {
@@ -245,7 +249,8 @@ impl DashboardService {
             PolicyDecision::Allowed { .. } | PolicyDecision::ApprovalRequired { .. } => {}
         }
         self.audit_access(&access, PolicyEffect::Allow, AuditResult::Attempted, now_ms)?;
-        let challenge = match self.policy.create_approval(&access, now_ms, lifetime_ms) {
+        let mut next_policy = self.policy.clone();
+        let challenge = match next_policy.create_approval(&access, now_ms, lifetime_ms) {
             Ok(challenge) => challenge,
             Err(error) => {
                 self.audit_access(&access, PolicyEffect::Allow, AuditResult::Failed, now_ms)?;
@@ -254,27 +259,23 @@ impl DashboardService {
         };
         let id = ApprovalId::parse(format!("approval-{}", &challenge.nonce[..16]))
             .map_err(|_| DashboardServiceError::InvalidRequest)?;
-        self.pending.insert(
-            id.clone(),
-            Pending {
-                nonce: challenge.nonce.clone(),
-                request: ApprovalRequest {
-                    id: id.clone(),
-                    activity_id: access.activity_id.clone(),
-                    principal_id: access.principal_id.clone(),
-                    source_host_id: access.source_host_id.clone(),
-                    target_host_id: access.target_host_id.clone(),
-                    device_id: access.device_id.clone(),
-                    operation: access.operation.clone(),
-                    resources: access.resources.clone(),
-                    requested_at_ms: now_ms,
-                    expires_at_ms: challenge.expires_at_ms,
-                    risk: super::SafeCode::parse("target_confirmation")
-                        .expect("constant safe code"),
-                },
-                access: access.clone(),
+        let pending = Pending {
+            nonce: challenge.nonce.clone(),
+            request: ApprovalRequest {
+                id: id.clone(),
+                activity_id: access.activity_id.clone(),
+                principal_id: access.principal_id.clone(),
+                source_host_id: access.source_host_id.clone(),
+                target_host_id: access.target_host_id.clone(),
+                device_id: access.device_id.clone(),
+                operation: access.operation.clone(),
+                resources: access.resources.clone(),
+                requested_at_ms: now_ms,
+                expires_at_ms: challenge.expires_at_ms,
+                risk: super::SafeCode::parse("target_confirmation").expect("constant safe code"),
             },
-        );
+            access: access.clone(),
+        };
         let sequence = self
             .activities
             .get(&access.activity_id)
@@ -303,11 +304,11 @@ impl DashboardService {
             },
             &format!("approval-request:{}", challenge.nonce),
         ) {
-            self.pending.remove(&id);
-            self.policy.discard_approval(&challenge.nonce);
             self.audit_access(&access, PolicyEffect::Allow, AuditResult::Failed, now_ms)?;
             return Err(error);
         }
+        self.policy = next_policy;
+        self.pending.insert(id, pending);
         Ok((challenge.nonce, challenge.expires_at_ms))
     }
 
@@ -322,6 +323,13 @@ impl DashboardService {
         if self.paused {
             return Err(DashboardServiceError::PermissionDenied);
         }
+        if matches!(
+            self.policy.evaluate(access, now_ms),
+            Ok(PolicyDecision::Denied { .. })
+        ) {
+            self.audit_access(access, PolicyEffect::Deny, AuditResult::Denied, now_ms)?;
+            return Err(DashboardServiceError::PermissionDenied);
+        }
         let pending_id = self.pending.iter().find_map(|(id, pending)| {
             (pending.nonce == nonce && &pending.access == access).then(|| id.clone())
         });
@@ -334,7 +342,8 @@ impl DashboardService {
             PolicyEffect::Allow
         };
         self.audit_access(access, effect, AuditResult::Attempted, now_ms)?;
-        let outcome = match self.policy.decide(nonce, session, access, decision, now_ms) {
+        let mut next_policy = self.policy.clone();
+        let outcome = match next_policy.decide(nonce, session, access, decision, now_ms) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.audit_access(access, effect, AuditResult::Failed, now_ms)?;
@@ -342,9 +351,6 @@ impl DashboardService {
             }
         };
         let approval_id = pending_id.clone();
-        if let Some(id) = pending_id {
-            self.pending.remove(&id);
-        }
         let state = if effect == PolicyEffect::Deny {
             ActivityState::Denied
         } else {
@@ -379,6 +385,10 @@ impl DashboardService {
             },
             &format!("approval-decision:{nonce}"),
         )?;
+        self.policy = next_policy;
+        if let Some(id) = pending_id {
+            self.pending.remove(&id);
+        }
         Ok(outcome.created_rule)
     }
 
@@ -391,12 +401,19 @@ impl DashboardService {
         rule: PolicyRule,
         now_ms: u64,
     ) -> Result<(), DashboardServiceError> {
+        self.authorize_admin(
+            "devicelane.policy.put",
+            ResourceClass::DeviceLanePolicy,
+            now_ms,
+        )?;
         self.audit_local("policy-put", AuditResult::Attempted, now_ms)?;
-        if self.policy.put_user_rule(rule).is_err() {
+        let mut next_policy = self.policy.clone();
+        if next_policy.put_user_rule(rule).is_err() {
             self.audit_local("policy-put", AuditResult::Failed, now_ms)?;
             return Err(DashboardServiceError::PermissionDenied);
         }
         self.append_local_event("policy-put", now_ms)?;
+        self.policy = next_policy;
         Ok(())
     }
 
@@ -405,8 +422,14 @@ impl DashboardService {
         id: &RuleId,
         now_ms: u64,
     ) -> Result<bool, DashboardServiceError> {
+        self.authorize_admin(
+            "devicelane.policy.delete",
+            ResourceClass::DeviceLanePolicy,
+            now_ms,
+        )?;
         self.audit_local("policy-delete", AuditResult::Attempted, now_ms)?;
-        let deleted = match self.policy.delete_user_rule(id) {
+        let mut next_policy = self.policy.clone();
+        let deleted = match next_policy.delete_user_rule(id) {
             Ok(deleted) => deleted,
             Err(_) => {
                 self.audit_local("policy-delete", AuditResult::Failed, now_ms)?;
@@ -414,6 +437,7 @@ impl DashboardService {
             }
         };
         self.append_local_event("policy-delete", now_ms)?;
+        self.policy = next_policy;
         Ok(deleted)
     }
 
@@ -447,12 +471,16 @@ impl DashboardService {
         event: ActivityEvent,
         idempotency_key: &str,
     ) -> Result<(), DashboardServiceError> {
+        self.events
+            .preflight_append(idempotency_key, &event)
+            .map_err(|_| DashboardServiceError::LimitExceeded)?;
         let mut next = self.activities.clone();
         next.insert(event.activity_id.clone(), event.clone());
         self.persist_activities(&next)?;
-        self.events
-            .append(idempotency_key, event.clone())
-            .map_err(|_| DashboardServiceError::LimitExceeded)?;
+        if self.events.append(idempotency_key, event.clone()).is_err() {
+            self.persist_activities(&self.activities)?;
+            return Err(DashboardServiceError::LimitExceeded);
+        }
         self.activities = next;
         Ok(())
     }
@@ -462,6 +490,11 @@ impl DashboardService {
         id: &ActivityId,
         now_ms: u64,
     ) -> Result<bool, DashboardServiceError> {
+        self.authorize_admin(
+            "devicelane.activity.cancel",
+            ResourceClass::DeviceLaneService,
+            now_ms,
+        )?;
         let Some(current) = self.activities.get(id).cloned() else {
             return Ok(false);
         };
@@ -515,6 +548,11 @@ impl DashboardService {
         existing: ExistingJobs,
         now_ms: u64,
     ) -> Result<(), DashboardServiceError> {
+        self.authorize_admin(
+            "devicelane.service.pause",
+            ResourceClass::DeviceLaneService,
+            now_ms,
+        )?;
         self.audit_local("remote-access-pause", AuditResult::Attempted, now_ms)?;
         self.paused = true;
         if existing == ExistingJobs::Cancel {
@@ -536,6 +574,11 @@ impl DashboardService {
     }
 
     pub fn resume(&mut self, now_ms: u64) -> Result<(), DashboardServiceError> {
+        self.authorize_admin(
+            "devicelane.service.resume",
+            ResourceClass::DeviceLaneService,
+            now_ms,
+        )?;
         self.audit_local("remote-access-resume", AuditResult::Attempted, now_ms)?;
         self.paused = false;
         if let Err(error) = self.append_local_event("remote-access-resume", now_ms) {
@@ -573,6 +616,38 @@ impl DashboardService {
             workspace_path: None,
             artifact_metadata: vec![],
         })
+    }
+
+    fn authorize_admin(
+        &mut self,
+        operation: &str,
+        resource: ResourceClass,
+        now_ms: u64,
+    ) -> Result<(), DashboardServiceError> {
+        let request = AccessRequest {
+            activity_id: ActivityId::parse(format!("admin-auth-{}", self.next_audit_sequence))
+                .map_err(|_| DashboardServiceError::InvalidRequest)?,
+            principal_id: PrincipalId::parse("local-user").expect("constant id"),
+            source_host_id: self.local_host_id.clone(),
+            target_host_id: self.local_host_id.clone(),
+            device_id: None,
+            operation: OperationId::parse(operation)
+                .map_err(|_| DashboardServiceError::InvalidRequest)?,
+            resources: vec![resource],
+            physical_device: false,
+            user_present: true,
+        };
+        match self
+            .policy
+            .evaluate(&request, now_ms)
+            .map_err(|_| DashboardServiceError::InvalidRequest)?
+        {
+            PolicyDecision::Denied { .. } => {
+                self.audit_access(&request, PolicyEffect::Deny, AuditResult::Denied, now_ms)?;
+                Err(DashboardServiceError::PermissionDenied)
+            }
+            PolicyDecision::Allowed { .. } | PolicyDecision::ApprovalRequired { .. } => Ok(()),
+        }
     }
 
     fn audit_access_from_event(
