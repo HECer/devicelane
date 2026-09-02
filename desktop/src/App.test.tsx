@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -230,16 +230,91 @@ describe("DeviceLane desktop foundation", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   }, 4_000);
 
-  it("derives mesh availability only from the authenticated dashboard snapshot and adopts its scope", async () => {
+  it("derives mesh availability from an authenticated probe without changing the selected local tab", async () => {
     const localOnly = { ...dashboard, scope: "local" as const };
     const { unmount } = render(<App client={fakeClient({ dashboardSnapshot: vi.fn().mockResolvedValue(localOnly) })} />);
     expect(await screen.findByRole("tab", { name: "Alle autorisierten Geräte" })).toBeDisabled();
     unmount();
 
     const mesh = { ...dashboard, scope: "mesh" as const };
-    render(<App client={fakeClient({ dashboardSnapshot: vi.fn().mockResolvedValue(mesh) })} />);
+    const dashboardSnapshot = vi.fn().mockResolvedValueOnce(mesh).mockResolvedValue(dashboard);
+    render(<App client={fakeClient({ dashboardSnapshot })} />);
     expect(await screen.findByRole("tab", { name: "Alle autorisierten Geräte" })).toBeEnabled();
-    expect(screen.getByRole("tab", { name: "Alle autorisierten Geräte" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Dieser Computer" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("discovers mesh authorization on a later serialized poll", async () => {
+    vi.useFakeTimers();
+    const localOnly = { ...dashboard, scope: "local" as const };
+    const mesh = { ...dashboard, revision: "8", scope: "mesh" as const };
+    const responses = [localOnly, mesh, { ...localOnly, revision: "8" }];
+    let inFlight = 0;
+    let maximumInFlight = 0;
+    const dashboardSnapshot = vi.fn(async () => {
+      inFlight += 1;
+      maximumInFlight = Math.max(maximumInFlight, inFlight);
+      await Promise.resolve();
+      inFlight -= 1;
+      return responses.shift() ?? { ...localOnly, revision: "8" };
+    });
+    const activityEvents = vi.fn(() => new Promise<never>(() => undefined));
+    const { unmount } = render(<App client={fakeClient({ dashboardSnapshot, activityEvents })} />);
+    await act(async () => Promise.resolve());
+    expect(screen.getByRole("tab", { name: "Alle autorisierten Geräte" })).toBeDisabled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("tab", { name: "Alle autorisierten Geräte" })).toBeEnabled();
+    expect(screen.getByRole("tab", { name: "Dieser Computer" })).toHaveAttribute("aria-selected", "true");
+    expect(dashboardSnapshot).toHaveBeenNthCalledWith(2, "mesh", expect.any(AbortSignal));
+    expect(maximumInFlight).toBe(1);
+    unmount();
+  });
+
+  it("does not overlap an authenticated probe when the user changes scope", async () => {
+    vi.useFakeTimers();
+    const mesh = { ...dashboard, revision: "8", scope: "mesh" as const };
+    let resolveProbe!: (value: DashboardSnapshot) => void;
+    const pendingProbe = new Promise<DashboardSnapshot>((resolve) => { resolveProbe = resolve; });
+    const dashboardSnapshot = vi.fn()
+      .mockResolvedValueOnce(mesh)
+      .mockResolvedValueOnce(dashboard)
+      .mockReturnValueOnce(pendingProbe)
+      .mockResolvedValue(mesh);
+    const activityEvents = vi.fn(() => new Promise<never>(() => undefined));
+    const { unmount } = render(<App client={fakeClient({ dashboardSnapshot, activityEvents })} />);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByRole("tab", { name: "Alle autorisierten Geräte" })).toBeEnabled();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(dashboardSnapshot).toHaveBeenCalledTimes(3);
+    fireEvent.click(screen.getByRole("tab", { name: "Alle autorisierten Geräte" }));
+    expect(dashboardSnapshot).toHaveBeenCalledTimes(3);
+
+    await act(async () => { resolveProbe(mesh); await Promise.resolve(); });
+    expect(dashboardSnapshot).toHaveBeenCalledTimes(4);
+    unmount();
+  });
+
+  it("treats repeated cursor-ahead and limit-exceeded stream results as terminal", async () => {
+    const repeatedCursorAhead = vi.fn()
+      .mockResolvedValueOnce({ result: "cursor_ahead", newest_available: { epoch: "4", sequence: "9" } })
+      .mockResolvedValueOnce({ result: "cursor_ahead", newest_available: { epoch: "4", sequence: "9" } })
+      .mockImplementation(() => new Promise<never>(() => undefined));
+    const { unmount } = render(<App client={fakeClient({ activityEvents: repeatedCursorAhead })} />);
+    await waitFor(() => expect(repeatedCursorAhead).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Cursor/);
+    expect(screen.queryByText("Stream verbindet erneut")).not.toBeInTheDocument();
+    unmount();
+
+    const limitExceeded = vi.fn().mockResolvedValue({ result: "limit_exceeded" });
+    render(<App client={fakeClient({ activityEvents: limitExceeded })} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Größenlimit/);
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    expect(limitExceeded).toHaveBeenCalledOnce();
+    expect(screen.queryByText("Stream verbindet erneut")).not.toBeInTheDocument();
   });
 
   it("serializes snapshot polls and never replaces a newer revision with an older response", async () => {
@@ -253,7 +328,7 @@ describe("DeviceLane desktop foundation", () => {
     const activityEvents = vi.fn(() => new Promise<never>(() => undefined));
     const { unmount } = render(<App client={fakeClient({ dashboardSnapshot, activityEvents })} />);
     await act(async () => Promise.resolve());
-    await vi.advanceTimersByTimeAsync(30_000);
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
     expect(dashboardSnapshot).toHaveBeenCalledTimes(1);
 
     await act(async () => {
@@ -261,8 +336,10 @@ describe("DeviceLane desktop foundation", () => {
       await Promise.resolve();
     });
     expect(screen.getByText("Neuer Host")).toBeVisible();
-    await vi.advanceTimersByTimeAsync(10_000);
-    await act(async () => Promise.resolve());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+      await Promise.resolve();
+    });
     expect(screen.queryByText("Alter Host")).not.toBeInTheDocument();
     unmount();
   });

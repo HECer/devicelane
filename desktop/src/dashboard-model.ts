@@ -3,8 +3,11 @@ import type {
   ActivityState,
   ConnectionPath,
   Freshness,
+  LeaseState,
   MessageCode,
+  MessageParam,
   MetricValue,
+  PolicyEffect,
   Presence,
   ResourceClass,
   ResourceOccupancy,
@@ -43,6 +46,33 @@ export function activityStateDisplay(value: ActivityState): DisplayValue {
     case "failed": return { label: "Fehlgeschlagen", icon: "×", sortOrder: 5 };
     case "denied": return { label: "Abgelehnt", icon: "−", sortOrder: 6 };
     case "cancelled": return { label: "Abgebrochen", icon: "□", sortOrder: 7 };
+    default: return assertNever(value);
+  }
+}
+
+export function policyEffectLabel(value: PolicyEffect): string {
+  switch (value) {
+    case "allow": return "Erlaubt";
+    case "deny": return "Abgelehnt";
+    default: return assertNever(value);
+  }
+}
+
+export function leaseStateDisplay(value: LeaseState): Pick<DisplayValue, "label" | "icon"> {
+  switch (value) {
+    case "active": return { label: "Lease aktiv", icon: "✓" };
+    case "uncertain": return { label: "Lease unsicher – keine neue Autorisierung", icon: "!" };
+    default: return assertNever(value);
+  }
+}
+
+export function messageParamLabel(value: MessageParam): string {
+  switch (value) {
+    case "local": return "Lokal";
+    case "remote": return "Remote";
+    case "allowed": return "Erlaubt";
+    case "denied": return "Abgelehnt";
+    case "unavailable": return "Nicht verfügbar";
     default: return assertNever(value);
   }
 }

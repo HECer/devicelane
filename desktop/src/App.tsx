@@ -26,12 +26,13 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   const [errorMessage, setErrorMessage] = useState("");
   const [streamError, setStreamError] = useState("");
   const [scope, setScope] = useState<DashboardScope>("local");
+  const scopeRef = useRef<DashboardScope>(scope);
+  const requestSnapshotRefresh = useRef<(() => void) | undefined>(undefined);
   const [dashboard, setDashboard] = useState<DashboardSnapshot>();
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [selectedHostId, setSelectedHostId] = useState<string>();
   const [streamReconnecting, setStreamReconnecting] = useState(false);
   const [meshAvailable, setMeshAvailable] = useState(false);
-  const meshAvailabilityKnown = useRef(false);
   const dashboardRevision = useRef<string | undefined>(undefined);
   const subscriberId = useRef(`desktop-${globalThis.crypto?.randomUUID?.() ?? Date.now().toString(36)}`);
   usePretext();
@@ -63,33 +64,81 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   }, [client]);
 
   useEffect(() => {
+    if (scopeRef.current === scope) return;
+    scopeRef.current = scope;
+    requestSnapshotRefresh.current?.();
+  }, [scope]);
+
+  useEffect(() => {
     const controller = new AbortController();
     let timer: number | undefined;
+    let running = false;
+    let rerun = false;
     const updateSnapshot = async () => {
+      if (running) {
+        rerun = true;
+        return;
+      }
+      running = true;
+      const selectedScope = scopeRef.current;
       try {
-        const requestedScope = meshAvailabilityKnown.current ? scope : "mesh";
-        const next = await client.dashboardSnapshot(requestedScope, controller.signal);
+        const meshProbe = await client.dashboardSnapshot("mesh", controller.signal);
         if (controller.signal.aborted) return;
-        applyDashboard(next);
-        if (!meshAvailabilityKnown.current || requestedScope === "mesh") {
-          setMeshAvailable(next.scope === "mesh");
-          meshAvailabilityKnown.current = true;
+        const authorized = meshProbe.scope === "mesh";
+        setMeshAvailable(authorized);
+        if (scopeRef.current !== selectedScope) {
+          rerun = true;
+          return;
         }
-        if (next.scope !== scope) setScope(next.scope);
+        const next = selectedScope === "local" && authorized
+          ? await client.dashboardSnapshot("local", controller.signal)
+          : meshProbe;
+        if (controller.signal.aborted) return;
+        if (scopeRef.current !== selectedScope) {
+          rerun = true;
+          return;
+        }
+        if (selectedScope === "local" && next.scope !== "local") {
+          throw new Error("Lokale Dashboard-Antwort hat einen unerwarteten Bereich");
+        }
+        applyDashboard(next);
+        if (selectedScope === "mesh" && next.scope !== "mesh") {
+          scopeRef.current = next.scope;
+          setScope(next.scope);
+        }
       } catch (error) {
         if (!controller.signal.aborted) {
           setErrorMessage(error instanceof Error ? error.message : String(error));
         }
       } finally {
-        if (!controller.signal.aborted) timer = window.setTimeout(() => void updateSnapshot(), 10_000);
+        running = false;
+        if (!controller.signal.aborted) {
+          if (rerun) {
+            rerun = false;
+            void updateSnapshot();
+            return;
+          }
+          rerun = false;
+          timer = window.setTimeout(() => void updateSnapshot(), 10_000);
+        }
       }
     };
+    const refreshSnapshot = () => {
+      if (running) {
+        rerun = true;
+        return;
+      }
+      if (timer !== undefined) window.clearTimeout(timer);
+      void updateSnapshot();
+    };
+    requestSnapshotRefresh.current = refreshSnapshot;
     void updateSnapshot();
     return () => {
       controller.abort();
       if (timer !== undefined) window.clearTimeout(timer);
+      if (requestSnapshotRefresh.current === refreshSnapshot) requestSnapshotRefresh.current = undefined;
     };
-  }, [client, scope]);
+  }, [client]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -97,6 +146,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
     let cursor: EventCursor = { epoch: "0", sequence: "0" };
     let reconnectAttempt = 0;
     let lastResyncRevision: string | undefined;
+    let cursorAheadRecovered = false;
 
     const schedule = (callback: () => void, delay: number) => {
       timer = window.setTimeout(callback, delay);
@@ -112,13 +162,16 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
             await client.acknowledgeEvents(subscriberId.current, page.next_cursor, controller.signal);
             cursor = page.next_cursor;
             reconnectAttempt = 0;
+            cursorAheadRecovered = false;
             setStreamReconnecting(false);
             setStreamError("");
             schedule(() => void pump(), page.events.length === 100 ? 0 : 1_000);
             return;
           case "resync_required": {
             if (lastResyncRevision === page.snapshot_revision) {
-              throw new Error("Aktivitätsstream benötigt erneut eine Synchronisierung");
+              setStreamReconnecting(false);
+              setStreamError("Aktivitätsstream benötigt erneut eine Synchronisierung");
+              return;
             }
             lastResyncRevision = page.snapshot_revision;
             const freshSnapshot = await client.dashboardSnapshot(scope, controller.signal);
@@ -130,11 +183,19 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
             return;
           }
           case "cursor_ahead":
+            if (cursorAheadRecovered) {
+              setStreamReconnecting(false);
+              setStreamError("Aktivitäts-Cursor bleibt dem verfügbaren Stream voraus");
+              return;
+            }
+            cursorAheadRecovered = true;
             cursor = page.newest_available;
             schedule(() => void pump(), 0);
             return;
           case "limit_exceeded":
-            throw new Error("Aktivitätsseite überschreitet das sichere Größenlimit");
+            setStreamReconnecting(false);
+            setStreamError("Aktivitätsseite überschreitet das sichere Größenlimit");
+            return;
           default:
             page satisfies never;
         }

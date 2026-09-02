@@ -7,7 +7,9 @@ import {
   formatMetric,
   formatTimestamp,
   isoTimestamp,
+  messageParamLabel,
   messageCodeLabel,
+  policyEffectLabel,
   mergeActivityEvents,
 } from "../dashboard-model";
 
@@ -53,13 +55,16 @@ export function ActivityFeed({ events, reconnecting = false }: ActivityFeedProps
                 <p className="activity-operation"><strong>{event.principal_id}</strong> · {event.operation}</p>
                 <p>{event.source_host_id} → {event.target_host_id}{event.device_id ? ` / ${event.device_id}` : ""}</p>
                 <p className="activity-authorization">
-                  <strong>{event.authorization.effect === "allow" ? "Erlaubt" : "Abgelehnt"}</strong>
+                  <strong>{policyEffectLabel(event.authorization.effect)}</strong>
                   {event.authorization.rule_id && <> · Regel: {event.authorization.rule_id}</>}
                   {event.authorization.approval_id && <> · Freigabe: {event.authorization.approval_id}</>}
                 </p>
                 {event.message && <p className="activity-message">
                   {event.message.code === "redacted" && <><strong>Redigierte Ausgabe</strong> · </>}
                   <span>{messageCodeLabel(event.message.code)}</span>
+                  {event.message.params.length > 0 && <span className="message-params">
+                    {event.message.params.map(messageParamLabel).join(", ")}
+                  </span>}
                 </p>}
                 <p className="activity-duration">
                   Gestartet: {event.started_at_ms ? formatTimestamp(event.started_at_ms) : "Nicht gemeldet"}

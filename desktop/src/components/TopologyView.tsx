@@ -2,6 +2,7 @@ import type { DashboardDevice, DashboardHost, DashboardLease, Presence } from ".
 import {
   connectionPathLabel,
   freshnessLabel,
+  leaseStateDisplay,
   presenceDisplay,
   trustLabel
 } from "../dashboard-model";
@@ -40,10 +41,14 @@ function DeviceRow({ device, leases }: { device: DashboardDevice; leases: Dashbo
       </div>
       <PresenceText presence={device.presence} />
       <span className="freshness">{freshnessLabel(device.freshness)}</span>
-      {leases.map((lease) => <span key={lease.id} className={`lease-state lease-state--${lease.state}`}>
-        <span aria-hidden="true">{lease.state === "active" ? "✓" : "!"}</span>
-        {lease.state === "active" ? "Lease aktiv" : "Lease unsicher – keine neue Autorisierung"}
-      </span>)}
+      {leases.map((lease) => {
+        const display = leaseStateDisplay(lease.state);
+        return <span key={lease.id} className={`lease-state lease-state--${lease.state}`}>
+          <span aria-hidden="true">{display.icon}</span>
+          <span>{display.label}</span>
+          <span className="lease-attribution">Inhaber: {lease.owner_host_id} · Gerät: {lease.device_id}</span>
+        </span>;
+      })}
       <TagList label="Gerätefähigkeiten" values={device.capabilities} />
       <TagList label="Geräteberechtigungen" values={device.permissions} />
     </li>

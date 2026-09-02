@@ -57,6 +57,8 @@ describe("TopologyView", () => {
     expect(screen.getByText("Verbindung über Registry")).toBeVisible();
     expect(screen.getByText("iPhone 17 Pro")).toBeVisible();
     expect(screen.getByText("Lease unsicher – keine neue Autorisierung")).toBeVisible();
+    expect(screen.getByText(/Inhaber: host-3/)).toBeVisible();
+    expect(screen.getByText(/Gerät: iphone-1/)).toBeVisible();
     expect(screen.getByText("Hermanns sehr lang benanntes MacBook Pro für mobile Builds")).toBeVisible();
   });
 

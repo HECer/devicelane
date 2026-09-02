@@ -50,6 +50,7 @@ describe("ActivityFeed", () => {
     expect(screen.getAllByText(/Regel: rule-1/)).toHaveLength(2);
     expect(screen.getAllByText(/Freigabe: approval-1/)).toHaveLength(2);
     expect(screen.getAllByText("Aktivität gestartet")).toHaveLength(2);
+    expect(screen.getAllByText("Remote")).toHaveLength(2);
     expect(screen.getAllByText(/Gestartet:/)).toHaveLength(2);
     expect(screen.getByText(/Beendet:/)).toBeVisible();
   });
