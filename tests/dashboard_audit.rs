@@ -106,11 +106,7 @@ fn retention_is_bounded_and_uses_an_inclusive_utc_cutoff() {
             .collect::<Vec<_>>(),
         vec![2, 3]
     );
-    assert!(
-        page.items
-            .iter()
-            .any(|item| item.result == AuditResult::Deleted)
-    );
+    assert_eq!(store.retention_tombstones().len(), 1);
 }
 
 #[test]
@@ -293,4 +289,207 @@ fn export_is_canonical_hashed_and_has_explicit_signature_status() {
     );
     let unsigned = store.export(AuditFilter::default(), None).unwrap();
     assert_eq!(unsigned.manifest.signature, ExportSignature::Unavailable);
+}
+
+#[test]
+fn midday_retention_keeps_a_mixed_segment_consistent_after_reopen() {
+    let temp = TempDir::new().unwrap();
+    let day = 86_400_000;
+    let mut store = AuditStore::open(
+        temp.path(),
+        RetentionPolicy::new(1).unwrap(),
+        Redactor::default(),
+    )
+    .unwrap();
+    store.append(raw(1, day / 4, "expired-in-mixed")).unwrap();
+    store
+        .append(raw(2, 3 * day / 4, "retained-in-mixed"))
+        .unwrap();
+    store.append(raw(3, day + day / 2, "current")).unwrap();
+    store.enforce_retention(day + day / 2).unwrap();
+    assert_eq!(
+        store
+            .query(AuditFilter::default(), None, 20)
+            .unwrap()
+            .items
+            .iter()
+            .filter(|record| record.result != AuditResult::Deleted)
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    drop(store);
+    let reopened = open(&temp);
+    assert_eq!(
+        reopened
+            .query(AuditFilter::default(), None, 20)
+            .unwrap()
+            .items
+            .iter()
+            .filter(|record| record.result != AuditResult::Deleted)
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn an_incomplete_tail_in_a_rotated_segment_is_committed_corruption() {
+    let temp = TempDir::new().unwrap();
+    let mut store = open(&temp);
+    store.append(raw(1, 1, "first-day")).unwrap();
+    store.append(raw(2, 86_400_001, "second-day")).unwrap();
+    drop(store);
+    let mut segments = fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|value| value == "audit"))
+        .collect::<Vec<_>>();
+    segments.sort();
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&segments[0])
+        .unwrap()
+        .write_all(&[0, 0, 0, 20, b'{'])
+        .unwrap();
+    assert!(matches!(
+        AuditStore::open(temp.path(), RetentionPolicy::default(), Redactor::default()),
+        Err(AuditError::CommittedCorruption)
+    ));
+}
+
+#[test]
+fn oversized_typed_records_fail_before_rotation_or_any_write() {
+    let temp = TempDir::new().unwrap();
+    let mut store = AuditStore::open_with_segment_limit(
+        temp.path(),
+        RetentionPolicy::default(),
+        Redactor::default(),
+        300,
+    )
+    .unwrap();
+    let before = fs::metadata(store.current_segment_path()).unwrap().len();
+    assert!(matches!(
+        store.append(raw(1, 1, "ok")),
+        Err(AuditError::FrameTooLarge)
+    ));
+    assert_eq!(
+        fs::metadata(store.current_segment_path()).unwrap().len(),
+        before
+    );
+    assert_eq!(
+        fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".audit"))
+            .count(),
+        1
+    );
+
+    let temp = TempDir::new().unwrap();
+    let mut store = open(&temp);
+    let mut oversized = raw(1, 1, "ok");
+    oversized.resources = vec![ResourceClass::WorkspaceRead; 257];
+    assert!(matches!(
+        store.append(oversized),
+        Err(AuditError::InvalidRecord)
+    ));
+    assert_eq!(fs::metadata(store.current_segment_path()).unwrap().len(), 0);
+}
+
+#[test]
+fn retention_tombstone_names_exact_deleted_segments_and_survives_reopen() {
+    let temp = TempDir::new().unwrap();
+    let day = 86_400_000;
+    let mut store = AuditStore::open(
+        temp.path(),
+        RetentionPolicy::new(1).unwrap(),
+        Redactor::default(),
+    )
+    .unwrap();
+    store.append(raw(1, 1, "old")).unwrap();
+    store.append(raw(2, 2 * day, "new")).unwrap();
+    store.enforce_retention(2 * day).unwrap();
+    let summary = store.retention_tombstones().last().unwrap();
+    assert_eq!(summary.deleted_record_count, 1);
+    assert_eq!(
+        (summary.first_occurred_at_ms, summary.last_occurred_at_ms),
+        (1, 1)
+    );
+    assert_eq!(summary.segments.len(), 1);
+    assert_eq!(summary.segments[0].sha256.len(), 64);
+    assert!(summary.segments[0].id.starts_with("segment-"));
+    drop(store);
+    let reopened = open(&temp);
+    assert_eq!(reopened.retention_tombstones().len(), 1);
+    assert_eq!(reopened.retention_tombstones()[0].deleted_record_count, 1);
+    assert!(
+        !reopened
+            .query(AuditFilter::default(), None, 20)
+            .unwrap()
+            .items
+            .iter()
+            .any(|record| record.sequence == 1)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_unix_storage_is_non_link_owned_and_restrictive() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let outer = TempDir::new().unwrap();
+    let root = outer.path().join("audit");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    let store = AuditStore::open(&root, RetentionPolicy::default(), Redactor::default()).unwrap();
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let segment = store.current_segment_path();
+    drop(store);
+    fs::set_permissions(&segment, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(
+        AuditStore::open(&root, RetentionPolicy::default(), Redactor::default()),
+        Err(AuditError::InsecureStorage)
+    ));
+
+    fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).unwrap();
+    let index = root.join("index.json");
+    let target = outer.path().join("foreign-index");
+    fs::write(&target, b"{}").unwrap();
+    fs::remove_file(&index).unwrap();
+    symlink(&target, &index).unwrap();
+    assert!(matches!(
+        AuditStore::open(&root, RetentionPolicy::default(), Redactor::default()),
+        Err(AuditError::InsecureStorage)
+    ));
+
+    let linked = outer.path().join("linked");
+    symlink(&root, &linked).unwrap();
+    assert!(matches!(
+        AuditStore::open(&linked, RetentionPolicy::default(), Redactor::default()),
+        Err(AuditError::InsecureStorage)
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn existing_windows_storage_rejects_a_native_foreign_writer_acl() {
+    let temp = TempDir::new().unwrap();
+    let store = open(&temp);
+    let segment = store.current_segment_path();
+    drop(store);
+    let status = std::process::Command::new("icacls")
+        .arg(&segment)
+        .args(["/grant", "*S-1-1-0:(F)"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(matches!(
+        AuditStore::open(temp.path(), RetentionPolicy::default(), Redactor::default()),
+        Err(AuditError::InsecureStorage)
+    ));
 }

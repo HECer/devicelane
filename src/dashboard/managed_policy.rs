@@ -170,7 +170,7 @@ fn ensure_restrictive_file(
 }
 
 #[cfg(windows)]
-fn windows_acl_is_restrictive(path: &Path, configured: &HashSet<String>) -> bool {
+pub(crate) fn windows_acl_is_restrictive(path: &Path, configured: &HashSet<String>) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{

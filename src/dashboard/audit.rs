@@ -21,6 +21,9 @@ pub enum AuditError {
     Serialization(serde_json::Error),
     InvalidRetention,
     InvalidSequence,
+    InvalidRecord,
+    FrameTooLarge,
+    InsecureStorage,
     LimitExceeded,
     CursorAhead,
     CommittedCorruption,
@@ -35,6 +38,9 @@ impl std::fmt::Display for AuditError {
             Self::Serialization(_) => "audit_serialization_error",
             Self::InvalidRetention => "invalid_retention",
             Self::InvalidSequence => "invalid_sequence",
+            Self::InvalidRecord => "invalid_record",
+            Self::FrameTooLarge => "frame_too_large",
+            Self::InsecureStorage => "insecure_storage",
             Self::LimitExceeded => "limit_exceeded",
             Self::CursorAhead => "cursor_ahead",
             Self::CommittedCorruption => "committed_corruption",
@@ -256,6 +262,31 @@ pub struct ExportManifest {
     pub records_sha256: String,
     pub signature: ExportSignature,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeletedSegmentSummary {
+    pub id: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionTombstoneSummary {
+    pub deleted_record_count: usize,
+    pub first_occurred_at_ms: u64,
+    pub last_occurred_at_ms: u64,
+    pub segments: Vec<DeletedSegmentSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredEntry {
+    Record(AuditRecord),
+    RetentionTombstone {
+        retention_tombstone: RetentionTombstoneSummary,
+    },
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct AuditExport {
     pub records: Vec<AuditRecord>,
@@ -281,6 +312,7 @@ pub struct AuditStore {
     current: u64,
     current_day: Option<u64>,
     records: Vec<AuditRecord>,
+    tombstones: Vec<RetentionTombstoneSummary>,
     recovered: bool,
     available: bool,
     max_segment_bytes: u64,
@@ -306,11 +338,15 @@ impl AuditStore {
         }
         let root = root.as_ref().to_owned();
         create_private_dir(&root)?;
+        validate_private_dir(&root)?;
         let current = read_index(&root)?.unwrap_or(1);
         let mut records = Vec::new();
+        let mut tombstones = Vec::new();
         let mut recovered = false;
         for path in segment_paths(&root)? {
-            recovered |= read_segment(&path, &mut records)?;
+            validate_private_file(&path)?;
+            let is_current = path == root.join(format!("segment-{current:020}.audit"));
+            recovered |= read_segment(&path, &mut records, &mut tombstones, is_current)?;
         }
         let current_day = records.last().map(|record| record.occurred_at_ms / DAY_MS);
         let mut store = Self {
@@ -320,6 +356,7 @@ impl AuditStore {
             current,
             current_day,
             records,
+            tombstones,
             recovered,
             available: true,
             max_segment_bytes,
@@ -327,6 +364,7 @@ impl AuditStore {
         if !store.segment_path(current).exists() {
             store.create_segment(current)?;
         }
+        validate_private_file(&store.segment_path(current))?;
         store.write_index()?;
         if recovered {
             let sequence = store
@@ -374,17 +412,29 @@ impl AuditStore {
         {
             return Err(AuditError::InvalidSequence);
         }
-        if let Err(error) = self.append_inner(raw) {
+        let record = self.redactor.redact(raw);
+        if record.validate().is_err() {
+            return Err(AuditError::InvalidRecord);
+        }
+        let payload = serde_json::to_vec(&StoredEntry::Record(record.clone()))
+            .map_err(|_| AuditError::InvalidRecord)?;
+        let frame_len = frame_len(&payload)?;
+        if frame_len > self.max_segment_bytes || frame_len > MAX_SEGMENT_BYTES {
+            return Err(AuditError::FrameTooLarge);
+        }
+        if let Err(error) = self.append_inner(record, payload, frame_len) {
             self.available = false;
             return Err(error);
         }
         Ok(())
     }
 
-    fn append_inner(&mut self, raw: RawAuditRecord) -> Result<(), AuditError> {
-        let record = self.redactor.redact(raw);
-        let payload = serde_json::to_vec(&record)?;
-        let frame_len = 4 + payload.len() as u64 + HASH_BYTES as u64;
+    fn append_inner(
+        &mut self,
+        record: AuditRecord,
+        payload: Vec<u8>,
+        frame_len: u64,
+    ) -> Result<(), AuditError> {
         let day = record.occurred_at_ms / DAY_MS;
         let segment_len = fs::metadata(self.segment_path(self.current))?.len();
         if segment_len + frame_len > self.max_segment_bytes
@@ -440,70 +490,80 @@ impl AuditStore {
 
     pub fn enforce_retention(&mut self, now_ms: u64) -> Result<(), AuditError> {
         let cutoff = now_ms.saturating_sub(u64::from(self.retention.days()) * DAY_MS);
-        let expired: Vec<_> = self
-            .records
-            .iter()
-            .filter(|record| record.occurred_at_ms < cutoff)
-            .cloned()
-            .collect();
-        if expired.is_empty() {
-            return Ok(());
-        }
-        self.rotate()?;
-        let max_sequence = self
-            .records
-            .iter()
-            .map(|record| record.sequence)
-            .max()
-            .unwrap_or(0);
-        let first = &expired[0];
-        self.append(RawAuditRecord {
-            sequence: max_sequence + 1,
-            occurred_at_ms: now_ms,
-            activity_id: None,
-            principal_id: first.principal_id.clone(),
-            source_host_id: first.source_host_id.clone(),
-            target_host_id: first.target_host_id.clone(),
-            device_id: None,
-            operation: OperationId::parse("retention-delete").map_err(|_| {
-                AuditError::Serialization(serde_json::Error::io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid operation",
-                )))
-            })?,
-            resources: Vec::new(),
-            decision: PolicyEffect::Allow,
-            result: AuditResult::Deleted,
-            message: Some("retention deletion".to_owned()),
-            arguments: Vec::new(),
-            environment: Vec::new(),
-            stdout: None,
-            stderr: None,
-            workspace_path: None,
-            artifact_metadata: Vec::new(),
-        })?;
-        // The tombstone is durable before old segment removal. Only wholly expired day segments are deleted.
-        let expired_days: std::collections::BTreeSet<_> = expired
-            .iter()
-            .map(|record| record.occurred_at_ms / DAY_MS)
-            .collect();
+        let mut deletable = Vec::new();
+        let mut deleted_records = Vec::new();
         for path in segment_paths(&self.root)? {
-            if path != self.segment_path(self.current) {
-                let mut values = Vec::new();
-                read_segment(&path, &mut values)?;
-                if !values.is_empty()
-                    && values
-                        .iter()
-                        .all(|record| expired_days.contains(&(record.occurred_at_ms / DAY_MS)))
-                {
-                    fs::remove_file(path)?;
-                }
+            if path == self.segment_path(self.current) {
+                continue;
+            }
+            let mut records = Vec::new();
+            let mut tombstones = Vec::new();
+            read_segment(&path, &mut records, &mut tombstones, false)?;
+            if !records.is_empty() && records.iter().all(|record| record.occurred_at_ms < cutoff) {
+                deleted_records.extend(records);
+                deletable.push(path);
             }
         }
-        self.records.retain(|record| {
-            record.occurred_at_ms >= cutoff || record.result == AuditResult::Deleted
-        });
+        if deletable.is_empty() {
+            return Ok(());
+        }
+        let summary = RetentionTombstoneSummary {
+            deleted_record_count: deleted_records.len(),
+            first_occurred_at_ms: deleted_records
+                .iter()
+                .map(|record| record.occurred_at_ms)
+                .min()
+                .unwrap_or(0),
+            last_occurred_at_ms: deleted_records
+                .iter()
+                .map(|record| record.occurred_at_ms)
+                .max()
+                .unwrap_or(0),
+            segments: deletable
+                .iter()
+                .map(|path| {
+                    Ok(DeletedSegmentSummary {
+                        id: path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or(AuditError::InsecureStorage)?
+                            .to_owned(),
+                        sha256: hex(&Sha256::digest(fs::read(path)?)),
+                    })
+                })
+                .collect::<Result<Vec<_>, AuditError>>()?,
+        };
+        let payload = serde_json::to_vec(&StoredEntry::RetentionTombstone {
+            retention_tombstone: summary.clone(),
+        })?;
+        let length = frame_len(&payload)?;
+        if length > self.max_segment_bytes || length > MAX_SEGMENT_BYTES {
+            return Err(AuditError::FrameTooLarge);
+        }
+        self.rotate()?;
+        append_frame(&self.segment_path(self.current), &payload)?;
+        self.tombstones.push(summary);
+        // Prove the durable tombstone can be read strictly before deleting referenced segments.
+        let mut verified_records = Vec::new();
+        let mut verified_tombstones = Vec::new();
+        read_segment(
+            &self.segment_path(self.current),
+            &mut verified_records,
+            &mut verified_tombstones,
+            false,
+        )?;
+        if verified_tombstones.last() != self.tombstones.last() {
+            return Err(AuditError::CommittedCorruption);
+        }
+        for path in &deletable {
+            fs::remove_file(path)?;
+        }
         sync_directory(&self.root)?;
+        self.records.clear();
+        self.tombstones.clear();
+        for path in segment_paths(&self.root)? {
+            read_segment(&path, &mut self.records, &mut self.tombstones, false)?;
+        }
         self.write_index()?;
         Ok(())
     }
@@ -543,6 +603,9 @@ impl AuditStore {
 
     pub fn current_segment_path(&self) -> PathBuf {
         self.segment_path(self.current)
+    }
+    pub fn retention_tombstones(&self) -> &[RetentionTombstoneSummary] {
+        &self.tombstones
     }
     pub fn recovery_performed(&self) -> bool {
         self.recovered
@@ -607,8 +670,20 @@ fn append_frame(path: &Path, payload: &[u8]) -> Result<(), AuditError> {
     Ok(())
 }
 
-fn read_segment(path: &Path, records: &mut Vec<AuditRecord>) -> Result<bool, AuditError> {
-    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+fn frame_len(payload: &[u8]) -> Result<u64, AuditError> {
+    let payload_len = u32::try_from(payload.len()).map_err(|_| AuditError::FrameTooLarge)?;
+    Ok(u64::from(payload_len) + 4 + HASH_BYTES as u64)
+}
+
+fn read_segment(
+    path: &Path,
+    records: &mut Vec<AuditRecord>,
+    tombstones: &mut Vec<RetentionTombstoneSummary>,
+    allow_tail_recovery: bool,
+) -> Result<bool, AuditError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(allow_tail_recovery);
+    let mut file = options.open(path)?;
     loop {
         let start = file.stream_position()?;
         let mut length = [0_u8; 4];
@@ -616,8 +691,11 @@ fn read_segment(path: &Path, records: &mut Vec<AuditRecord>) -> Result<bool, Aud
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
                 let recovered = fs::metadata(path)?.len() != start;
-                file.set_len(start)?;
+                if recovered && !allow_tail_recovery {
+                    return Err(AuditError::CommittedCorruption);
+                }
                 if recovered {
+                    file.set_len(start)?;
                     file.sync_all()?;
                 }
                 return Ok(recovered);
@@ -625,12 +703,25 @@ fn read_segment(path: &Path, records: &mut Vec<AuditRecord>) -> Result<bool, Aud
             Err(error) => return Err(error.into()),
         }
         let length = u32::from_be_bytes(length) as usize;
-        if length > MAX_PAGE_BYTES {
+        let remaining = fs::metadata(path)?.len().saturating_sub(start + 4);
+        let required = length as u64 + HASH_BYTES as u64;
+        if remaining < required {
+            if !allow_tail_recovery {
+                return Err(AuditError::CommittedCorruption);
+            }
+            file.set_len(start)?;
+            file.sync_all()?;
+            return Ok(true);
+        }
+        if required + 4 > MAX_SEGMENT_BYTES {
             return Err(AuditError::CommittedCorruption);
         }
         let mut payload = vec![0; length];
         let mut expected = [0; HASH_BYTES];
         if file.read_exact(&mut payload).is_err() || file.read_exact(&mut expected).is_err() {
+            if !allow_tail_recovery {
+                return Err(AuditError::CommittedCorruption);
+            }
             file.set_len(start)?;
             file.sync_all()?;
             return Ok(true);
@@ -638,21 +729,27 @@ fn read_segment(path: &Path, records: &mut Vec<AuditRecord>) -> Result<bool, Aud
         if Sha256::digest(&payload).as_slice() != expected {
             return Err(AuditError::CommittedCorruption);
         }
-        records
-            .push(serde_json::from_slice(&payload).map_err(|_| AuditError::CommittedCorruption)?);
+        match serde_json::from_slice(&payload).map_err(|_| AuditError::CommittedCorruption)? {
+            StoredEntry::Record(record) => records.push(record),
+            StoredEntry::RetentionTombstone {
+                retention_tombstone,
+            } => tombstones.push(retention_tombstone),
+        }
     }
 }
 
 fn segment_paths(root: &Path) -> Result<Vec<PathBuf>, AuditError> {
-    let mut paths = fs::read_dir(root)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|v| v.to_str())
-                .is_some_and(|v| v.starts_with("segment-") && v.ends_with(".audit"))
-        })
-        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .is_some_and(|v| v.starts_with("segment-") && v.ends_with(".audit"))
+        {
+            paths.push(path);
+        }
+    }
     paths.sort();
     Ok(paths)
 }
@@ -662,6 +759,7 @@ fn read_index(root: &Path) -> Result<Option<u64>, AuditError> {
     if !path.exists() {
         return Ok(None);
     }
+    validate_private_file(&path)?;
     let index: Index =
         serde_json::from_slice(&fs::read(path)?).map_err(|_| AuditError::CommittedCorruption)?;
     if index.version != 1 || index.current == 0 {
@@ -672,13 +770,10 @@ fn read_index(root: &Path) -> Result<Option<u64>, AuditError> {
 
 #[cfg(not(windows))]
 fn create_private_dir(path: &Path) -> Result<(), AuditError> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    if fs::symlink_metadata(path).is_err() {
+        fs::create_dir_all(path)?;
     }
-    Ok(())
+    validate_private_dir(path)
 }
 #[cfg(windows)]
 fn create_private_dir(path: &Path) -> Result<(), AuditError> {
@@ -700,6 +795,46 @@ fn create_private_file(path: &Path) -> Result<File, AuditError> {
     windows_private::create_file(path)
 }
 
+#[cfg(unix)]
+fn validate_private_dir(path: &Path) -> Result<(), AuditError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = fs::symlink_metadata(path).map_err(|_| AuditError::InsecureStorage)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(AuditError::InsecureStorage);
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_file(path: &Path) -> Result<(), AuditError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = fs::symlink_metadata(path).map_err(|_| AuditError::InsecureStorage)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(AuditError::InsecureStorage);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_private_dir(path: &Path) -> Result<(), AuditError> {
+    windows_private::validate(path, true)
+}
+
+#[cfg(windows)]
+fn validate_private_file(path: &Path) -> Result<(), AuditError> {
+    windows_private::validate(path, false)
+}
+
 #[cfg(windows)]
 mod windows_private {
     use super::*;
@@ -710,20 +845,22 @@ mod windows_private {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
+        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE,
-        FILE_SHARE_NONE,
+        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     pub fn create_dir(path: &Path) -> Result<(), AuditError> {
         if path.exists() {
-            return Ok(());
+            return tighten_existing_dir(path);
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -737,6 +874,104 @@ mod windows_private {
             }
         }
         Ok(())
+    }
+
+    pub fn validate(path: &Path, directory: bool) -> Result<(), AuditError> {
+        use std::os::windows::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(path).map_err(|_| AuditError::InsecureStorage)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || if directory {
+                !metadata.is_dir()
+            } else {
+                !metadata.is_file()
+            }
+            || !super::super::managed_policy::windows_acl_is_restrictive(
+                path,
+                &std::collections::HashSet::new(),
+            )
+        {
+            return Err(AuditError::InsecureStorage);
+        }
+        Ok(())
+    }
+
+    fn tighten_existing_dir(path: &Path) -> Result<(), AuditError> {
+        use std::os::windows::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(path).map_err(|_| AuditError::InsecureStorage)?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(AuditError::InsecureStorage);
+        }
+        if !owner_is_current(path)? {
+            return Err(AuditError::InsecureStorage);
+        }
+        let security = Security::current_user()?;
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        if unsafe {
+            GetSecurityDescriptorDacl(security.descriptor, &mut present, &mut dacl, &mut defaulted)
+        } == 0
+            || present == 0
+            || dacl.is_null()
+        {
+            return Err(AuditError::InsecureStorage);
+        }
+        let mut wide = wide(path);
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32).into());
+        }
+        validate(path, true)
+    }
+
+    fn owner_is_current(path: &Path) -> Result<bool, AuditError> {
+        let mut wide = wide(path);
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 || owner.is_null() || descriptor.is_null() {
+            return Err(AuditError::InsecureStorage);
+        }
+        let owner_sid = sid_text(owner);
+        unsafe { LocalFree(descriptor.cast()) };
+        Ok(owner_sid.is_some_and(|owner| {
+            current_sid().is_ok_and(|current| owner.eq_ignore_ascii_case(&current))
+        }))
+    }
+
+    fn sid_text(sid: PSID) -> Option<String> {
+        let mut text = std::ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 || text.is_null() {
+            return None;
+        }
+        let mut length = 0;
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        let value = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) }).ok();
+        unsafe { LocalFree(text.cast()) };
+        value
     }
 
     pub fn create_file(path: &Path) -> Result<File, AuditError> {
