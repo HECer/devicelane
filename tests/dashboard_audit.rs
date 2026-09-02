@@ -292,6 +292,105 @@ fn export_is_canonical_hashed_and_has_explicit_signature_status() {
 }
 
 #[test]
+fn store_lock_is_exclusive_for_the_full_store_lifetime() {
+    let temp = TempDir::new().unwrap();
+    let first = open(&temp);
+    assert!(matches!(
+        AuditStore::open(temp.path(), RetentionPolicy::default(), Redactor::default()),
+        Err(AuditError::StoreLocked)
+    ));
+    drop(first);
+    assert!(AuditStore::open(temp.path(), RetentionPolicy::default(), Redactor::default()).is_ok());
+}
+
+#[test]
+fn load_rejects_non_monotonic_sequences_across_indexed_segments() {
+    let temp = TempDir::new().unwrap();
+    let mut store = open(&temp);
+    store.append(raw(1, 1, "one")).unwrap();
+    store.append(raw(2, 86_400_001, "two")).unwrap();
+    drop(store);
+    let mut segments = fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "audit"))
+        .collect::<Vec<_>>();
+    segments.sort();
+    let first = fs::read(&segments[0]).unwrap();
+    fs::write(&segments[1], first).unwrap();
+    assert!(matches!(
+        AuditStore::open(temp.path(), RetentionPolicy::default(), Redactor::default()),
+        Err(AuditError::NonMonotonicSequence)
+    ));
+}
+
+#[test]
+fn export_signs_a_domain_separated_manifest_and_is_bounded() {
+    use device_development_mesh::dashboard::audit::canonical_export_signing_envelope;
+    let temp = TempDir::new().unwrap();
+    let mut store = open(&temp);
+    for sequence in 1..=257 {
+        store.append(raw(sequence, sequence, "ok")).unwrap();
+    }
+    assert!(matches!(
+        store.export(AuditFilter::default(), Some(&TestSigner)),
+        Err(AuditError::LimitExceeded)
+    ));
+
+    let temp = TempDir::new().unwrap();
+    let mut store = open(&temp);
+    store.append(raw(1, 1, "ok")).unwrap();
+    let export = store
+        .export(AuditFilter::default(), Some(&TestSigner))
+        .unwrap();
+    let envelope = canonical_export_signing_envelope(&export.manifest).unwrap();
+    let expected = Sha256::digest(&envelope)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert!(
+        matches!(&export.manifest.signature, ExportSignature::Signed { signature_hex, .. } if signature_hex == &expected)
+    );
+    assert!(
+        String::from_utf8(envelope.clone())
+            .unwrap()
+            .contains("devicelane.audit-export.v1")
+    );
+    let mut tampered = export.manifest.clone();
+    tampered.record_count += 1;
+    assert_ne!(
+        canonical_export_signing_envelope(&tampered).unwrap(),
+        envelope
+    );
+    tampered = export.manifest.clone();
+    let replacement = if tampered.records_sha256.starts_with('0') {
+        "1"
+    } else {
+        "0"
+    };
+    tampered.records_sha256.replace_range(..1, replacement);
+    assert_ne!(
+        canonical_export_signing_envelope(&tampered).unwrap(),
+        envelope
+    );
+    tampered = export.manifest.clone();
+    tampered.format_version += 1;
+    assert_ne!(
+        canonical_export_signing_envelope(&tampered).unwrap(),
+        envelope
+    );
+    tampered = export.manifest.clone();
+    if let ExportSignature::Signed { key_id, .. } = &mut tampered.signature {
+        key_id.push_str("-other");
+    }
+    assert_ne!(
+        canonical_export_signing_envelope(&tampered).unwrap(),
+        envelope
+    );
+}
+
+#[test]
 fn midday_retention_compacts_mixed_segments_at_the_exact_cutoff_and_reopens() {
     let temp = TempDir::new().unwrap();
     let day = 86_400_000;
@@ -410,6 +509,14 @@ fn compaction_crash_recovery_chooses_only_the_indexed_generation() {
             Redactor::default(),
         )
         .unwrap();
+        assert_eq!(
+            reopened.retention_tombstones().len(),
+            if fault == RetentionFault::BeforeIndexSwap {
+                0
+            } else {
+                1
+            }
+        );
         assert_eq!(
             reopened
                 .query(AuditFilter::default(), None, 20)

@@ -13,6 +13,8 @@ const DAY_MS: u64 = 86_400_000;
 const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PAGE_RECORDS: usize = 256;
 const MAX_PAGE_BYTES: usize = 1024 * 1024;
+const MAX_EXPORT_RECORDS: usize = 256;
+const MAX_EXPORT_BYTES: usize = 8 * 1024 * 1024;
 const HASH_BYTES: usize = 32;
 
 #[derive(Debug)]
@@ -25,6 +27,8 @@ pub enum AuditError {
     FrameTooLarge,
     InsecureStorage,
     InjectedCrash,
+    StoreLocked,
+    NonMonotonicSequence,
     LimitExceeded,
     CursorAhead,
     CommittedCorruption,
@@ -43,6 +47,8 @@ impl std::fmt::Display for AuditError {
             Self::FrameTooLarge => "frame_too_large",
             Self::InsecureStorage => "insecure_storage",
             Self::InjectedCrash => "injected_crash",
+            Self::StoreLocked => "store_locked",
+            Self::NonMonotonicSequence => "non_monotonic_sequence",
             Self::LimitExceeded => "limit_exceeded",
             Self::CursorAhead => "cursor_ahead",
             Self::CommittedCorruption => "committed_corruption",
@@ -265,6 +271,43 @@ pub struct ExportManifest {
     pub signature: ExportSignature,
 }
 
+#[derive(Serialize)]
+struct ExportSigningEnvelope<'a> {
+    domain: &'static str,
+    format_version: u16,
+    record_count: usize,
+    records_sha256: &'a str,
+    key_id: &'a str,
+}
+
+pub fn canonical_export_signing_envelope(manifest: &ExportManifest) -> Result<Vec<u8>, AuditError> {
+    let key_id = match &manifest.signature {
+        ExportSignature::Signed { key_id, .. } => key_id.as_str(),
+        ExportSignature::Unavailable => "unavailable",
+    };
+    signing_envelope(
+        manifest.format_version,
+        manifest.record_count,
+        &manifest.records_sha256,
+        key_id,
+    )
+}
+
+fn signing_envelope(
+    format_version: u16,
+    record_count: usize,
+    records_sha256: &str,
+    key_id: &str,
+) -> Result<Vec<u8>, AuditError> {
+    Ok(serde_json::to_vec(&ExportSigningEnvelope {
+        domain: "devicelane.audit-export.v1",
+        format_version,
+        record_count,
+        records_sha256,
+        key_id,
+    })?)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeletedSegmentSummary {
@@ -330,6 +373,7 @@ pub struct AuditStore {
     available: bool,
     max_segment_bytes: u64,
     active_segments: Vec<u64>,
+    _lock: File,
 }
 
 impl AuditStore {
@@ -353,6 +397,7 @@ impl AuditStore {
         let root = root.as_ref().to_owned();
         create_private_dir(&root)?;
         validate_private_dir(&root)?;
+        let store_lock = acquire_store_lock(&root.join("store.lock"))?;
         let index = read_index(&root)?;
         let current = index.as_ref().map_or(1, |index| index.current);
         let discovered = segment_paths(&root)?;
@@ -380,6 +425,12 @@ impl AuditStore {
             let is_current = path == root.join(format!("segment-{current:020}.audit"));
             recovered |= read_segment(&path, &mut records, &mut tombstones, is_current)?;
         }
+        if records
+            .windows(2)
+            .any(|pair| pair[0].sequence >= pair[1].sequence)
+        {
+            return Err(AuditError::NonMonotonicSequence);
+        }
         for path in &discovered {
             if segment_number(path).is_some_and(|number| !active_segments.contains(&number)) {
                 fs::remove_file(path)?;
@@ -399,6 +450,7 @@ impl AuditStore {
             available: true,
             max_segment_bytes,
             active_segments,
+            _lock: store_lock,
         };
         if !store.segment_path(current).exists() {
             store.create_segment(current)?;
@@ -506,17 +558,24 @@ impl AuditStore {
             return Err(AuditError::CursorAhead);
         }
         let mut items = Vec::new();
+        let mut encoded_items_bytes = 0_usize;
         for record in self
             .records
             .iter()
             .filter(|record| record.sequence > after && filter.matches(record))
         {
-            let mut candidate = items.clone();
-            candidate.push(record.clone());
-            if serde_json::to_vec(&candidate)?.len() > MAX_PAGE_BYTES {
+            let item_bytes = serde_json::to_vec(record)?.len();
+            let candidate_items_bytes =
+                encoded_items_bytes.saturating_add(item_bytes + usize::from(!items.is_empty()));
+            let candidate_cursor = EventCursor {
+                epoch: 1,
+                sequence: record.sequence,
+            };
+            if cursor_page_encoded_len(candidate_items_bytes, &candidate_cursor)? > MAX_PAGE_BYTES {
                 break;
             }
             items.push(record.clone());
+            encoded_items_bytes = candidate_items_bytes;
             if items.len() == limit {
                 break;
             }
@@ -556,12 +615,12 @@ impl AuditStore {
 
         // Seal even an idle current segment so every candidate is immutable during compaction.
         self.rotate()?;
-        let tombstone_segment = self.current;
+        let sealed_current = self.current;
         let candidates = self
             .active_segments
             .iter()
             .copied()
-            .filter(|number| *number != tombstone_segment)
+            .filter(|number| *number != sealed_current)
             .collect::<Vec<_>>();
         let mut next_number = segment_paths(&self.root)?
             .iter()
@@ -644,6 +703,8 @@ impl AuditStore {
         if length > self.max_segment_bytes || length > MAX_SEGMENT_BYTES {
             return Err(AuditError::FrameTooLarge);
         }
+        let tombstone_segment = next_number;
+        self.create_segment(tombstone_segment)?;
         append_frame(&self.segment_path(tombstone_segment), &payload)?;
         self.tombstones.push(summary);
         // Prove the durable tombstone can be read strictly before deleting referenced segments.
@@ -659,16 +720,13 @@ impl AuditStore {
             return Err(AuditError::CommittedCorruption);
         }
         sync_directory(&self.root)?;
-        let fresh_current = next_number;
-        self.create_segment(fresh_current)?;
-        sync_directory(&self.root)?;
         if fault == RetentionFault::BeforeIndexSwap {
             return Err(AuditError::InjectedCrash);
         }
         new_active.push(tombstone_segment);
-        new_active.push(fresh_current);
+        new_active.push(sealed_current);
         self.active_segments = new_active;
-        self.current = fresh_current;
+        self.current = sealed_current;
         self.current_day = None;
         self.write_index()?;
         if fault == RetentionFault::AfterIndexSwap {
@@ -694,20 +752,32 @@ impl AuditStore {
         filter: AuditFilter,
         signer: Option<&dyn AuditSigner>,
     ) -> Result<AuditExport, AuditError> {
-        let records: Vec<_> = self
-            .records
-            .iter()
-            .filter(|record| filter.matches(record))
-            .cloned()
-            .collect();
+        let mut records = Vec::new();
+        let mut encoded_bytes = 2_usize;
+        for record in self.records.iter().filter(|record| filter.matches(record)) {
+            if records.len() == MAX_EXPORT_RECORDS {
+                return Err(AuditError::LimitExceeded);
+            }
+            let item_bytes = serde_json::to_vec(record)?.len();
+            encoded_bytes =
+                encoded_bytes.saturating_add(item_bytes + usize::from(!records.is_empty()));
+            if encoded_bytes > MAX_EXPORT_BYTES {
+                return Err(AuditError::LimitExceeded);
+            }
+            records.push(record.clone());
+        }
         let records_json = serde_json::to_vec(&records)?;
         let digest = Sha256::digest(&records_json);
         let records_sha256 = hex(&digest);
         let signature = match signer {
-            Some(signer) => ExportSignature::Signed {
-                key_id: signer.key_id().to_owned(),
-                signature_hex: hex(&signer.sign(&records_json)?),
-            },
+            Some(signer) => {
+                let key_id = signer.key_id().to_owned();
+                let envelope = signing_envelope(1, records.len(), &records_sha256, &key_id)?;
+                ExportSignature::Signed {
+                    key_id,
+                    signature_hex: hex(&signer.sign(&envelope)?),
+                }
+            }
             None => ExportSignature::Unavailable,
         };
         Ok(AuditExport {
@@ -764,6 +834,14 @@ impl AuditStore {
         drop(file);
         atomic_replace(&tmp, &self.root.join("index.json"), &self.root)
     }
+}
+
+fn cursor_page_encoded_len(items_bytes: usize, cursor: &EventCursor) -> Result<usize, AuditError> {
+    Ok(b"{\"items\":[".len()
+        + items_bytes
+        + b"],\"next_cursor\":".len()
+        + serde_json::to_vec(cursor)?.len()
+        + 1)
 }
 
 pub struct AuditGuard {
@@ -936,6 +1014,33 @@ fn create_private_file(path: &Path) -> Result<File, AuditError> {
 }
 
 #[cfg(unix)]
+fn acquire_store_lock(path: &Path) -> Result<File, AuditError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if fs::symlink_metadata(path).is_ok() {
+        validate_private_file(path)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    validate_private_file(path)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(AuditError::StoreLocked);
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn acquire_store_lock(path: &Path) -> Result<File, AuditError> {
+    windows_private::lock(path)
+}
+
+#[cfg(unix)]
 fn validate_private_dir(path: &Path) -> Result<(), AuditError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata = fs::symlink_metadata(path).map_err(|_| AuditError::InsecureStorage)?;
@@ -981,7 +1086,8 @@ mod windows_private {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE, LocalFree,
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SHARING_VIOLATION, GetLastError,
+        INVALID_HANDLE_VALUE, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -994,10 +1100,10 @@ mod windows_private {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FlushFileBuffers, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        OPEN_EXISTING,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_NONE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FlushFileBuffers, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -1127,7 +1233,7 @@ mod windows_private {
                 FILE_SHARE_NONE,
                 &security.attributes,
                 CREATE_NEW,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
                 std::ptr::null_mut(),
             )
         };
@@ -1135,6 +1241,34 @@ mod windows_private {
             return Err(io::Error::last_os_error().into());
         }
         Ok(unsafe { File::from_raw_handle(handle as _) })
+    }
+
+    pub fn lock(path: &Path) -> Result<File, AuditError> {
+        if path.exists() {
+            validate(path, false)?;
+        }
+        let security = Security::current_user()?;
+        let wide_path = wide(path);
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                FILE_SHARE_NONE,
+                &security.attributes,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return if unsafe { GetLastError() } == ERROR_SHARING_VIOLATION {
+                Err(AuditError::StoreLocked)
+            } else {
+                Err(io::Error::last_os_error().into())
+            };
+        }
+        let file = unsafe { File::from_raw_handle(handle as _) };
+        Ok(file)
     }
 
     pub fn sync_dir(path: &Path) -> Result<(), AuditError> {
