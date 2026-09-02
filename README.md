@@ -308,6 +308,38 @@ sh ./scripts/mac-bootstrap-smoke
 
 Physical-device results are deliberately separate from mock, simulator, and fixture tests. **Mocks gelten nicht als Nachweis** for either hardware gate. A hardware gate is only green after installation, launch, logs, and artifact return succeed on a real authorized device.
 
+### DeviceLane dashboard release gate
+
+The normal CI matrix runs the locked Rust workspace, the Tauri bridge, the React dashboard tests,
+type checking, production frontend build, and lifecycle contract/smoke checks on Windows, macOS,
+and Linux. That deterministic fixture coverage does not prove a physical Mac pass. A production
+release additionally requires a real paired Windows-to-Mac run against the target Apple Silicon
+Mac supplied as `<MAC_HOST>` at execution time; private LAN addresses do not belong in committed
+release evidence.
+
+Start the gate on the Mac before submitting the matching operation from Windows. The expected
+operation must request both `workspace_read` and `device_lease`, be approved on the Mac, survive a
+disconnect/reconnect, and reach a terminal state. The script refuses fixture mode and writes only
+redacted metadata: identifiers and the controller address are stored as SHA-256 pseudonyms, while
+raw local audit databases, identity files, bearer values, and private keys are never copied.
+
+```sh
+DEVICELANE_REAL_MESH_GATE=1 sh ./scripts/mac-hardware-gate.sh \
+  --mesh-controller "<WINDOWS_CONTROLLER_HOST>:7443" \
+  --mesh-endpoint "$TMPDIR/devicelane/devicelane.sock" \
+  --windows-principal codex-windows \
+  --windows-source-host windows-controller \
+  --mesh-activity-id release-gate-20260902 \
+  --device PHYSICAL_IPHONE_UDID \
+  --team APPLE_TEAM_ID
+```
+
+The mesh gate is green only when it observes the Windows principal/source in a target-local
+approval, live activity through the CLI stream, explicit nonzero-or-unavailable metrics,
+`reconnecting` or `resync_required`, a terminal result, and the corresponding redacted audit
+record. If SSH or the DeviceLane ports are unavailable, report the physical gate as blocked; never
+replace it with a fixture pass.
+
 For Yoke-managed work, `passes: true` is valid only when the mapped **story-spezifische Akzeptanzprüfung** also passes. The global quality gate additionally runs the complete workspace tests, Clippy with warnings denied, and the formatting check.
 
 ## Repository map
@@ -354,6 +386,7 @@ release_status: experimental
 hardware_gates:
   physical_iphone: pending
   physical_android: pending
+  windows_to_mac_dashboard: pending
 ```
 
 ## License and acknowledgements

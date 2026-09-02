@@ -31,7 +31,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           components: clippy, rustfmt
-      - run: cargo build --workspace
-      - run: cargo test --workspace
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Linux desktop prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+      - name: Locked desktop dependencies
+        run: npm ci --prefix desktop
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+      - run: cargo test --test desktop_distribution --locked
+      - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo fmt --all -- --check
+      - name: Dashboard UI tests
+        working-directory: desktop
+        run: npm test -- --run
+      - name: Dashboard UI typecheck
+        working-directory: desktop
+        run: npm run typecheck
+      - name: Dashboard UI production build
+        working-directory: desktop
+        run: npm run build
+      - name: Unix lifecycle transaction smoke
+        if: runner.os != 'Windows'
+        run: sh scripts/lifecycle-transaction-smoke.sh
+      - name: Linux lifecycle adapter smoke
+        if: runner.os == 'Linux'
+        run: sh scripts/desktop-release-smoke.sh --self-test

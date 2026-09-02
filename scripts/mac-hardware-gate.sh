@@ -14,6 +14,12 @@ OUTPUT_ROOT=${HOME:-}/Library/Logs/DeviceDevelopmentMesh/hardware-gates
 JOB_ID="hardware-gate-$(date -u +%Y%m%dT%H%M%SZ)"
 AGENT_PEER=local-mac-agent
 ARCHIVE_STDOUT=false
+MESH_CONTROLLER=
+MESH_ENDPOINT=
+WINDOWS_PRINCIPAL=
+WINDOWS_SOURCE_HOST=
+MESH_ACTIVITY_ID=
+MESH_TIMEOUT_SECONDS=300
 
 repair() {
     printf 'hardware_gate_failed=%s\nnext_step=%s\n' "$1" "$2" >&2
@@ -31,11 +37,160 @@ while [ "$#" -gt 0 ]; do
         --output) shift; OUTPUT_ROOT=${1:-} ;;
         --job-id) shift; JOB_ID=${1:-} ;;
         --agent-peer) shift; AGENT_PEER=${1:-} ;;
+        --mesh-controller) shift; MESH_CONTROLLER=${1:-} ;;
+        --mesh-endpoint) shift; MESH_ENDPOINT=${1:-} ;;
+        --windows-principal) shift; WINDOWS_PRINCIPAL=${1:-} ;;
+        --windows-source-host) shift; WINDOWS_SOURCE_HOST=${1:-} ;;
+        --mesh-activity-id) shift; MESH_ACTIVITY_ID=${1:-} ;;
+        --mesh-timeout-seconds) shift; MESH_TIMEOUT_SECONDS=${1:-} ;;
         --archive-stdout) ARCHIVE_STDOUT=true ;;
-        *) repair invalid_argument "Use --device UDID --team TEAM_ID --output DIRECTORY --job-id ID --agent-peer ID." ;;
+        *) repair invalid_argument "Use --device UDID --team TEAM_ID --output DIRECTORY --job-id ID --agent-peer ID and the documented --mesh-* arguments." ;;
     esac
     shift
 done
+
+run_mesh_gate() {
+    [ "${DEVICELANE_REAL_MESH_GATE:-0}" = 1 ] || repair mesh_gate_not_authorized "Set DEVICELANE_REAL_MESH_GATE=1 only for a real paired Windows-to-Mac run."
+    for value in "$MESH_CONTROLLER" "$MESH_ENDPOINT" "$WINDOWS_PRINCIPAL" "$WINDOWS_SOURCE_HOST" "$MESH_ACTIVITY_ID"; do
+        [ -n "$value" ] || repair mesh_gate_argument_missing "Pass --mesh-controller, --mesh-endpoint, --windows-principal, --windows-source-host, and --mesh-activity-id."
+    done
+    case "$MESH_TIMEOUT_SECONDS" in ''|*[!0-9]*) repair invalid_mesh_timeout "Use a positive integer for --mesh-timeout-seconds." ;; esac
+    [ "$MESH_TIMEOUT_SECONDS" -gt 0 ] || repair invalid_mesh_timeout "Use a positive integer for --mesh-timeout-seconds."
+    DEVICELANE_CLI=$(command -v devicelane 2>/dev/null || true)
+    [ -x "$DEVICELANE_CLI" ] || repair devicelane_cli_missing "Install DeviceLane on the Mac with scripts/setup-mac.sh --upgrade."
+
+    # All daemon replies stay in memory. Only an allow-listed, pseudonymized summary is written.
+    # The command spellings below are also the operator contract for the physical gate:
+    # devicelane mesh status --local --json; devicelane activities watch --local --json;
+    # devicelane approvals list --local --json; devicelane audit list --local --json.
+    "$PYTHON3" - "$DEVICELANE_CLI" "$MESH_ENDPOINT" "$MESH_CONTROLLER" "$WINDOWS_PRINCIPAL" "$WINDOWS_SOURCE_HOST" "$MESH_ACTIVITY_ID" "$MESH_TIMEOUT_SECONDS" "$RUN_DIR/evidence/mesh-evidence.json" <<'PY'
+import hashlib, json, select, socket, subprocess, sys, time
+
+cli, endpoint, controller, principal, source, activity_id, timeout_raw, output = sys.argv[1:]
+timeout = int(timeout_raw)
+
+def fail(code, message):
+    print(f"hardware_gate_failed={code}\nnext_step={message}", file=sys.stderr)
+    raise SystemExit(1)
+
+def run(*parts):
+    command = [cli, *parts, "--local", "--json", "--endpoint", endpoint]
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+    if result.returncode:
+        fail("mesh_command_failed", f"DeviceLane command failed: {' '.join(parts)}")
+    try: return json.loads(result.stdout)
+    except Exception: fail("mesh_invalid_json", f"DeviceLane returned invalid JSON: {' '.join(parts)}")
+
+def watch_once():
+    command = [cli, "activities", "watch", "--cursor", "1:0", "--limit", "256", "--local", "--json", "--endpoint", endpoint]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    lines = []
+    try:
+        stop = time.monotonic() + 2
+        while time.monotonic() < stop:
+            ready, _, _ = select.select([process.stdout], [], [], 0.2)
+            if not ready: continue
+            line = process.stdout.readline()
+            if not line: break
+            try: lines.append(json.loads(line))
+            except Exception: fail("mesh_invalid_watch_json", "DeviceLane activities watch returned invalid NDJSON.")
+            if len(lines) >= 256: break
+    finally:
+        process.terminate()
+        try: process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill(); process.wait()
+    return lines
+
+host, separator, port = controller.rpartition(":")
+if not separator or not host or not port.isdigit():
+    fail("invalid_mesh_controller", "Use --mesh-controller HOST:PORT.")
+try:
+    with socket.create_connection((host, int(port)), timeout=5): pass
+except OSError:
+    fail("mesh_controller_unreachable", "Start the paired Windows registry and allow the configured controller port.")
+
+deadline = time.monotonic() + timeout
+seen = {"approval": False, "running": False, "reconnecting": False, "terminal": False, "audit": False}
+terminal_event = None
+metric_state = None
+decision = None
+status_scope = None
+while time.monotonic() < deadline:
+    status = run("mesh", "status", "--scope", "mesh")
+    if status.get("type") == "dashboard_snapshot":
+        status_scope = status.get("payload", {}).get("scope")
+
+    approvals = run("approvals", "list")
+    for item in approvals.get("payload", []):
+        resources = item.get("resources", [])
+        if (item.get("activity_id") == activity_id and item.get("principal_id") == principal
+                and item.get("source_host_id") == source
+                and {"workspace_read", "device_lease"}.issubset(set(resources))):
+            seen["approval"] = True
+
+    activities = run("activities", "list", "--cursor", "1:0", "--limit", "256")
+    payload = activities.get("payload", {})
+    if payload.get("result") == "resync_required":
+        # A bounded resync is an expected recovery signal, never a silent partial page.
+        seen["reconnecting"] = True
+    watched = watch_once()
+    streamed_events = [item for item in watched if isinstance(item, dict) and "activity_id" in item]
+    for error in watched:
+        if error.get("type") == "error" and error.get("payload", {}).get("code") == "resync_required":
+            seen["reconnecting"] = True
+    for event in [*payload.get("events", []), *streamed_events]:
+        if event.get("activity_id") != activity_id: continue
+        resources = set(event.get("resources", []))
+        if not {"workspace_read", "device_lease"}.issubset(resources): continue
+        state = event.get("state")
+        seen["running"] |= state == "running"
+        seen["reconnecting"] |= state == "reconnecting"
+        if state in {"succeeded", "failed", "cancelled", "denied"}:
+            seen["terminal"] = True; terminal_event = event
+        decision = event.get("authorization", {}).get("effect", decision)
+        metrics = event.get("metrics", {})
+        values = list(metrics.values())
+        if values and all((isinstance(v, dict) and ((isinstance(v.get("unavailable"), dict) and v["unavailable"].get("reason") == "observer_unavailable") or (isinstance(v.get("available"), dict) and v["available"].get("value", 0) > 0))) for v in values):
+            metric_state = "nonzero_or_observer_unavailable"
+
+    audit = run("audit", "list", "--limit", "256")
+    for record in audit.get("payload", {}).get("items", []):
+        if (record.get("activity_id") == activity_id and record.get("principal_id") == principal
+                and record.get("source_host_id") == source):
+            raw = json.dumps(record, sort_keys=True).lower()
+            if not any(word in raw for word in ("private_key", "bearer ", "authorization:", "environment")):
+                seen["audit"] = True
+    if all(seen.values()) and status_scope == "mesh" and metric_state and terminal_event:
+        break
+    time.sleep(1)
+
+if not all(seen.values()):
+    fail("mesh_observation_incomplete", "Keep the Windows operation and Mac approval UI active through disconnect/reconnect and completion.")
+if status_scope != "mesh": fail("mesh_scope_unavailable", "Restore authenticated registry connectivity.")
+if not metric_state: fail("observer_invalid", "Metrics must be nonzero or explicitly observer_unavailable.")
+if decision != "allow": fail("approval_not_allowed", "Approve the exact Windows operation on the target Mac before it starts.")
+
+def pseudonym(value): return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+evidence = {
+    "schema": "devicelane.mesh-gate.redacted.v1",
+    "redacted": True,
+    "controller": pseudonym(controller),
+    "principal": pseudonym(principal),
+    "source_host": pseudonym(source),
+    "activity_id": pseudonym(activity_id),
+    "resources": ["workspace_read", "device_lease"],
+    "decision": decision,
+    "states_observed": sorted(k for k, value in seen.items() if value),
+    "metric_status": metric_state,
+    "terminal_state": terminal_event.get("state"),
+    "audit_record": "same_redacted_activity_record_observed",
+    "recovery": "resync_required_or_reconnecting_observed",
+}
+with open(output, "x", encoding="utf-8") as handle:
+    json.dump(evidence, handle, sort_keys=True, indent=2)
+PY
+}
 
 [ "$(uname -s)" = Darwin ] || repair not_macos "Run scripts/mac-hardware-gate.sh on the paired Mac."
 [ -d "$PROJECT" ] || repair missing_project "Re-run scripts/setup-mac.sh --upgrade on the Mac."
@@ -131,6 +286,9 @@ XCODE_VERSION=$("$XCODEBUILD" -version | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 SDK_VERSION=$("$XCODEBUILD" -version -sdk iphoneos 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 DEVICECTL_VERSION=$("$DEVICECTL" --version 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 XCRESULTTOOL_VERSION=$("$XCRESULTTOOL" version 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+if [ "${DEVICELANE_REAL_MESH_GATE:-0}" = 1 ] || [ -n "$MESH_CONTROLLER$MESH_ENDPOINT$WINDOWS_PRINCIPAL$WINDOWS_SOURCE_HOST$MESH_ACTIVITY_ID" ]; then
+    run_mesh_gate
+fi
 $PYTHON3 - "$RUN_DIR/evidence" "$DEVICE_ID" "$DEVICE_AUDIT_ID" "${HOME:-}" <<'PY'
 import pathlib, sys
 root=pathlib.Path(sys.argv[1]); device=sys.argv[2].encode(); audit=sys.argv[3].encode(); home=sys.argv[4].encode()

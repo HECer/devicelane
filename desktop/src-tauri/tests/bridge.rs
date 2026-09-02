@@ -208,6 +208,57 @@ fn dashboard_snapshot_bridge_uses_the_typed_scope_and_response() {
 }
 
 #[test]
+fn pending_approvals_bridge_uses_the_same_typed_local_request() {
+    let requests = Arc::new(Mutex::new(vec![]));
+    let bridge = DesktopBridge::new(FakeTransport {
+        requests: Arc::clone(&requests),
+        response: LocalResponse::PendingApprovals(vec![]),
+    });
+
+    assert!(bridge.pending_approvals().unwrap().is_empty());
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![LocalRequest::PendingApprovals {
+            version: LocalProtocolVersion::CURRENT,
+        }]
+    );
+}
+
+#[test]
+fn audit_query_bridge_preserves_filter_cursor_and_bound() {
+    let requests = Arc::new(Mutex::new(vec![]));
+    let filter = AuditFilter::default();
+    let cursor = EventCursor {
+        epoch: 7,
+        sequence: 11,
+    };
+    let bridge = DesktopBridge::new(FakeTransport {
+        requests: Arc::clone(&requests),
+        response: LocalResponse::AuditRecords(device_development_mesh::dashboard::CursorPage {
+            items: vec![],
+            next_cursor: None,
+        }),
+    });
+
+    assert!(
+        bridge
+            .audit_query(filter.clone(), Some(cursor), 17)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![LocalRequest::AuditQuery {
+            version: LocalProtocolVersion::CURRENT,
+            filter,
+            cursor: Some(cursor),
+            limit: 17,
+        }]
+    );
+}
+
+#[test]
 fn management_bridge_uses_approval_ids_without_exposing_nonces_or_access_credentials() {
     let requests = Arc::new(Mutex::new(vec![]));
     let bridge = DesktopBridge::new(FakeTransport {

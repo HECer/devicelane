@@ -873,6 +873,74 @@ impl DashboardService {
         Ok(())
     }
 
+    /// Applies an observation from the authenticated execution layer to an already-authorized
+    /// activity. Identity, operation, resources, and authorization are inherited from the daemon
+    /// record so an observer cannot widen a grant or create an unapproved activity.
+    pub fn transition_activity(
+        &mut self,
+        id: &ActivityId,
+        state: ActivityState,
+        metrics: MetricSnapshot,
+        message: Option<super::DisplayMessage>,
+        now_ms: u64,
+    ) -> Result<bool, DashboardServiceError> {
+        let current = self
+            .activities
+            .get(id)
+            .cloned()
+            .ok_or(DashboardServiceError::NotFound)?;
+        if current.state == state {
+            return Ok(false);
+        }
+        let valid = matches!(
+            (current.state, state),
+            (ActivityState::Queued, ActivityState::Running)
+                | (ActivityState::Queued, ActivityState::Reconnecting)
+                | (ActivityState::Running, ActivityState::Reconnecting)
+                | (ActivityState::Running, ActivityState::Succeeded)
+                | (ActivityState::Running, ActivityState::Failed)
+                | (ActivityState::Reconnecting, ActivityState::Running)
+                | (ActivityState::Reconnecting, ActivityState::Succeeded)
+                | (ActivityState::Reconnecting, ActivityState::Failed)
+        );
+        if !valid {
+            return Err(DashboardServiceError::InvalidRequest);
+        }
+        let sequence = current
+            .sequence
+            .checked_add(1)
+            .ok_or(DashboardServiceError::LimitExceeded)?;
+        let mut next = current.clone();
+        next.sequence = sequence;
+        next.occurred_at_ms = now_ms;
+        next.state = state;
+        next.metrics = metrics;
+        next.message = message;
+        if matches!(state, ActivityState::Running | ActivityState::Reconnecting) {
+            next.started_at_ms.get_or_insert(now_ms);
+            next.finished_at_ms = None;
+        } else {
+            next.started_at_ms.get_or_insert(now_ms);
+            next.finished_at_ms = Some(now_ms);
+        }
+        next.validate()
+            .map_err(|_| DashboardServiceError::InvalidRequest)?;
+
+        let result = match state {
+            ActivityState::Succeeded => Some(AuditResult::Succeeded),
+            ActivityState::Failed => Some(AuditResult::Failed),
+            _ => None,
+        };
+        if let Some(result) = result {
+            self.audit_access_from_event(&current, result, now_ms)?;
+        }
+        self.record_activity(
+            next,
+            &format!("observer:{}:{sequence}:{state:?}", id.as_str()),
+        )?;
+        Ok(true)
+    }
+
     pub fn cancel_activity(
         &mut self,
         id: &ActivityId,

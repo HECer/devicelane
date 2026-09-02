@@ -1,8 +1,8 @@
 use crate::dashboard::audit::{AuditDeletionScope, AuditExport, AuditFilter, ExportManifest};
 use crate::dashboard::event_log::EventRead;
 use crate::dashboard::model::{
-    ActivityId, AuditRecord, CursorPage, DashboardScope, DashboardSnapshot, EventCursor, HostId,
-    RuleId, SubscriberId,
+    ActivityId, ActivityState, AuditRecord, CursorPage, DashboardScope, DashboardSnapshot,
+    DisplayMessage, EventCursor, HostId, MetricSnapshot, RuleId, SubscriberId,
 };
 use crate::dashboard::model::{ApprovalDecision, ApprovalRequest, PolicyRule};
 use crate::dashboard::policy::{AccessRequest, PolicyEngine};
@@ -534,6 +534,23 @@ impl DaemonState {
 
     pub fn enable_dashboard(&mut self, service: DashboardService) {
         self.dashboard = Some(service);
+    }
+
+    /// Trusted execution adapters use this boundary after the local daemon has authorized an
+    /// activity. It cannot create jobs or alter their principal/resource authorization.
+    pub fn transition_dashboard_activity(
+        &mut self,
+        activity_id: &ActivityId,
+        state: ActivityState,
+        metrics: MetricSnapshot,
+        message: Option<DisplayMessage>,
+        now_ms: u64,
+    ) -> Result<bool, LocalProtocolError> {
+        self.dashboard
+            .as_mut()
+            .ok_or(LocalProtocolError::FeatureUnavailable)?
+            .transition_activity(activity_id, state, metrics, message, now_ms)
+            .map_err(map_dashboard_error)
     }
 
     fn local_policy_host_id(&self) -> Option<HostId> {
