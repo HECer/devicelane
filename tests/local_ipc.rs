@@ -1,9 +1,14 @@
+#[cfg(windows)]
 use device_development_mesh::dashboard::audit::AuditFilter;
+#[cfg(windows)]
 use device_development_mesh::dashboard::service::{AdminMutation, ExistingJobs};
 use device_development_mesh::dashboard::{
-    ActivityId, ActivityState, ApprovalDecision, DashboardScope, EventCursor, HostId, OperationId,
-    PolicyEffect, PolicyOrigin, PolicyRule, PrincipalId, ResourceClass, RuleId, SubscriberId,
-    policy::AccessRequest,
+    ActivityId, HostId, OperationId, PrincipalId, ResourceClass, policy::AccessRequest,
+};
+#[cfg(windows)]
+use device_development_mesh::dashboard::{
+    ActivityState, ApprovalDecision, DashboardScope, EventCursor, PolicyEffect, PolicyOrigin,
+    PolicyRule, RuleId, SubscriberId,
 };
 
 fn approval_access(target: &str) -> AccessRequest {
@@ -21,6 +26,7 @@ fn approval_access(target: &str) -> AccessRequest {
     }
 }
 
+#[cfg(windows)]
 fn admin_access(
     activity: &str,
     operation: &str,
@@ -119,6 +125,7 @@ fn approve_admin_mutation_once(
     ));
 }
 
+#[cfg(windows)]
 fn user_rule() -> PolicyRule {
     PolicyRule {
         id: RuleId::parse("ipc-rule").unwrap(),
@@ -143,9 +150,12 @@ fn user_rule() -> PolicyRule {
 use device_development_mesh::local_ipc::{
     Authorizer, AutostartAdapter, ConnectionState, DaemonRole, DaemonSnapshot, DaemonState,
     DiagnosticItem, LocalProtocolError, LocalProtocolVersion, LocalRequest, LocalResponse,
-    MAX_FRAME_BYTES, MAX_LOCAL_WORKERS, PeerCredentials, SameUserAuthorizer, open_local_stream,
-    read_frame, send_local_request, send_raw_local_frame, validate_state_paths,
-    windows_pipe_security_sddl, write_frame,
+    MAX_FRAME_BYTES, PeerCredentials, SameUserAuthorizer, read_frame, send_local_request,
+    send_raw_local_frame, validate_state_paths, write_frame,
+};
+#[cfg(windows)]
+use device_development_mesh::local_ipc::{
+    MAX_LOCAL_WORKERS, open_local_stream, windows_pipe_security_sddl,
 };
 use std::sync::{Arc, Mutex};
 
@@ -1176,7 +1186,7 @@ fn production_unix_socket_serves_state_and_recovers_after_bad_frames() {
     let temp = tempfile::tempdir().unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let socket = temp.path().join("devicelane.sock");
+    let socket = temp.path().canonicalize().unwrap().join("devicelane.sock");
     let stale = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     drop(stale);
     let identity = temp.path().join("identity");
@@ -1312,7 +1322,12 @@ fn service_managed_policy_configuration_is_paired_and_fails_closed() {
     #[cfg(windows)]
     let listen = format!(r"\\.\pipe\devicelane-managed-config-{}", std::process::id());
     #[cfg(unix)]
-    let listen = runtime.join("managed-config.sock").display().to_string();
+    let listen = runtime
+        .canonicalize()
+        .unwrap()
+        .join("managed-config.sock")
+        .display()
+        .to_string();
     let base = [
         "--identity",
         identity.to_str().unwrap(),

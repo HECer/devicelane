@@ -19,6 +19,7 @@ struct DaemonFixture {
 }
 
 fn daemon_fixture() -> DaemonFixture {
+    #[cfg(windows)]
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("runtime");
@@ -35,7 +36,12 @@ fn daemon_fixture() -> DaemonFixture {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     #[cfg(unix)]
-    let listen = runtime.join("mesh-failure.sock").display().to_string();
+    let listen = runtime
+        .canonicalize()
+        .unwrap()
+        .join("mesh-failure.sock")
+        .display()
+        .to_string();
     let endpoint = local_endpoint(&runtime, &listen).unwrap();
     let audit = AuditStore::open(
         root.path().join("audit"),

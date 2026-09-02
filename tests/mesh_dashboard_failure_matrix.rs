@@ -235,6 +235,7 @@ fn fixture(case: ExternalFailureCase) -> Fixture {
 }
 
 fn fixture_with_policy(case: ExternalFailureCase, policy: PolicyEngine) -> Fixture {
+    #[cfg(windows)]
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("runtime");
@@ -251,7 +252,12 @@ fn fixture_with_policy(case: ExternalFailureCase, policy: PolicyEngine) -> Fixtu
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     #[cfg(unix)]
-    let listen = runtime.join("failure-matrix.sock").display().to_string();
+    let listen = runtime
+        .canonicalize()
+        .unwrap()
+        .join("failure-matrix.sock")
+        .display()
+        .to_string();
     let endpoint = local_endpoint(&runtime, &listen).unwrap();
     let audit = AuditStore::open(
         root.path().join("audit"),
