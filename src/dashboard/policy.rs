@@ -278,8 +278,7 @@ fn specificity(rule: &PolicyRule) -> u8 {
         + u8::from(rule.device_id.is_some())
         + u8::from(rule.operation.is_some())
         + u8::from(!rule.resources.is_empty())
-        + u8::from(rule.require_user_presence)
-        + u8::from(rule.user_presence.is_some())
+        + u8::from(rule.require_user_presence || rule.user_presence.is_some())
         + u8::from(rule.physical_device.is_some())
 }
 

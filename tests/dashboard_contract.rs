@@ -828,12 +828,14 @@ fn policy_rule_boolean_constraints_round_trip_and_missing_fields_are_wildcards()
     assert_eq!(wildcard.user_presence, None);
     assert_eq!(wildcard.physical_device, None);
 
-    let mut contradictory = rule;
-    contradictory.require_user_presence = true;
-    contradictory.user_presence = Some(false);
-    assert!(serde_json::to_value(&contradictory).is_err());
-    let mut encoded = serde_json::to_value(&wildcard).unwrap();
-    encoded["require_user_presence"] = json!(true);
-    encoded["user_presence"] = json!(false);
-    assert!(serde_json::from_value::<PolicyRule>(encoded).is_err());
+    for exact_presence in [false, true] {
+        let mut redundant = rule.clone();
+        redundant.require_user_presence = true;
+        redundant.user_presence = Some(exact_presence);
+        assert!(serde_json::to_value(&redundant).is_err());
+        let mut encoded = serde_json::to_value(&wildcard).unwrap();
+        encoded["require_user_presence"] = json!(true);
+        encoded["user_presence"] = json!(exact_presence);
+        assert!(serde_json::from_value::<PolicyRule>(encoded).is_err());
+    }
 }

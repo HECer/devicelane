@@ -581,9 +581,9 @@ pub struct PolicyRule {
 impl PolicyRule {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_unique_resources(&self.resources)?;
-        if self.require_user_presence && self.user_presence == Some(false) {
+        if self.require_user_presence && self.user_presence.is_some() {
             return Err(ValidationError::at(
-                "conflicting_presence_constraints",
+                "redundant_presence_constraints",
                 "user_presence",
             ));
         }

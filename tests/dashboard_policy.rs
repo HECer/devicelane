@@ -422,6 +422,23 @@ fn legacy_presence_false_is_wildcard_and_true_requires_presence() {
 }
 
 #[test]
+fn legacy_and_exact_presence_have_equal_specificity_and_revision_wins() {
+    let mut req = request("workspace.read", vec![ResourceClass::WorkspaceRead]);
+    req.user_present = true;
+    let mut legacy = rule("legacy-presence", PolicyEffect::Allow);
+    legacy.require_user_presence = true;
+    legacy.revision = 1;
+    let mut exact = rule("exact-presence", PolicyEffect::Allow);
+    exact.user_presence = Some(true);
+    exact.revision = 2;
+    let engine = PolicyEngine::with_rules(vec![legacy, exact.clone()]).unwrap();
+    assert_eq!(
+        engine.evaluate(&req, NOW),
+        PolicyDecision::Allowed { rule_id: exact.id }
+    );
+}
+
+#[test]
 fn approval_expires_at_its_expiry_boundary() {
     let req = request("workspace.read", vec![ResourceClass::WorkspaceRead]);
     let mut engine = PolicyEngine::new();
