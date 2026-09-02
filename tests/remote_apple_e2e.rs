@@ -150,7 +150,8 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         let request = apple_request(index, operation.clone(), lease_id.clone());
         let accepted = cli_json(&address, &first_identity, "apple-run", &request);
         let job_id = accepted["job_id"].as_str().unwrap().to_owned();
-        let terminal = wait_for_terminal(&address, &first_identity, &job_id);
+        let context = format!("{operation:?}");
+        let terminal = wait_for_terminal(&address, &first_identity, &job_id, &context, &marker);
         assert_eq!(
             terminal["kind"],
             "completed",
@@ -198,7 +199,9 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         wait_for_terminal(
             &address,
             &second_identity,
-            observed["job_id"].as_str().unwrap()
+            observed["job_id"].as_str().unwrap(),
+            "observer DiscoverProject",
+            &marker,
         )["kind"]
             == "completed"
     );
@@ -217,7 +220,13 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         ),
     );
     let durable_job = durable["job_id"].as_str().unwrap().to_owned();
-    let before = wait_for_terminal(&address, &first_identity, &durable_job);
+    let before = wait_for_terminal(
+        &address,
+        &first_identity,
+        &durable_job,
+        "durable BuildApp",
+        &marker,
+    );
     registry_process.kill().unwrap();
     registry_process.wait().unwrap();
     registry_process = start_registry(&address, &registry_identity);
@@ -278,7 +287,7 @@ fn start_registry(address: &str, identity: &Path) -> ChildGuard {
             "--identity",
             identity.to_str().unwrap(),
             "--offline-after-ms",
-            "500",
+            "5000",
         ],
     )
 }
@@ -372,29 +381,61 @@ fn cli_value(
     cli_json(address, identity, command, body)
 }
 
-fn events(address: &str, identity: &Path, job_id: &str, after: u64) -> serde_json::Value {
-    cli_value(
-        address,
-        identity,
-        "events",
-        &serde_json::json!({"job_id": job_id, "after": after}),
-    )
-}
-
-fn wait_for_terminal(address: &str, identity: &Path, job_id: &str) -> serde_json::Value {
-    let mut terminal = None;
-    wait_until("terminal event", || {
-        terminal = events(address, identity, job_id, 0)["events"]
-            .as_array()
-            .and_then(|items| {
+fn wait_for_terminal(
+    address: &str,
+    identity: &Path,
+    job_id: &str,
+    context: &str,
+    marker: &Path,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_snapshot = serde_json::Value::Null;
+    loop {
+        let output = cli(
+            address,
+            identity,
+            "events",
+            &serde_json::json!({"job_id": job_id, "after": 0}),
+        );
+        let last_status = output.status.to_string();
+        let last_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if output.status.success() {
+            last_snapshot = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "mesh-cli events returned invalid JSON for {context}/{job_id}: {error}; status={last_status}; stderr={last_stderr}"
+                )
+            });
+            let pending_without_events = last_snapshot["accepted"] == true
+                && last_snapshot["job_id"] == job_id
+                && last_snapshot.get("events").is_none();
+            assert!(
+                last_snapshot["events"].is_array() || pending_without_events,
+                "mesh-cli events returned an invalid pending state for {context}/{job_id}: snapshot={last_snapshot}; status={last_status}; stderr={last_stderr}"
+            );
+            if let Some(terminal) = last_snapshot["events"].as_array().and_then(|items| {
                 items
                     .iter()
                     .find(|event| matches!(event["kind"].as_str(), Some("completed" | "rejected")))
-                    .cloned()
-            });
-        terminal.is_some()
-    });
-    terminal.unwrap()
+            }) {
+                return terminal.clone();
+            }
+        } else {
+            let error = serde_json::from_slice::<serde_json::Value>(&output.stderr)
+                .ok()
+                .and_then(|value| value["error"].as_str().map(str::to_owned));
+            assert_eq!(
+                error.as_deref(),
+                Some("connection_unavailable"),
+                "mesh-cli events failed non-transiently for {context}/{job_id}; status={last_status}; stderr={last_stderr}"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal event absent for {context}/{job_id}; last_status={last_status}; last_stderr={last_stderr}; last_snapshot={last_snapshot}; markers={}",
+            std::fs::read_to_string(marker).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_for_host(address: &str, identity: &Path) {
@@ -415,7 +456,11 @@ fn wait_for_host(address: &str, identity: &Path) {
             && serde_json::from_slice::<serde_json::Value>(&output.stdout)
                 .ok()
                 .and_then(|hosts| hosts.as_array().cloned())
-                .is_some_and(|hosts| hosts.iter().any(|host| host["id"] == "mac-1"))
+                .is_some_and(|hosts| {
+                    hosts
+                        .iter()
+                        .any(|host| host["id"] == "mac-1" && host["status"] == "online")
+                })
         {
             return;
         }
