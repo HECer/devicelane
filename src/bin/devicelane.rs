@@ -13,6 +13,8 @@ use std::{
 };
 
 const HELP: &str = "DeviceLane unified client\n\nUsage:\n  devicelane status --local [--json] [--endpoint ENDPOINT]\n  devicelane remote-access <pause|resume> --local\n  devicelane diagnostics --local\n  devicelane mesh <status|watch> --local [--scope local|mesh]\n  devicelane activities <list|watch|cancel> --local [--cursor EPOCH:SEQUENCE] [--limit 1..256]\n  devicelane approvals <list|request|decide> --local [typed access options]\n  devicelane policy <list|put|delete> --local [typed rule options]\n  devicelane audit <list|export> --local [filters]\n\nGrant flow:\n  approvals request --activity-id ID --principal-id ID --source-host-id ID --target-host-id ID --operation OP --resource RESOURCE\n  approvals decide --nonce NONCE [same exact access flags] --decision allow_once|allow_and_remember|deny_once|deny_and_block\n  then invoke the exact mutation before the five-minute grant expires.\n\nAdministrative operations: devicelane.policy.put, devicelane.policy.delete, devicelane.activity.cancel.\nResources: workspace_read, workspace_write, artifact_upload, artifact_download, device_lease, application_install, application_launch, debugger, signing, microphone, screen_capture, network_endpoint, device_lane_policy, device_lane_service.";
+const ADMIN_HELP: &str = "Admin grants: devicelane.policy.put -> device_lane_policy; devicelane.policy.delete -> device_lane_policy; devicelane.activity.cancel -> device_lane_service; devicelane.service.pause -> device_lane_service; devicelane.service.resume -> device_lane_service.";
+
 #[derive(Default)]
 struct P {
     pos: Vec<String>,
@@ -305,7 +307,7 @@ fn parse() -> Result<Option<Args>, String> {
     let v: Vec<_> = std::env::args().skip(1).collect();
     if v.iter().any(|x| x == "--help" || x == "-h") {
         println!(
-            "{HELP}\n\nAll commands use authenticated local IPC and require --local. No raw JSON or shell input is accepted."
+            "{HELP}\n\n{ADMIN_HELP}\n\nAll commands use authenticated local IPC and require --local. No raw JSON or shell input is accepted."
         );
         return Ok(None);
     }

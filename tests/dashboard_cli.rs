@@ -1,8 +1,19 @@
+use device_development_mesh::dashboard::audit::{AuditStore, Redactor, RetentionPolicy};
+use device_development_mesh::dashboard::event_log::EventJournal;
+use device_development_mesh::dashboard::policy::PolicyEngine;
+use device_development_mesh::dashboard::service::DashboardService;
+use device_development_mesh::dashboard::topology::TopologyProjector;
+use device_development_mesh::dashboard::{
+    ActivityEvent, ActivityId, ActivityState, Authorization, HostId, MetricSnapshot, MetricValue,
+    OperationId, PolicyEffect, PrincipalId, ResourceClass, SafeCode, SubscriberId,
+};
 use device_development_mesh::local_ipc::{
-    LocalProtocolVersion, LocalRequest, LocalResponse, local_endpoint, send_local_request,
+    ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, LocalProtocolVersion, LocalRequest,
+    LocalResponse, local_endpoint, send_local_request, serve_local,
 };
 use std::io::BufRead;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct Service(Child);
@@ -145,6 +156,104 @@ fn grant_once(endpoint: &str, activity: &str, operation: &str, resource: &str) {
     );
 }
 
+fn observed_watch_service() -> (tempfile::TempDir, String, EventJournal) {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let text = format!("{}-observed", endpoint_text(&runtime));
+    let endpoint = local_endpoint(&runtime, &text).unwrap();
+    let journal = EventJournal::new(1, 0);
+    let unavailable = || MetricValue::Unavailable {
+        reason: SafeCode::parse("observer_unavailable").unwrap(),
+    };
+    journal
+        .append(
+            "watch-event",
+            ActivityEvent {
+                activity_id: ActivityId::parse("watch-event").unwrap(),
+                sequence: 1,
+                occurred_at_ms: 1,
+                principal_id: PrincipalId::parse("agent").unwrap(),
+                source_host_id: HostId::parse("source").unwrap(),
+                target_host_id: HostId::parse("identity.json").unwrap(),
+                device_id: None,
+                operation: OperationId::parse("build").unwrap(),
+                resources: vec![ResourceClass::WorkspaceRead],
+                authorization: Authorization {
+                    effect: PolicyEffect::Allow,
+                    rule_id: None,
+                    approval_id: None,
+                },
+                state: ActivityState::Running,
+                message: None,
+                metrics: MetricSnapshot {
+                    current_memory_bytes: unavailable(),
+                    peak_memory_bytes: unavailable(),
+                    cpu_time_ms: unavailable(),
+                    process_count: unavailable(),
+                },
+                started_at_ms: Some(1),
+                finished_at_ms: None,
+            },
+        )
+        .unwrap();
+    let audit = Arc::new(Mutex::new(
+        AuditStore::open(
+            root.path().join("audit"),
+            RetentionPolicy::default(),
+            Redactor::default(),
+        )
+        .unwrap(),
+    ));
+    let service = DashboardService::new(
+        HostId::parse("identity.json").unwrap(),
+        TopologyProjector::new(),
+        journal.clone(),
+        audit,
+        PolicyEngine::new(),
+    );
+    let mut state = DaemonState::new(
+        DaemonSnapshot {
+            public_identity: "identity.json".into(),
+            daemon_version: "test".into(),
+            os: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            role: DaemonRole::Workstation,
+            endpoint: text.clone(),
+            connection: ConnectionState::Connected,
+            local_protocol: LocalProtocolVersion::CURRENT,
+            remote_protocol: "1.0".into(),
+            warnings: vec![],
+            remote_access_paused: false,
+            autostart: false,
+            log_location: root.path().display().to_string(),
+            features: vec!["dashboard_v1".into()],
+        },
+        vec![],
+    );
+    state.enable_dashboard(service);
+    std::thread::spawn(move || {
+        let _ = serve_local(&endpoint, Arc::new(Mutex::new(state)));
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if cli_endpoint(&text, &["status", "--local", "--json"])
+            .status
+            .success()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (root, text, journal)
+}
+
 fn cli(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_devicelane"))
         .args(args)
@@ -285,6 +394,8 @@ fn help_names_typed_resources_and_the_exact_grant_flow() {
     assert!(text.contains("allow_once"));
     assert!(text.contains("workspace_read"));
     assert!(text.contains("devicelane.policy.put"));
+    assert!(text.contains("devicelane.service.pause -> device_lane_service"));
+    assert!(text.contains("devicelane.service.resume -> device_lane_service"));
 }
 
 #[test]
@@ -293,14 +404,23 @@ fn real_daemon_queries_match_direct_ipc_and_exact_grant_enables_mutation() {
     let version = LocalProtocolVersion::CURRENT;
     let cases = [
         (
-            vec!["activities", "list", "--local", "--json"],
+            vec![
+                "activities",
+                "list",
+                "--local",
+                "--json",
+                "--cursor",
+                "1:0",
+                "--limit",
+                "17",
+            ],
             LocalRequest::ActivityEvents {
                 version,
                 cursor: device_development_mesh::dashboard::EventCursor {
                     epoch: 1,
                     sequence: 0,
                 },
-                limit: 100,
+                limit: 17,
             },
         ),
         (
@@ -312,12 +432,17 @@ fn real_daemon_queries_match_direct_ipc_and_exact_grant_enables_mutation() {
             LocalRequest::PolicyRules { version },
         ),
         (
-            vec!["audit", "list", "--local", "--json"],
+            vec![
+                "audit", "list", "--local", "--json", "--cursor", "1:0", "--limit", "17",
+            ],
             LocalRequest::AuditQuery {
                 version,
                 filter: Default::default(),
-                cursor: None,
-                limit: 100,
+                cursor: Some(device_development_mesh::dashboard::EventCursor {
+                    epoch: 1,
+                    sequence: 0,
+                }),
+                limit: 17,
             },
         ),
         (
@@ -530,5 +655,82 @@ fn real_daemon_queries_match_direct_ipc_and_exact_grant_enables_mutation() {
         deleted.status.success(),
         "{}",
         String::from_utf8_lossy(&deleted.stderr)
+    );
+}
+
+#[test]
+fn activity_watch_acknowledges_only_stdout_delivered_cursor() {
+    let (_root, endpoint, journal) = observed_watch_service();
+    let mut delivered = Command::new(env!("CARGO_BIN_EXE_devicelane"))
+        .args([
+            "activities",
+            "watch",
+            "--local",
+            "--json",
+            "--cursor",
+            "1:0",
+            "--limit",
+            "1",
+            "--endpoint",
+            &endpoint,
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let delivered_id = SubscriberId::parse(format!("cli-{}", delivered.id())).unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(delivered.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(value["activity_id"], "watch-event");
+    assert_eq!(value["sequence"], 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while journal.subscriber_cursor(&delivered_id)
+        != Some(device_development_mesh::dashboard::EventCursor {
+            epoch: 1,
+            sequence: 1,
+        })
+    {
+        assert!(
+            Instant::now() < deadline,
+            "successful stdout was not acknowledged"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = delivered.kill();
+    let _ = delivered.wait();
+
+    let mut broken = Command::new(env!("CARGO_BIN_EXE_devicelane"))
+        .args([
+            "activities",
+            "watch",
+            "--local",
+            "--json",
+            "--cursor",
+            "1:0",
+            "--limit",
+            "1",
+            "--endpoint",
+            &endpoint,
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let broken_id = SubscriberId::parse(format!("cli-{}", broken.id())).unwrap();
+    drop(broken.stdout.take());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = broken.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "broken watch did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        journal.subscriber_cursor(&broken_id),
+        None,
+        "broken stdout must not create or advance subscriber acknowledgement"
     );
 }

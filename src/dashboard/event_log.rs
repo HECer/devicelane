@@ -516,6 +516,15 @@ impl EventJournal {
         }
     }
 
+    /// Returns the last cursor durably observed by a live subscriber.
+    /// Intended for diagnostics and black-box delivery verification.
+    pub fn subscriber_cursor(&self, id: &SubscriberId) -> Option<EventCursor> {
+        self.lock()
+            .subscribers
+            .get(id)
+            .map(|value| value.acknowledged)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner
             .lock()
