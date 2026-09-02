@@ -565,6 +565,20 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
         );
     }
 
+    let dispatch_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::read_to_string(&marker)
+            .is_ok_and(|contents| contents.lines().any(|line| line.contains("simctl install")))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < dispatch_deadline,
+            "Mac agent never dispatched the real install process before reconnect testing"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
     let EventRead::Events {
         next_cursor: resume_cursor,
         ..
