@@ -95,18 +95,10 @@ impl Redactor {
     }
 
     pub fn redact(&self, raw: RawAuditRecord) -> AuditRecord {
-        let contains_sensitive = raw.message.as_deref().is_some_and(|message| {
-            let lower = message.to_ascii_lowercase();
-            lower.contains("bearer ")
-                || lower.contains("authorization")
-                || lower.contains("token")
-                || lower.contains("secret")
-                || lower.contains("private-key")
-                || self
-                    .literals
-                    .iter()
-                    .any(|literal| message.contains(literal))
-        });
+        let contains_sensitive = raw
+            .message
+            .as_deref()
+            .is_some_and(|message| self.contains_sensitive(message));
         // Sensitive-bearing fields are deliberately consumed and never serialized.
         drop((
             raw.arguments,
@@ -119,12 +111,40 @@ impl Redactor {
         AuditRecord {
             sequence: raw.sequence,
             occurred_at_ms: raw.occurred_at_ms,
-            activity_id: raw.activity_id,
-            principal_id: raw.principal_id,
-            source_host_id: raw.source_host_id,
-            target_host_id: raw.target_host_id,
-            device_id: raw.device_id,
-            operation: raw.operation,
+            activity_id: raw.activity_id.map(|value| {
+                if self.contains_sensitive(value.as_str()) {
+                    ActivityId::parse("redacted").expect("constant id")
+                } else {
+                    value
+                }
+            }),
+            principal_id: if self.contains_sensitive(raw.principal_id.as_str()) {
+                PrincipalId::parse("redacted").expect("constant id")
+            } else {
+                raw.principal_id
+            },
+            source_host_id: if self.contains_sensitive(raw.source_host_id.as_str()) {
+                HostId::parse("redacted").expect("constant id")
+            } else {
+                raw.source_host_id
+            },
+            target_host_id: if self.contains_sensitive(raw.target_host_id.as_str()) {
+                HostId::parse("redacted").expect("constant id")
+            } else {
+                raw.target_host_id
+            },
+            device_id: raw.device_id.map(|value| {
+                if self.contains_sensitive(value.as_str()) {
+                    DeviceId::parse("redacted").expect("constant id")
+                } else {
+                    value
+                }
+            }),
+            operation: if self.contains_sensitive(raw.operation.as_str()) {
+                OperationId::parse("redacted").expect("constant id")
+            } else {
+                raw.operation
+            },
             resources: raw.resources,
             decision: raw.decision,
             result: raw.result,
@@ -140,6 +160,16 @@ impl Redactor {
                 .expect("empty structured message is valid")
             }),
         }
+    }
+
+    fn contains_sensitive(&self, value: &str) -> bool {
+        let lower = value.to_ascii_lowercase();
+        lower.contains("bearer")
+            || lower.contains("authorization")
+            || lower.contains("token")
+            || lower.contains("secret")
+            || lower.contains("private-key")
+            || self.literals.iter().any(|literal| value.contains(literal))
     }
 }
 

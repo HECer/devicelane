@@ -49,13 +49,14 @@ fn open(temp: &TempDir) -> AuditStore {
 fn redacts_before_any_bytes_reach_disk() {
     let temp = TempDir::new().unwrap();
     let mut store = open(&temp);
-    store
-        .append(raw(
-            1,
-            10,
-            "Authorization: Bearer token-secret configured-secret private-key",
-        ))
-        .unwrap();
+    let mut sensitive = raw(
+        1,
+        10,
+        "Authorization: Bearer token-secret configured-secret private-key",
+    );
+    sensitive.principal_id = PrincipalId::parse("configured-secret").unwrap();
+    sensitive.operation = OperationId::parse("token-secret").unwrap();
+    store.append(sensitive).unwrap();
     drop(store);
 
     let forbidden = [
