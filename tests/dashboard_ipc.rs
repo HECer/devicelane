@@ -145,7 +145,12 @@ fn event(state: ActivityState, sequence: u64, at: u64) -> ActivityEvent {
 fn local_snapshot_excludes_activities_between_other_hosts() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
-        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+        AuditStore::open(
+            root.path().join("audit"),
+            RetentionPolicy::default(),
+            Redactor::default(),
+        )
+        .unwrap(),
     ));
     let mut service = DashboardService::new(
         HostId::parse("mac").unwrap(),
@@ -240,7 +245,12 @@ fn admin_rule(
 fn cancellation_requires_an_explicit_one_use_admin_grant() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
-        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+        AuditStore::open(
+            root.path().join("audit"),
+            RetentionPolicy::default(),
+            Redactor::default(),
+        )
+        .unwrap(),
     ));
     let mut service = DashboardService::new(
         HostId::parse("mac").unwrap(),
@@ -274,7 +284,12 @@ fn cancellation_requires_an_explicit_one_use_admin_grant() {
 fn restart_reconciles_one_existing_activity_id_without_starting_another() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
-        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+        AuditStore::open(
+            root.path().join("audit"),
+            RetentionPolicy::default(),
+            Redactor::default(),
+        )
+        .unwrap(),
     ));
     let mut service = DashboardService::new(
         HostId::parse("mac").unwrap(),
@@ -331,7 +346,12 @@ fn restart_reconciles_one_existing_activity_id_without_starting_another() {
 fn missing_admin_grant_fails_closed_before_policy_mutation() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
-        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+        AuditStore::open(
+            root.path().join("audit"),
+            RetentionPolicy::default(),
+            Redactor::default(),
+        )
+        .unwrap(),
     ));
     let poison = Arc::clone(&audit);
     let _ = std::thread::spawn(move || {
@@ -358,7 +378,12 @@ fn missing_admin_grant_fails_closed_before_policy_mutation() {
 fn subscriber_limit_is_stable_and_idle_housekeeping_frees_capacity() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
-        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+        AuditStore::open(
+            root.path().join("audit"),
+            RetentionPolicy::default(),
+            Redactor::default(),
+        )
+        .unwrap(),
     ));
     let service = DashboardService::new(
         HostId::parse("mac").unwrap(),
@@ -406,7 +431,12 @@ fn subscriber_limit_is_stable_and_idle_housekeeping_frees_capacity() {
 fn pause_and_resume_require_separate_explicit_grants() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
-        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+        AuditStore::open(
+            root.path().join("audit"),
+            RetentionPolicy::default(),
+            Redactor::default(),
+        )
+        .unwrap(),
     ));
     let mut service = DashboardService::new(
         HostId::parse("mac").unwrap(),
@@ -477,7 +507,12 @@ fn persistent_service_reopen_reconciles_same_activity_id() {
 fn approval_request_is_audited_before_pending_state_and_emits_live_event() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
-        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+        AuditStore::open(
+            root.path().join("audit"),
+            RetentionPolicy::default(),
+            Redactor::default(),
+        )
+        .unwrap(),
     ));
     let mut service = DashboardService::new(
         HostId::parse("mac").unwrap(),
@@ -507,7 +542,12 @@ fn approval_request_is_audited_before_pending_state_and_emits_live_event() {
 fn notification_lookup_returns_only_exact_live_daemon_pending_truth() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
-        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+        AuditStore::open(
+            root.path().join("audit"),
+            RetentionPolicy::default(),
+            Redactor::default(),
+        )
+        .unwrap(),
     ));
     let mut service = DashboardService::new(
         HostId::parse("mac").unwrap(),
@@ -541,7 +581,8 @@ fn notification_lookup_returns_only_exact_live_daemon_pending_truth() {
 #[test]
 fn local_admin_approval_request_is_accepted_but_does_not_authorize_before_decision() {
     let root = tempfile::tempdir().unwrap();
-    let mut service = persistent_service(root.path(), PolicyEngine::new());
+    let state = root.path().join("state");
+    let mut service = persistent_service(&state, PolicyEngine::new());
     let request = AccessRequest {
         activity_id: ActivityId::parse("admin-put").unwrap(),
         principal_id: PrincipalId::parse("local-user").unwrap(),
@@ -573,7 +614,12 @@ fn local_admin_approval_request_is_accepted_but_does_not_authorize_before_decisi
 fn explicit_admin_deny_prevents_policy_mutation_despite_local_authentication() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
-        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+        AuditStore::open(
+            root.path().join("audit"),
+            RetentionPolicy::default(),
+            Redactor::default(),
+        )
+        .unwrap(),
     ));
     let deny = admin_rule(
         "deny-admin",
@@ -605,7 +651,12 @@ fn explicit_admin_deny_prevents_policy_mutation_despite_local_authentication() {
 fn same_user_without_an_explicit_admin_grant_is_denied() {
     let root = tempfile::tempdir().unwrap();
     let audit = Arc::new(Mutex::new(
-        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+        AuditStore::open(
+            root.path().join("audit"),
+            RetentionPolicy::default(),
+            Redactor::default(),
+        )
+        .unwrap(),
     ));
     let user_allow = admin_rule(
         "user-admin-allow",
@@ -636,13 +687,14 @@ fn same_user_without_an_explicit_admin_grant_is_denied() {
 #[test]
 fn restart_preserves_waiting_approval_when_pending_nonce_survives() {
     let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
     {
-        let mut service = persistent_service(root.path(), PolicyEngine::new());
+        let mut service = persistent_service(&state, PolicyEngine::new());
         service
             .request_approval(access("waiting"), 60_000, 10)
             .unwrap();
     }
-    let service = persistent_service(root.path(), PolicyEngine::new());
+    let service = persistent_service(&state, PolicyEngine::new());
     let snapshot = service.snapshot(DashboardScope::Local, 11);
     assert_eq!(service.pending_approvals(11).len(), 1);
     assert_eq!(snapshot.activities.len(), 1);
@@ -724,8 +776,9 @@ fn persistent_service(root: &std::path::Path, policy: PolicyEngine) -> Dashboard
 #[test]
 fn checkpoint_failure_rolls_back_staged_approval_request() {
     let request_root = tempfile::tempdir().unwrap();
-    let mut request_service = persistent_service(request_root.path(), PolicyEngine::new());
-    break_checkpoint(request_root.path());
+    let state = request_root.path().join("state");
+    let mut request_service = persistent_service(&state, PolicyEngine::new());
+    break_checkpoint(&state);
     assert!(
         request_service
             .request_approval(access("request"), 1_000, 10)

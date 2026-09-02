@@ -241,6 +241,11 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     let logs = root.path().join("logs");
     std::fs::create_dir_all(&runtime).unwrap();
     std::fs::create_dir_all(&logs).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     #[cfg(windows)]
     let listen = format!(r"\\.\pipe\devicelane-mesh-e2e-{}", std::process::id());
     #[cfg(not(windows))]

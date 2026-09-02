@@ -104,9 +104,7 @@ fn separate_processes_pair_heartbeat_and_retain_offline_snapshot() {
 
     agent.kill().unwrap();
     agent.wait().unwrap();
-    thread::sleep(Duration::from_millis(400));
-    let offline = eventually_list(&address, &cli_identity, &["--json"]);
-    let offline: serde_json::Value = serde_json::from_slice(&offline.stdout).unwrap();
+    let offline = eventually_host_status(&address, &cli_identity, "offline");
     assert_eq!(offline[0]["status"], "offline");
     assert_eq!(offline[0]["devices"][0]["id"], "iphone-1");
 
@@ -175,6 +173,22 @@ fn eventually_list(address: &str, identity: &str, extra: &[&str]) -> Output {
             Instant::now() < deadline,
             "agent did not appear within five seconds: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn eventually_host_status(address: &str, identity: &str, expected: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = eventually_list(address, identity, &["--json"]);
+        let hosts: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if hosts[0]["status"] == expected {
+            return hosts;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host did not become {expected} within five seconds; last response: {hosts}"
         );
         thread::sleep(Duration::from_millis(25));
     }

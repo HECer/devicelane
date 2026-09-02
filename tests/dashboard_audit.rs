@@ -8,7 +8,25 @@ use device_development_mesh::dashboard::{
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::sync::Arc;
-use tempfile::TempDir;
+struct TempDir {
+    _outer: tempfile::TempDir,
+    root: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new() -> std::io::Result<Self> {
+        let outer = tempfile::TempDir::new()?;
+        let root = outer.path().join("audit");
+        Ok(Self {
+            _outer: outer,
+            root,
+        })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.root
+    }
+}
 
 fn raw(sequence: u64, occurred_at_ms: u64, message: &str) -> RawAuditRecord {
     RawAuditRecord {
@@ -496,7 +514,7 @@ fn manifest_streams_every_matching_record_beyond_legacy_payload_limits() {
 #[test]
 fn atomic_private_output_is_created_with_mode_0600() {
     use std::os::unix::fs::PermissionsExt;
-    let temp = TempDir::new().unwrap();
+    let temp = tempfile::TempDir::new().unwrap();
     let output = temp.path().join("audit-export.json");
     device_development_mesh::dashboard::audit::write_private_atomic(&output, b"{}\n").unwrap();
     assert_eq!(
@@ -752,7 +770,7 @@ fn retention_tombstone_names_exact_deleted_segments_and_survives_reopen() {
 #[test]
 fn existing_unix_storage_is_non_link_owned_and_restrictive() {
     use std::os::unix::fs::{PermissionsExt, symlink};
-    let outer = TempDir::new().unwrap();
+    let outer = tempfile::TempDir::new().unwrap();
     let root = outer.path().join("audit");
     fs::create_dir(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
