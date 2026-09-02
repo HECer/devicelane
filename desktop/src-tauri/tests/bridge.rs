@@ -1,7 +1,8 @@
 use device_development_mesh::dashboard::audit::{AuditFilter, ExportManifest, ExportSignature};
 use device_development_mesh::dashboard::event_log::EventRead;
 use device_development_mesh::dashboard::{
-    ApprovalDecision, DashboardScope, DashboardSnapshot, EventCursor, SubscriberId,
+    ApprovalDecision, AuditRecord, AuditResult, DashboardScope, DashboardSnapshot, EventCursor,
+    HostId, OperationId, PolicyEffect, PrincipalId, ResourceClass, SubscriberId,
 };
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, LocalProtocolVersion, LocalRequest, LocalResponse,
@@ -339,6 +340,125 @@ fn failed_audit_export_write_leaves_no_partial_file() {
             .is_err()
     );
     assert!(!missing.exists());
+}
+
+fn export_record(sequence: u64) -> AuditRecord {
+    AuditRecord {
+        sequence,
+        occurred_at_ms: sequence,
+        activity_id: None,
+        principal_id: PrincipalId::parse(format!("principal-{sequence}")).unwrap(),
+        source_host_id: HostId::parse("windows").unwrap(),
+        target_host_id: HostId::parse("mac").unwrap(),
+        device_id: None,
+        operation: OperationId::parse("xcode-build").unwrap(),
+        resources: vec![ResourceClass::WorkspaceRead],
+        decision: PolicyEffect::Allow,
+        result: AuditResult::Succeeded,
+        redacted_message: None,
+    }
+}
+
+#[test]
+fn native_writer_saves_more_than_512_kib_through_bounded_pages() {
+    let records = (1..=2_048).map(export_record).collect::<Vec<_>>();
+    let records_json = serde_json::to_vec(&records).unwrap();
+    assert!(records_json.len() > 512 * 1024);
+    let manifest = ExportManifest {
+        format_version: 1,
+        record_count: records.len(),
+        records_sha256: format!("{:x}", sha2::Sha256::digest(&records_json)),
+        signature: ExportSignature::Unavailable,
+    };
+    let mut responses = vec![LocalResponse::AuditExportManifest(manifest.clone())];
+    for page in records.chunks(32) {
+        responses.push(LocalResponse::AuditRecords(
+            device_development_mesh::dashboard::CursorPage {
+                items: page.to_vec(),
+                next_cursor: page.last().map(|record| EventCursor {
+                    epoch: 1,
+                    sequence: record.sequence,
+                }),
+            },
+        ));
+    }
+    responses.push(LocalResponse::AuditRecords(
+        device_development_mesh::dashboard::CursorPage {
+            items: vec![],
+            next_cursor: None,
+        },
+    ));
+    let requests = Arc::new(Mutex::new(vec![]));
+    let bridge = DesktopBridge::new(QueueTransport {
+        requests: Arc::clone(&requests),
+        responses: Mutex::new(responses),
+    });
+    let root = std::env::temp_dir().join(format!("devicelane-large-export-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let output = root.join("audit.json");
+
+    let result = bridge
+        .save_audit_export_to_path(AuditFilter::default(), &output)
+        .unwrap();
+
+    assert!(
+        matches!(result, devicelane_desktop::AuditSaveResult::Saved { manifest: saved, .. } if saved == manifest)
+    );
+    assert!(fs::metadata(&output).unwrap().len() > 512 * 1024);
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !matches!(request, LocalRequest::AuditExport { .. }))
+    );
+    fs::remove_file(output).unwrap();
+    fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn native_writer_detects_a_changed_audit_view_before_replacing_the_target() {
+    let original = export_record(1);
+    let records_json = serde_json::to_vec(&vec![original]).unwrap();
+    let manifest = ExportManifest {
+        format_version: 1,
+        record_count: 1,
+        records_sha256: format!("{:x}", sha2::Sha256::digest(&records_json)),
+        signature: ExportSignature::Unavailable,
+    };
+    let changed = export_record(2);
+    let bridge = DesktopBridge::new(QueueTransport {
+        requests: Arc::new(Mutex::new(vec![])),
+        responses: Mutex::new(vec![
+            LocalResponse::AuditExportManifest(manifest),
+            LocalResponse::AuditRecords(device_development_mesh::dashboard::CursorPage {
+                items: vec![changed],
+                next_cursor: Some(EventCursor {
+                    epoch: 1,
+                    sequence: 2,
+                }),
+            }),
+            LocalResponse::AuditRecords(device_development_mesh::dashboard::CursorPage {
+                items: vec![],
+                next_cursor: None,
+            }),
+        ]),
+    });
+    let root =
+        std::env::temp_dir().join(format!("devicelane-changed-export-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let output = root.join("audit.json");
+    fs::write(&output, b"original").unwrap();
+
+    assert_eq!(
+        bridge
+            .save_audit_export_to_path(AuditFilter::default(), &output)
+            .unwrap_err(),
+        "audit export changed while saving"
+    );
+    assert_eq!(fs::read(&output).unwrap(), b"original");
+    fs::remove_file(output).unwrap();
+    fs::remove_dir(root).unwrap();
 }
 
 #[test]

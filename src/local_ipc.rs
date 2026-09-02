@@ -829,9 +829,8 @@ impl DaemonState {
                     .dashboard
                     .as_ref()
                     .ok_or(LocalProtocolError::FeatureUnavailable)?
-                    .audit_export(filter, None)
-                    .map_err(map_dashboard_error)?
-                    .manifest;
+                    .audit_export_manifest(filter, None)
+                    .map_err(map_dashboard_error)?;
                 Ok(LocalResponse::AuditExportManifest(manifest))
             }
             LocalRequest::AuditDelete { scope, filter, .. } => {

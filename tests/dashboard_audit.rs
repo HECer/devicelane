@@ -446,6 +446,66 @@ fn export_signs_a_domain_separated_manifest_and_is_bounded() {
 }
 
 #[test]
+fn manifest_streams_every_matching_record_beyond_legacy_payload_limits() {
+    let temp = TempDir::new().unwrap();
+    let mut store = open(&temp);
+    for sequence in 1..=2_048 {
+        store.append(raw(sequence, sequence, "ok")).unwrap();
+    }
+    let all_records = store
+        .query(AuditFilter::default(), None, 256)
+        .unwrap()
+        .items;
+    assert!(serde_json::to_vec(&all_records).unwrap().len() > 64 * 1024);
+    let manifest = store
+        .export_manifest(AuditFilter::default(), Some(&TestSigner))
+        .unwrap();
+    assert_eq!(manifest.record_count, 2_048);
+
+    let mut canonical = Vec::new();
+    canonical.push(b'[');
+    let mut cursor = None;
+    let mut count = 0;
+    loop {
+        let page = store.query(AuditFilter::default(), cursor, 256).unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        for record in &page.items {
+            if count > 0 {
+                canonical.push(b',');
+            }
+            serde_json::to_writer(&mut canonical, record).unwrap();
+            count += 1;
+        }
+        cursor = page.next_cursor;
+    }
+    canonical.push(b']');
+    assert!(canonical.len() > 512 * 1024);
+    assert_eq!(count, manifest.record_count);
+    assert_eq!(
+        manifest.records_sha256,
+        Sha256::digest(&canonical)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_private_output_is_created_with_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let output = temp.path().join("audit-export.json");
+    device_development_mesh::dashboard::audit::write_private_atomic(&output, b"{}\n").unwrap();
+    assert_eq!(
+        fs::metadata(output).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
 fn midday_retention_compacts_mixed_segments_at_the_exact_cutoff_and_reopens() {
     let temp = TempDir::new().unwrap();
     let day = 86_400_000;

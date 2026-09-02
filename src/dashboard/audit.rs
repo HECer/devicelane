@@ -930,6 +930,46 @@ impl AuditStore {
         })
     }
 
+    pub fn export_manifest(
+        &self,
+        filter: AuditFilter,
+        signer: Option<&dyn AuditSigner>,
+    ) -> Result<ExportManifest, AuditError> {
+        if !self.available {
+            return Err(AuditError::AuditUnavailable);
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"[");
+        let mut record_count = 0_usize;
+        for record in self.records.iter().filter(|record| filter.matches(record)) {
+            if record_count > 0 {
+                digest.update(b",");
+            }
+            let bytes = serde_json::to_vec(record)?;
+            digest.update(&bytes);
+            record_count += 1;
+        }
+        digest.update(b"]");
+        let records_sha256 = hex(&digest.finalize());
+        let signature = match signer {
+            Some(signer) => {
+                let key_id = signer.key_id().to_owned();
+                let envelope = signing_envelope(1, record_count, &records_sha256, &key_id)?;
+                ExportSignature::Signed {
+                    key_id,
+                    signature_hex: hex(&signer.sign(&envelope)?),
+                }
+            }
+            None => ExportSignature::Unavailable,
+        };
+        Ok(ExportManifest {
+            format_version: 1,
+            record_count,
+            records_sha256,
+            signature,
+        })
+    }
+
     pub fn current_segment_path(&self) -> PathBuf {
         self.segment_path(self.current)
     }
@@ -1176,13 +1216,13 @@ fn create_private_dir(path: &Path) -> Result<(), AuditError> {
 
 #[cfg(not(windows))]
 fn create_private_file(path: &Path) -> Result<File, AuditError> {
-    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(file)
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(Into::into)
 }
 #[cfg(windows)]
 fn create_private_file(path: &Path) -> Result<File, AuditError> {

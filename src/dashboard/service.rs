@@ -1,6 +1,6 @@
 use super::audit::{
     AuditDeletionScope, AuditError, AuditExport, AuditFilter, AuditSigner, AuditStore,
-    RawAuditRecord, read_activity_checkpoint, write_activity_checkpoint,
+    ExportManifest, RawAuditRecord, read_activity_checkpoint, write_activity_checkpoint,
 };
 use super::event_log::{
     AcknowledgeError, AppendTransactionError, EventJournal, EventRead, ReadLimit,
@@ -797,6 +797,18 @@ impl DashboardService {
             .lock()
             .map_err(|_| DashboardServiceError::AuditUnavailable)?
             .export(filter, signer)
+            .map_err(map_audit_error)
+    }
+
+    pub fn audit_export_manifest(
+        &self,
+        filter: AuditFilter,
+        signer: Option<&dyn AuditSigner>,
+    ) -> Result<ExportManifest, DashboardServiceError> {
+        self.audit
+            .lock()
+            .map_err(|_| DashboardServiceError::AuditUnavailable)?
+            .export_manifest(filter, signer)
             .map_err(map_audit_error)
     }
 
