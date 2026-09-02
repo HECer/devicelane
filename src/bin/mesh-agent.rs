@@ -497,17 +497,24 @@ fn start_apple_job(
                                 },
                         },
                     ) {
-                        Some(response) if response.lease_status.as_deref() == Some("active") => {
+                        Ok(response) if response.lease_status.as_deref() == Some("active") => {
                             Ok(())
                         }
-                        Some(response) => {
-                            Err(response.error.unwrap_or_else(|| "lease_inactive".into()))
+                        Ok(response) => Err(LeaseValidationError::ServerDenied(
+                            response.error.unwrap_or_else(|| "lease_inactive".into()),
+                        )),
+                        Err(RpcError::ConnectUnavailable) => {
+                            Err(LeaseValidationError::ConnectUnavailable)
                         }
-                        None => Err("lease_validation_unavailable".into()),
+                        Err(RpcError::InvalidAddress) => Err(LeaseValidationError::InvalidAddress),
+                        Err(RpcError::Tls) => Err(LeaseValidationError::Tls),
+                        Err(RpcError::Io) => Err(LeaseValidationError::Io),
+                        Err(RpcError::Protocol) => Err(LeaseValidationError::Protocol),
                     },
                     Duration::from_millis(850),
                 )
                 .err()
+                .map(|error| error.code().to_owned())
             });
             if lease_validation_error.is_none() {
                 let execution = if matches!(
@@ -690,16 +697,16 @@ fn validate_lease_grant(
 }
 
 fn validate_lease_with_retry(
-    mut validate: impl FnMut() -> Result<(), String>,
+    mut validate: impl FnMut() -> Result<(), LeaseValidationError>,
     total_timeout: Duration,
-) -> Result<(), String> {
+) -> Result<(), LeaseValidationError> {
     let deadline = Instant::now() + total_timeout;
     for attempt in 0..3 {
         match validate() {
             Ok(()) => return Ok(()),
-            Err(error) if error == "lease_validation_unavailable" => {
+            Err(LeaseValidationError::ConnectUnavailable) => {
                 if attempt == 2 || Instant::now() >= deadline {
-                    return Err(error);
+                    return Err(LeaseValidationError::ConnectUnavailable);
                 }
                 thread::sleep(Duration::from_millis(10));
             }
@@ -707,6 +714,42 @@ fn validate_lease_with_retry(
         }
     }
     unreachable!()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RpcError {
+    InvalidAddress,
+    ConnectUnavailable,
+    Tls,
+    Io,
+    Protocol,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LeaseValidationError {
+    ConnectUnavailable,
+    InvalidAddress,
+    Tls,
+    Io,
+    Protocol,
+    ServerDenied(String),
+}
+
+impl LeaseValidationError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::ConnectUnavailable => "lease_validation_unavailable",
+            Self::InvalidAddress => "lease_validation_address_invalid",
+            Self::Tls => "lease_validation_tls_failed",
+            Self::Io => "lease_validation_io_failed",
+            Self::Protocol => "lease_validation_protocol_failed",
+            Self::ServerDenied(error) if error == "lease_inactive" => "lease_inactive",
+            Self::ServerDenied(error) if error == "lease_validation_access_denied" => {
+                "lease_validation_access_denied"
+            }
+            Self::ServerDenied(_) => "lease_validation_denied",
+        }
+    }
 }
 
 fn publish_artifact(
@@ -728,7 +771,8 @@ fn publish_artifact(
             total_size: bytes.len() as u64,
             sha256: sha256.clone(),
         },
-    )?
+    )
+    .ok()?
     .artifact_metadata?;
     for (index, chunk) in bytes.chunks(64 * 1024).enumerate() {
         let response = rpc(
@@ -742,7 +786,8 @@ fn publish_artifact(
                 chunk_sha256: format!("{:x}", Sha256::digest(chunk)),
                 bytes: chunk.to_vec(),
             },
-        )?;
+        )
+        .ok()?;
         if response.error.is_some() {
             return None;
         }
@@ -750,25 +795,40 @@ fn publish_artifact(
     Some(metadata.id)
 }
 
-fn rpc(registry: &str, transport: &SecureTransport, request: &Request) -> Option<Response> {
+fn rpc(
+    registry: &str,
+    transport: &SecureTransport,
+    request: &Request,
+) -> Result<Response, RpcError> {
     let stream = registry_stream(registry)?;
-    let mut stream = transport.connect_tls(stream, "registry").ok()?;
-    serde_json::to_writer(&mut stream, request).ok()?;
-    stream.write_all(b"\n").ok()?;
+    let mut stream = transport
+        .connect_tls(stream, "registry")
+        .map_err(|_| RpcError::Tls)?;
+    serde_json::to_writer(&mut stream, request).map_err(|_| RpcError::Protocol)?;
+    stream.write_all(b"\n").map_err(|_| RpcError::Io)?;
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    serde_json::from_str(&line).ok()
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|_| RpcError::Io)?;
+    serde_json::from_str(&line).map_err(|_| RpcError::Protocol)
 }
 
-fn registry_stream(registry: &str) -> Option<TcpStream> {
-    for address in registry.to_socket_addrs().ok()? {
+fn registry_stream(registry: &str) -> Result<TcpStream, RpcError> {
+    let addresses = registry
+        .to_socket_addrs()
+        .map_err(|_| RpcError::InvalidAddress)?;
+    for address in addresses {
         if let Ok(stream) = TcpStream::connect_timeout(&address, REGISTRY_RPC_TIMEOUT) {
-            stream.set_read_timeout(Some(REGISTRY_RPC_TIMEOUT)).ok()?;
-            stream.set_write_timeout(Some(REGISTRY_RPC_TIMEOUT)).ok()?;
-            return Some(stream);
+            stream
+                .set_read_timeout(Some(REGISTRY_RPC_TIMEOUT))
+                .map_err(|_| RpcError::Io)?;
+            stream
+                .set_write_timeout(Some(REGISTRY_RPC_TIMEOUT))
+                .map_err(|_| RpcError::Io)?;
+            return Ok(stream);
         }
     }
-    None
+    Err(RpcError::ConnectUnavailable)
 }
 
 fn network_event(
@@ -800,7 +860,7 @@ fn send_apple_progress(
     terminal: bool,
 ) -> bool {
     for _ in 0..20 {
-        if let Some(stream) = registry_stream(registry)
+        if let Ok(stream) = registry_stream(registry)
             && let Ok(mut stream) = transport.connect_tls(stream, "registry")
             && serde_json::to_writer(
                 &mut stream,
@@ -1038,7 +1098,7 @@ mod tests {
                 || {
                     transient_attempts += 1;
                     if transient_attempts < 3 {
-                        Err("lease_validation_unavailable".into())
+                        Err(LeaseValidationError::ConnectUnavailable)
                     } else {
                         Ok(())
                     }
@@ -1049,18 +1109,27 @@ mod tests {
         );
         assert_eq!(transient_attempts, 3);
 
-        let mut denied_attempts = 0;
-        assert_eq!(
-            validate_lease_with_retry(
-                || {
-                    denied_attempts += 1;
-                    Err("lease_inactive".into())
-                },
-                Duration::from_millis(100),
-            ),
-            Err("lease_inactive".into())
-        );
-        assert_eq!(denied_attempts, 1);
+        for error in [
+            LeaseValidationError::InvalidAddress,
+            LeaseValidationError::Tls,
+            LeaseValidationError::Io,
+            LeaseValidationError::Protocol,
+            LeaseValidationError::ServerDenied("lease_inactive".into()),
+            LeaseValidationError::ServerDenied("lease_validation_unavailable".into()),
+        ] {
+            let mut attempts = 0;
+            assert_eq!(
+                validate_lease_with_retry(
+                    || {
+                        attempts += 1;
+                        Err(error.clone())
+                    },
+                    Duration::from_millis(100),
+                ),
+                Err(error)
+            );
+            assert_eq!(attempts, 1);
+        }
     }
 
     #[test]
@@ -1079,12 +1148,57 @@ mod tests {
         });
 
         let started = Instant::now();
-        assert!(rpc(&address, &agent, &Request::List).is_none());
+        assert!(matches!(
+            rpc(&address, &agent, &Request::List),
+            Err(RpcError::Tls)
+        ));
         assert!(
             started.elapsed() < Duration::from_millis(700),
             "stalled registry held the device writer for {:?}",
             started.elapsed()
         );
         stalled_peer.join().unwrap();
+    }
+
+    #[test]
+    fn registry_rpc_classifies_connect_unavailability() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = SecureTransport::load_or_create(root.path().join("agent"), "agent").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let started = Instant::now();
+        assert!(matches!(
+            rpc(&address, &agent, &Request::List),
+            Err(RpcError::ConnectUnavailable)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(700));
+    }
+
+    #[test]
+    fn registry_rpc_classifies_malformed_authenticated_response_as_protocol_error() {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry =
+            SecureTransport::load_or_create(root.path().join("registry"), "registry").unwrap();
+        let mut agent =
+            SecureTransport::load_or_create(root.path().join("agent"), "agent").unwrap();
+        registry.trust("agent", agent.certificate_der()).unwrap();
+        agent.trust("registry", registry.certificate_der()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let malformed_peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut stream = registry.accept_tls(stream).unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream).read_line(&mut request).unwrap();
+            stream.write_all(b"not-json\n").unwrap();
+        });
+
+        assert!(matches!(
+            rpc(&address, &agent, &Request::List),
+            Err(RpcError::Protocol)
+        ));
+        malformed_peer.join().unwrap();
     }
 }
