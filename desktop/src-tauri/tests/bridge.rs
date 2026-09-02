@@ -1,11 +1,14 @@
 use device_development_mesh::dashboard::audit::{AuditFilter, ExportManifest, ExportSignature};
 use device_development_mesh::dashboard::event_log::EventRead;
+use device_development_mesh::dashboard::policy::AccessRequest;
 use device_development_mesh::dashboard::{
-    ApprovalDecision, AuditRecord, AuditResult, DashboardScope, DashboardSnapshot, EventCursor,
-    HostId, OperationId, PolicyEffect, PrincipalId, ResourceClass, SubscriberId,
+    ActivityId, ApprovalDecision, AuditRecord, AuditResult, DashboardScope, DashboardSnapshot,
+    EventCursor, HostId, MetricValue, OperationId, PolicyEffect, PrincipalId, ResourceClass,
+    SubscriberId,
 };
 use device_development_mesh::local_ipc::{
-    ConnectionState, DaemonRole, DaemonSnapshot, LocalProtocolVersion, LocalRequest, LocalResponse,
+    ConnectionState, DaemonRole, DaemonSnapshot, LocalEndpoint, LocalProtocolVersion, LocalRequest,
+    LocalResponse, local_endpoint, send_local_request,
 };
 use devicelane_desktop::{
     DaemonTransport, DesktopBridge, JavaScriptWire, RepairProcess, WireEventCursor, repair_spec,
@@ -14,8 +17,12 @@ use devicelane_desktop::{
 use sha2::Digest;
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::net::TcpListener;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 struct FakeTransport {
@@ -116,6 +123,562 @@ fn controls_send_only_versioned_local_ipc_requests() {
             },
         ]
     );
+}
+
+#[test]
+fn remote_workspace_execution_uses_the_typed_daemon_path() {
+    let requests = Arc::new(Mutex::new(vec![]));
+    let transport = FakeTransport {
+        requests: Arc::clone(&requests),
+        response: LocalResponse::ExecutionStarted {
+            activity_id: device_development_mesh::dashboard::ActivityId::parse("activity-1")
+                .unwrap(),
+        },
+    };
+    let bridge = DesktopBridge::new(transport);
+
+    let activity_id = bridge
+        .start_remote_execution("activity-1", "project", "request-1", "build/Mesh.app")
+        .unwrap();
+
+    assert_eq!(activity_id.as_str(), "activity-1");
+    assert!(matches!(
+        &requests.lock().unwrap()[0],
+        LocalRequest::StartRemoteExecution {
+            activity_id,
+            workspace_path,
+            request_id,
+            app_path,
+            ..
+        } if activity_id.as_str() == "activity-1"
+            && workspace_path == "project"
+            && request_id == "request-1"
+            && app_path == "build/Mesh.app"
+    ));
+}
+
+#[test]
+fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
+    let root = tempfile::tempdir().unwrap();
+    let registry_identity = root.path().join("registry");
+    let service_identity = root.path().join("service").join("mac-agent");
+    let agent_identity = root.path().join("mesh-agent");
+    pair_process(
+        &workspace_binary("mesh-cli"),
+        &registry_identity,
+        &service_identity,
+    );
+    pair_process(
+        &workspace_binary("mesh-agent"),
+        &registry_identity,
+        &agent_identity,
+    );
+
+    let registry_address = free_address();
+    let _registry = spawn(
+        &workspace_binary("mesh-registry"),
+        &[
+            "--listen",
+            &registry_address,
+            "--identity",
+            registry_identity.to_str().unwrap(),
+            "--offline-after-ms",
+            "500",
+            "--agent-peer",
+            "mac-agent",
+        ],
+    );
+    let workspace_root = root.path().join("workspaces");
+    std::fs::create_dir_all(workspace_root.join("mac-agent/project/build")).unwrap();
+    let marker = root.path().join("agent-tool.log");
+    let xcodebuild = fake_apple_tool(root.path(), "xcodebuild", &marker, 0);
+    let devicectl = fake_apple_tool(root.path(), "devicectl", &marker, 0);
+    let simctl = fake_apple_tool(root.path(), "simctl", &marker, 1_500);
+    let _agent = spawn(
+        &workspace_binary("mesh-agent"),
+        &[
+            "--registry",
+            &registry_address,
+            "--identity",
+            agent_identity.to_str().unwrap(),
+            "--id",
+            "mac-agent",
+            "--peer-id",
+            "mac-agent",
+            "--os",
+            "macos",
+            "--arch",
+            "arm64",
+            "--workspace-root",
+            workspace_root.to_str().unwrap(),
+            "--xcodebuild",
+            xcodebuild.to_str().unwrap(),
+            "--devicectl",
+            devicectl.to_str().unwrap(),
+            "--simctl",
+            simctl.to_str().unwrap(),
+            "--heartbeat-ms",
+            "50",
+            "--capability",
+            "apple.simulator@1",
+            "--device",
+            "iphone-1:ios:connected",
+        ],
+    );
+    wait_for_mesh_host(&registry_address, &service_identity, "mac-agent");
+
+    let runtime = root.path().join("runtime");
+    let logs = root.path().join("logs");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&logs).unwrap();
+    #[cfg(windows)]
+    let listen = format!(r"\\.\pipe\devicelane-mesh-e2e-{}", std::process::id());
+    #[cfg(not(windows))]
+    let listen = String::new();
+    let endpoint = local_endpoint(&runtime, &listen).unwrap();
+    let _daemon = spawn(
+        &workspace_binary("devicelane-service"),
+        &[
+            "--identity",
+            service_identity.to_str().unwrap(),
+            "--runtime-dir",
+            runtime.to_str().unwrap(),
+            "--role",
+            "agent",
+            "--registry",
+            &registry_address,
+            "--listen",
+            &listen,
+            "--agent-peer",
+            "mac-agent",
+            "--log-dir",
+            logs.to_str().unwrap(),
+            "--foreground",
+        ],
+    );
+    wait_for_daemon(&endpoint);
+
+    let activity_id = "real-windows-to-mac-activity";
+    let access = AccessRequest {
+        activity_id: ActivityId::parse(activity_id).unwrap(),
+        principal_id: PrincipalId::parse("windows-principal").unwrap(),
+        source_host_id: HostId::parse("windows-client").unwrap(),
+        target_host_id: HostId::parse("mac-agent").unwrap(),
+        device_id: Some(device_development_mesh::dashboard::DeviceId::parse("iphone-1").unwrap()),
+        operation: OperationId::parse("workspace.read").unwrap(),
+        resources: vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease],
+        physical_device: true,
+        user_present: true,
+    };
+    let created = devicelane_cli(
+        &endpoint_text(&endpoint),
+        &[
+            "approvals",
+            "request",
+            "--local",
+            "--json",
+            "--activity-id",
+            activity_id,
+            "--principal-id",
+            "windows-principal",
+            "--source-host-id",
+            "windows-client",
+            "--target-host-id",
+            "mac-agent",
+            "--device-id",
+            "iphone-1",
+            "--operation",
+            "workspace.read",
+            "--resource",
+            "workspace_read",
+            "--resource",
+            "device_lease",
+            "--physical-device",
+            "--user-present",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let LocalResponse::ApprovalCreated { nonce, .. } =
+        serde_json::from_slice(&created.stdout).unwrap()
+    else {
+        panic!("approval request did not return a challenge")
+    };
+    let decided = send_local_request(
+        &endpoint,
+        &LocalRequest::DecideApproval {
+            version: LocalProtocolVersion::CURRENT,
+            nonce,
+            access,
+            decision: ApprovalDecision::AllowOnce,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        decided,
+        LocalResponse::ApprovalDecided {
+            decision: ApprovalDecision::AllowOnce,
+            ..
+        }
+    ));
+
+    let bridge = DesktopBridge::new(EndpointTransport(endpoint.clone()));
+    assert_eq!(
+        bridge
+            .start_remote_execution(activity_id, "project", "request-1", "build/Mesh.app")
+            .unwrap()
+            .as_str(),
+        activity_id
+    );
+    let running = wait_for_activity(&bridge, activity_id, "running");
+    assert_eq!(
+        running
+            .activities
+            .iter()
+            .filter(|item| item.state == device_development_mesh::dashboard::ActivityState::Running)
+            .count(),
+        1
+    );
+    let activity = running
+        .activities
+        .iter()
+        .find(|item| item.activity_id.as_str() == activity_id)
+        .unwrap();
+    assert_eq!(
+        activity.resources,
+        vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease]
+    );
+
+    let cursor = device_development_mesh::dashboard::EventCursor {
+        epoch: 1,
+        sequence: 0,
+    };
+    let direct = send_local_request(
+        &endpoint,
+        &LocalRequest::ActivityEvents {
+            version: LocalProtocolVersion::CURRENT,
+            scope: DashboardScope::Local,
+            cursor,
+            limit: 256,
+        },
+    )
+    .unwrap();
+    let cli = devicelane_cli(
+        &endpoint_text(&endpoint),
+        &["activities", "list", "--local", "--json"],
+    );
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let LocalResponse::ActivityEvents(direct) = direct else {
+        panic!("direct activity events missing")
+    };
+    let LocalResponse::ActivityEvents(cli_events) = serde_json::from_slice(&cli.stdout).unwrap()
+    else {
+        panic!("CLI activity events missing")
+    };
+    let tauri_events = bridge
+        .activity_events(DashboardScope::Local, cursor, 256)
+        .unwrap();
+    assert_eq!(direct, cli_events);
+    assert_eq!(direct, tauri_events);
+    let EventRead::Events { events, .. } = &direct else {
+        panic!("execution events missing")
+    };
+    let running_event = events
+        .iter()
+        .find(|event| {
+            event.activity_id.as_str() == activity_id
+                && event.state == device_development_mesh::dashboard::ActivityState::Running
+        })
+        .expect("running event missing");
+    for metric in [
+        &running_event.metrics.current_memory_bytes,
+        &running_event.metrics.peak_memory_bytes,
+        &running_event.metrics.cpu_time_ms,
+        &running_event.metrics.process_count,
+    ] {
+        assert!(
+            matches!(metric, MetricValue::Unavailable { reason } if reason.as_str() == "observer_unavailable")
+        );
+    }
+
+    let terminal = wait_for_activity(&bridge, activity_id, "succeeded");
+    assert_eq!(
+        terminal
+            .activities
+            .iter()
+            .filter(|item| item.activity_id.as_str() == activity_id)
+            .count(),
+        1
+    );
+
+    let direct_audit = send_local_request(
+        &endpoint,
+        &LocalRequest::AuditQuery {
+            version: LocalProtocolVersion::CURRENT,
+            filter: AuditFilter::default(),
+            cursor: None,
+            limit: 256,
+        },
+    )
+    .unwrap();
+    let cli_audit = devicelane_cli(
+        &endpoint_text(&endpoint),
+        &["audit", "list", "--local", "--json", "--limit", "256"],
+    );
+    assert!(
+        cli_audit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli_audit.stderr)
+    );
+    let LocalResponse::AuditRecords(direct_audit) = direct_audit else {
+        panic!("direct audit records missing")
+    };
+    let LocalResponse::AuditRecords(cli_audit) = serde_json::from_slice(&cli_audit.stdout).unwrap()
+    else {
+        panic!("CLI audit records missing")
+    };
+    let tauri_audit = bridge
+        .audit_query(AuditFilter::default(), None, 256)
+        .unwrap();
+    assert_eq!(direct_audit, cli_audit);
+    assert_eq!(direct_audit, tauri_audit);
+    let terminal_audit = direct_audit
+        .items
+        .iter()
+        .find(|record| {
+            record.activity_id.as_ref().map(|id| id.as_str()) == Some(activity_id)
+                && record.result == AuditResult::Succeeded
+        })
+        .expect("terminal audit record missing");
+    let canonical = serde_json::json!({
+        "activity_id": terminal_audit.activity_id.clone(),
+        "principal_id": terminal_audit.principal_id.clone(),
+        "source_host_id": terminal_audit.source_host_id.clone(),
+        "target_host_id": terminal_audit.target_host_id.clone(),
+        "operation": terminal_audit.operation.clone(),
+        "resources": terminal_audit.resources.clone(),
+        "decision": terminal_audit.decision,
+        "terminal": terminal_audit.result,
+        "redaction": terminal_audit.redacted_message.clone(),
+    });
+    assert_eq!(canonical["principal_id"], "windows-principal");
+    assert_eq!(canonical["source_host_id"], "windows-client");
+    assert_eq!(canonical["target_host_id"], "mac-agent");
+    assert_eq!(canonical["operation"], "workspace.read");
+    assert_eq!(
+        canonical["resources"],
+        serde_json::json!(["workspace_read", "device_lease"])
+    );
+    assert_eq!(canonical["decision"], "allow");
+    assert_eq!(canonical["terminal"], "succeeded");
+    assert!(canonical["redaction"].is_null());
+    let digest = sha2::Sha256::digest(serde_json::to_vec(&canonical).unwrap());
+    assert_eq!(digest.len(), 32, "canonical audit digest must be SHA-256");
+}
+
+#[derive(Clone)]
+struct EndpointTransport(LocalEndpoint);
+
+impl DaemonTransport for EndpointTransport {
+    fn send(&self, request: LocalRequest) -> Result<LocalResponse, String> {
+        send_local_request(&self.0, &request).map_err(|error| error.to_string())
+    }
+}
+
+fn wait_for_activity(
+    bridge: &DesktopBridge<EndpointTransport>,
+    activity_id: &str,
+    expected: &str,
+) -> DashboardSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = bridge.dashboard_snapshot(DashboardScope::Mesh).unwrap();
+        if snapshot.activities.iter().any(|activity| {
+            activity.activity_id.as_str() == activity_id
+                && format!("{:?}", activity.state).eq_ignore_ascii_case(expected)
+        }) {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn workspace_binary(name: &str) -> PathBuf {
+    let debug = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let binary = debug.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        binary.is_file(),
+        "build workspace binaries before this gate: {}",
+        binary.display()
+    );
+    binary
+}
+
+fn pair_process(binary: &Path, registry_identity: &Path, peer_identity: &Path) {
+    let address = free_address();
+    let mut registry = spawn(
+        &workspace_binary("mesh-registry"),
+        &[
+            "pair",
+            "--listen",
+            &address,
+            "--identity",
+            registry_identity.to_str().unwrap(),
+        ],
+    );
+    let mut command = Command::new(binary);
+    command.args([
+        "pair",
+        "--address",
+        &address,
+        "--identity",
+        peer_identity.to_str().unwrap(),
+    ]);
+    if binary.file_stem().and_then(|value| value.to_str()) == Some("mesh-agent") {
+        command.args(["--peer-id", "mac-agent"]);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(registry.wait().unwrap().success());
+}
+
+fn free_address() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+fn spawn(path: &Path, args: &[&str]) -> ChildGuard {
+    ChildGuard(
+        Command::new(path)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn wait_for_mesh_host(address: &str, identity: &Path, host: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = Command::new(workspace_binary("mesh-cli"))
+            .args([
+                "--registry",
+                address,
+                "--identity",
+                identity.to_str().unwrap(),
+                "list",
+                "--json",
+            ])
+            .output();
+        if output.is_ok_and(|value| {
+            value.status.success() && String::from_utf8_lossy(&value.stdout).contains(host)
+        }) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for mesh host");
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_daemon(endpoint: &LocalEndpoint) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while send_local_request(
+        endpoint,
+        &LocalRequest::Status {
+            version: LocalProtocolVersion::CURRENT,
+        },
+    )
+    .is_err()
+    {
+        assert!(Instant::now() < deadline, "timed out waiting for daemon");
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn endpoint_text(endpoint: &LocalEndpoint) -> String {
+    match endpoint {
+        #[cfg(unix)]
+        LocalEndpoint::UnixSocket(path) => path.display().to_string(),
+        #[cfg(windows)]
+        LocalEndpoint::NamedPipe(path) => path.clone(),
+    }
+}
+
+fn devicelane_cli(endpoint: &str, args: &[&str]) -> Output {
+    Command::new(workspace_binary("devicelane"))
+        .args(args)
+        .args(["--endpoint", endpoint])
+        .output()
+        .unwrap()
+}
+
+fn fake_apple_tool(root: &Path, name: &str, marker: &Path, delay_ms: u64) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = root.join(format!("{name}.cmd"));
+        std::fs::write(
+            &path,
+            format!(
+                "@echo off\r\necho {name} %*>>\"{}\"\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"install\" goto mutation\r\nif \"%1\"==\"-version\" goto version\r\nif \"{name}\"==\"devicectl\" if \"%1\"==\"list\" goto devices\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"list\" goto simulators\r\necho complete\r\nexit /b 0\r\n:mutation\r\npowershell.exe -NoProfile -Command \"Start-Sleep -Milliseconds {delay_ms}\"\r\necho installed\r\nexit /b 0\r\n:version\r\necho Xcode 16\r\nexit /b 0\r\n:devices\r\necho {{\"result\":{{\"devices\":[]}}}}\r\nexit /b 0\r\n:simulators\r\necho {{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"iphone-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}\r\nexit /b 0\r\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        path
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho '{name} $*' >> '{}'\nif [ '{name}' = simctl ] && [ \"$1\" = install ]; then sleep {}; echo installed; exit 0; fi\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && [ \"$1\" = list ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && [ \"$1\" = list ] && echo '{{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"iphone-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}' && exit 0\necho complete\n", marker.display(), delay_ms as f64 / 1000.0),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+}
+
+struct ChildGuard(Child);
+impl Deref for ChildGuard {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+impl DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[test]
