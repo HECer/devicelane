@@ -1,9 +1,11 @@
+use device_development_mesh::dashboard::event_log::EventRead;
+use device_development_mesh::dashboard::{EventCursor, SubscriberId};
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, LocalProtocolVersion, LocalRequest, LocalResponse,
 };
 use devicelane_desktop::{
-    DaemonTransport, DesktopBridge, RepairProcess, repair_spec, run_smoke_probe_with_transport,
-    sha256_file, validate_bundle_asset,
+    DaemonTransport, DesktopBridge, JavaScriptWire, RepairProcess, WireEventCursor, repair_spec,
+    run_smoke_probe_with_transport, sha256_file, validate_bundle_asset,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -126,6 +128,93 @@ fn daemon_errors_remain_errors_at_the_command_boundary() {
         bridge.pause().unwrap_err(),
         "daemon error (unauthorized): wrong user"
     );
+}
+
+#[test]
+fn dashboard_bridge_uses_typed_versioned_requests_and_preserves_resync_details() {
+    let requests = Arc::new(Mutex::new(vec![]));
+    let resync = EventRead::ResyncRequired {
+        oldest_available: EventCursor {
+            epoch: u64::MAX,
+            sequence: u64::MAX - 1,
+        },
+        snapshot_revision: u64::MAX - 2,
+    };
+    let bridge = DesktopBridge::new(FakeTransport {
+        requests: Arc::clone(&requests),
+        response: LocalResponse::ActivityEvents(resync.clone()),
+    });
+
+    let response = bridge
+        .activity_events(
+            EventCursor {
+                epoch: 0,
+                sequence: 0,
+            },
+            100,
+        )
+        .unwrap();
+
+    assert_eq!(response, resync);
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![LocalRequest::ActivityEvents {
+            version: LocalProtocolVersion::CURRENT,
+            cursor: EventCursor {
+                epoch: 0,
+                sequence: 0
+            },
+            limit: 100,
+        }]
+    );
+}
+
+#[test]
+fn dashboard_acknowledgement_parses_decimal_cursor_without_javascript_precision_loss() {
+    let requests = Arc::new(Mutex::new(vec![]));
+    let bridge = DesktopBridge::new(FakeTransport {
+        requests: Arc::clone(&requests),
+        response: LocalResponse::Acknowledged,
+    });
+    let cursor = WireEventCursor {
+        epoch: u64::MAX.to_string(),
+        sequence: (u64::MAX - 1).to_string(),
+    };
+
+    bridge
+        .acknowledge_events("desktop-ui", cursor.try_into().unwrap())
+        .unwrap();
+
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![LocalRequest::AcknowledgeEvents {
+            version: LocalProtocolVersion::CURRENT,
+            subscriber_id: SubscriberId::parse("desktop-ui").unwrap(),
+            cursor: EventCursor {
+                epoch: u64::MAX,
+                sequence: u64::MAX - 1
+            },
+        }]
+    );
+}
+
+#[test]
+fn javascript_dashboard_wire_serializes_every_u64_as_an_exact_decimal_string() {
+    let wire = serde_json::to_value(JavaScriptWire(EventRead::ResyncRequired {
+        oldest_available: EventCursor {
+            epoch: u64::MAX,
+            sequence: u64::MAX - 1,
+        },
+        snapshot_revision: u64::MAX - 2,
+    }))
+    .unwrap();
+
+    assert_eq!(wire["oldest_available"]["epoch"], u64::MAX.to_string());
+    assert_eq!(
+        wire["oldest_available"]["sequence"],
+        (u64::MAX - 1).to_string()
+    );
+    assert_eq!(wire["snapshot_revision"], (u64::MAX - 2).to_string());
 }
 
 #[test]

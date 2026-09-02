@@ -1,10 +1,11 @@
 use device_development_mesh::dashboard::{
     ActivityEvent, ActivityId, ActivityState, ActivitySummary, ApprovalDecision, ApprovalId,
     ApprovalRequest, AuditRecord, AuditResult, Authorization, ConnectionPath, CursorPage,
-    DashboardDevice, DashboardHost, DashboardScope, DashboardSnapshot, DashboardWarning, DeviceId,
-    DisplayMessage, EventCursor, Freshness, HostId, MessageCode, MetricSnapshot, MetricValue,
-    OperationId, PolicyEffect, PolicyOrigin, PolicyRule, Presence, PrincipalId, ResourceClass,
-    ResourceOccupancy, RuleId, SafeCode, TrustState, ValidatedId,
+    DashboardDevice, DashboardHost, DashboardLease, DashboardScope, DashboardSnapshot,
+    DashboardWarning, DeviceId, DisplayMessage, EventCursor, Freshness, HostId, LeaseId,
+    LeaseState, MessageCode, MetricSnapshot, MetricValue, OperationId, PolicyEffect, PolicyOrigin,
+    PolicyRule, Presence, PrincipalId, ResourceClass, ResourceOccupancy, RuleId, SafeCode,
+    TrustState, ValidatedId,
 };
 use serde_json::json;
 
@@ -101,6 +102,12 @@ fn representative_contracts_round_trip() {
         scope: DashboardScope::Mesh,
         hosts: vec![sample_host()],
         activities: vec![ActivitySummary::from(&event)],
+        leases: vec![DashboardLease {
+            id: LeaseId::parse("lease-1").unwrap(),
+            owner_host_id: host_id("mac-studio"),
+            device_id: device_id("iphone-1"),
+            state: LeaseState::Uncertain,
+        }],
         pending_approvals: vec![ApprovalRequest {
             id: ApprovalId::parse("approval-1").unwrap(),
             activity_id: event.activity_id.clone(),
@@ -125,6 +132,7 @@ fn representative_contracts_round_trip() {
     let encoded = serde_json::to_string(&snapshot).unwrap();
     let decoded: DashboardSnapshot = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded, snapshot);
+    assert_eq!(decoded.leases[0].state, LeaseState::Uncertain);
     assert_eq!(
         serde_json::from_str::<ActivityEvent>(&serde_json::to_string(&event).unwrap()).unwrap(),
         event
@@ -309,6 +317,7 @@ fn stale_or_offline_presence_requires_last_seen() {
         scope: DashboardScope::Local,
         hosts: vec![host],
         activities: vec![],
+        leases: vec![],
         pending_approvals: vec![],
         warnings: vec![],
     };
@@ -365,6 +374,7 @@ fn deserialization_cannot_bypass_semantic_validation() {
         scope: DashboardScope::Local,
         hosts: vec![sample_host()],
         activities: vec![],
+        leases: vec![],
         pending_approvals: vec![],
         warnings: vec![],
     })
@@ -717,6 +727,7 @@ fn invalid_in_memory_models_cannot_cross_the_serialization_boundary() {
         scope: DashboardScope::Local,
         hosts: vec![sample_host(); 129],
         activities: vec![],
+        leases: vec![],
         pending_approvals: vec![],
         warnings: vec![],
     };
@@ -756,6 +767,7 @@ fn nested_validation_errors_report_the_complete_object_path() {
         scope: DashboardScope::Mesh,
         hosts: vec![sample_host()],
         activities: vec![ActivitySummary::from(&sample_event())],
+        leases: vec![],
         pending_approvals: vec![],
         warnings: vec![],
     };

@@ -593,6 +593,26 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         .unwrap(),
         LocalResponse::Cancellation { cancelled: true }
     ));
+    let resync = send_eventually(
+        &endpoint,
+        &LocalRequest::ActivityEvents {
+            version: LocalProtocolVersion::CURRENT,
+            cursor: EventCursor {
+                epoch: 0,
+                sequence: 0,
+            },
+            limit: 32,
+        },
+    );
+    assert!(matches!(
+        resync,
+        LocalResponse::ActivityEvents(
+            device_development_mesh::dashboard::event_log::EventRead::ResyncRequired {
+                oldest_available: EventCursor { epoch: 1, .. },
+                snapshot_revision: _,
+            }
+        )
+    ));
     let events = send_eventually(
         &endpoint,
         &LocalRequest::ActivityEvents {
@@ -792,7 +812,8 @@ fn production_service_restart_reconciles_one_durable_activity_id() {
         })
         .expect("restarted service did not bind");
     assert!(
-        matches!(response, LocalResponse::DashboardSnapshot(snapshot) if snapshot.activities.len() == 1 && snapshot.activities[0].activity_id.as_str() == "ipc-approval" && snapshot.activities[0].state == ActivityState::Reconnecting)
+        matches!(&response, LocalResponse::DashboardSnapshot(snapshot) if snapshot.activities.len() == 1 && snapshot.activities[0].activity_id.as_str() == "ipc-approval" && snapshot.activities[0].state == ActivityState::AwaitingApproval),
+        "unexpected restart snapshot: {response:?}"
     );
     second.kill().unwrap();
     second.wait().unwrap();

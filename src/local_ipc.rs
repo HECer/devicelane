@@ -649,7 +649,9 @@ impl DaemonState {
                 let read = service.events(cursor, limit);
                 match read {
                     EventRead::CursorAhead { .. } => Err(LocalProtocolError::CursorAhead),
-                    EventRead::ResyncRequired { .. } => Err(LocalProtocolError::ResyncRequired),
+                    resync @ EventRead::ResyncRequired { .. } => {
+                        Ok(LocalResponse::ActivityEvents(resync))
+                    }
                     EventRead::LimitExceeded => Err(LocalProtocolError::LimitExceeded),
                     events => Ok(LocalResponse::ActivityEvents(events)),
                 }

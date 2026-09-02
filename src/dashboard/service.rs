@@ -231,6 +231,9 @@ impl DashboardService {
         if scope == DashboardScope::Local {
             snapshot.scope = DashboardScope::Local;
             snapshot.hosts.retain(|host| host.id == self.local_host_id);
+            snapshot
+                .leases
+                .retain(|lease| lease.owner_host_id == self.local_host_id);
         }
         snapshot.activities = self.activities.values().map(Into::into).collect();
         snapshot.pending_approvals = self.pending_approvals(now_ms);

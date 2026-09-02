@@ -1,7 +1,8 @@
+pub use crate::dashboard::model::LeaseState;
 use crate::dashboard::{
-    ConnectionPath, DashboardDevice, DashboardHost, DashboardScope, DashboardSnapshot, DeviceId,
-    Freshness, HostId, MAX_COLLECTION_ITEMS, MAX_ID_BYTES, MAX_TEXT_BYTES, Presence, SafeCode,
-    TrustState,
+    ConnectionPath, DashboardDevice, DashboardHost, DashboardLease, DashboardScope,
+    DashboardSnapshot, DeviceId, Freshness, HostId, LeaseId, MAX_COLLECTION_ITEMS, MAX_ID_BYTES,
+    MAX_TEXT_BYTES, Presence, SafeCode, TrustState,
 };
 use crate::network_processes::{DeviceSnapshot, HostSnapshot};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -23,12 +24,6 @@ pub struct RegistryHost {
     pub connection_path: ConnectionPath,
     pub permissions: Vec<String>,
     pub devices: Vec<DeviceDetails>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LeaseState {
-    Active,
-    Uncertain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -341,6 +336,16 @@ impl TopologyProjector {
                 .map(|host| host.dashboard.clone())
                 .collect(),
             activities: Vec::new(),
+            leases: self
+                .leases
+                .iter()
+                .map(|(id, lease)| DashboardLease {
+                    id: LeaseId::parse(id.clone()).expect("stored lease IDs are validated"),
+                    owner_host_id: lease.owner_host_id.clone(),
+                    device_id: lease.device_id.clone(),
+                    state: lease.state,
+                })
+                .collect(),
             pending_approvals: Vec::new(),
             warnings: Vec::new(),
         }

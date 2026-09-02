@@ -291,6 +291,10 @@ fn stale_owner_makes_active_lease_uncertain_and_not_authorizable() {
         projector.lease_state("lease-1"),
         Some(LeaseState::Uncertain)
     );
+    let snapshot = projector.snapshot(120);
+    assert_eq!(snapshot.leases.len(), 1);
+    assert_eq!(snapshot.leases[0].id.as_str(), "lease-1");
+    assert_eq!(snapshot.leases[0].state, LeaseState::Uncertain);
     assert!(!projector.lease_authorizable("lease-1"));
 }
 

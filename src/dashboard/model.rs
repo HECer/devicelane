@@ -237,6 +237,7 @@ define_id!(RuleId);
 define_id!(OperationId);
 define_id!(ApprovalId);
 define_id!(SubscriberId);
+define_id!(LeaseId);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -262,6 +263,13 @@ pub enum Freshness {
     Live,
     Stale { last_seen_at_ms: u64 },
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum LeaseState {
+    Active,
+    Uncertain,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -535,6 +543,15 @@ pub struct ResourceOccupancy {
     pub acquired_at_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardLease {
+    pub id: LeaseId,
+    pub owner_host_id: HostId,
+    pub device_id: DeviceId,
+    pub state: LeaseState,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "ApprovalRequestWire")]
 pub struct ApprovalRequest {
@@ -641,6 +658,7 @@ pub struct DashboardSnapshot {
     pub scope: DashboardScope,
     pub hosts: Vec<DashboardHost>,
     pub activities: Vec<ActivitySummary>,
+    pub leases: Vec<DashboardLease>,
     pub pending_approvals: Vec<ApprovalRequest>,
     pub warnings: Vec<DashboardWarning>,
 }
@@ -649,6 +667,7 @@ impl DashboardSnapshot {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_len(self.hosts.len(), "hosts")?;
         validate_len(self.activities.len(), "activities")?;
+        validate_len(self.leases.len(), "leases")?;
         validate_len(self.pending_approvals.len(), "pending_approvals")?;
         validate_len(self.warnings.len(), "warnings")?;
         for (index, host) in self.hosts.iter().enumerate() {
@@ -659,6 +678,30 @@ impl DashboardSnapshot {
             activity
                 .validate()
                 .map_err(|error| error.prepend(format!("activities[{index}]")))?;
+        }
+        let mut lease_ids = HashSet::with_capacity(self.leases.len());
+        for (index, lease) in self.leases.iter().enumerate() {
+            if !lease_ids.insert(&lease.id) {
+                return Err(ValidationError::at_index(
+                    "duplicate_lease_id",
+                    "leases",
+                    index,
+                ));
+            }
+            let owner = self
+                .hosts
+                .iter()
+                .find(|host| host.id == lease.owner_host_id);
+            if !owner.is_some_and(|host| {
+                host.devices
+                    .iter()
+                    .any(|device| device.id == lease.device_id)
+            }) {
+                return Err(ValidationError::at(
+                    "lease_device_mismatch",
+                    format!("leases[{index}].device_id"),
+                ));
+            }
         }
         for (index, approval) in self.pending_approvals.iter().enumerate() {
             approval
@@ -1156,6 +1199,8 @@ struct DashboardSnapshotWire {
     scope: DashboardScope,
     hosts: Vec<DashboardHost>,
     activities: Vec<ActivitySummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    leases: Vec<DashboardLease>,
     pending_approvals: Vec<ApprovalRequest>,
     warnings: Vec<DashboardWarning>,
 }
@@ -1169,6 +1214,7 @@ validate_wire!(
         scope: wire.scope,
         hosts: wire.hosts,
         activities: wire.activities,
+        leases: wire.leases,
         pending_approvals: wire.pending_approvals,
         warnings: wire.warnings,
     }
@@ -1182,6 +1228,7 @@ validated_serialize!(
         scope: value.scope,
         hosts: value.hosts.clone(),
         activities: value.activities.clone(),
+        leases: value.leases.clone(),
         pending_approvals: value.pending_approvals.clone(),
         warnings: value.warnings.clone(),
     }

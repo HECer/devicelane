@@ -1,9 +1,13 @@
 use command_group::CommandGroup;
+use device_development_mesh::dashboard::event_log::EventRead;
+use device_development_mesh::dashboard::{
+    DashboardScope, DashboardSnapshot, EventCursor, SubscriberId,
+};
 use device_development_mesh::local_ipc::{
     DaemonSnapshot, DiagnosticItem, LocalProtocolVersion, LocalRequest, LocalResponse,
     local_endpoint, send_local_request,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs::File;
@@ -39,6 +43,58 @@ impl DaemonTransport for LocalDaemonTransport {
 pub struct DiagnosticsResult {
     pub path: String,
     pub items: Vec<DiagnosticItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireEventCursor {
+    pub epoch: String,
+    pub sequence: String,
+}
+
+impl TryFrom<WireEventCursor> for EventCursor {
+    type Error = String;
+
+    fn try_from(value: WireEventCursor) -> Result<Self, Self::Error> {
+        let parse = |name: &str, raw: String| {
+            if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{name} must be an unsigned decimal string"));
+            }
+            raw.parse::<u64>()
+                .map_err(|_| format!("{name} exceeds u64"))
+        };
+        Ok(Self {
+            epoch: parse("cursor.epoch", value.epoch)?,
+            sequence: parse("cursor.sequence", value.sequence)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct JavaScriptWire<T>(pub T);
+
+fn stringify_unsigned_numbers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => values.iter_mut().for_each(stringify_unsigned_numbers),
+        serde_json::Value::Object(values) => {
+            values.values_mut().for_each(stringify_unsigned_numbers)
+        }
+        serde_json::Value::Number(number) if number.is_u64() => {
+            *value = serde_json::Value::String(number.to_string());
+        }
+        _ => {}
+    }
+}
+
+impl<T: Serialize> Serialize for JavaScriptWire<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut value = serde_json::to_value(&self.0).map_err(serde::ser::Error::custom)?;
+        stringify_unsigned_numbers(&mut value);
+        value.serialize(serializer)
+    }
 }
 
 pub struct DesktopBridge<T> {
@@ -88,6 +144,41 @@ impl<T: DaemonTransport> DesktopBridge<T> {
             }),
             response => Err(unexpected_response(response)),
         }
+    }
+
+    pub fn dashboard_snapshot(&self, scope: DashboardScope) -> Result<DashboardSnapshot, String> {
+        match self.transport.send(LocalRequest::DashboardSnapshot {
+            version: LocalProtocolVersion::CURRENT,
+            scope,
+        })? {
+            LocalResponse::DashboardSnapshot(snapshot) => Ok(snapshot),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn activity_events(&self, cursor: EventCursor, limit: usize) -> Result<EventRead, String> {
+        match self.transport.send(LocalRequest::ActivityEvents {
+            version: LocalProtocolVersion::CURRENT,
+            cursor,
+            limit,
+        })? {
+            LocalResponse::ActivityEvents(events) => Ok(events),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn acknowledge_events(
+        &self,
+        subscriber_id: &str,
+        cursor: EventCursor,
+    ) -> Result<(), String> {
+        let subscriber_id = SubscriberId::parse(subscriber_id)
+            .map_err(|error| format!("invalid subscriber_id: {error}"))?;
+        self.acknowledge(LocalRequest::AcknowledgeEvents {
+            version: LocalProtocolVersion::CURRENT,
+            subscriber_id,
+            cursor,
+        })
     }
 
     fn acknowledge(&self, request: LocalRequest) -> Result<(), String> {
@@ -465,6 +556,39 @@ fn create_diagnostics(
 }
 
 #[tauri::command]
+fn dashboard_snapshot(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    scope: DashboardScope,
+) -> Result<JavaScriptWire<DashboardSnapshot>, String> {
+    report(&app, bridge.dashboard_snapshot(scope).map(JavaScriptWire))
+}
+
+#[tauri::command]
+fn activity_events(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    cursor: WireEventCursor,
+    limit: usize,
+) -> Result<JavaScriptWire<EventRead>, String> {
+    let result =
+        EventCursor::try_from(cursor).and_then(|cursor| bridge.activity_events(cursor, limit));
+    report(&app, result.map(JavaScriptWire))
+}
+
+#[tauri::command]
+fn acknowledge_events(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    subscriber_id: String,
+    cursor: WireEventCursor,
+) -> Result<(), String> {
+    let result = EventCursor::try_from(cursor)
+        .and_then(|cursor| bridge.acknowledge_events(&subscriber_id, cursor));
+    report(&app, result)
+}
+
+#[tauri::command]
 async fn repair_daemon(app: AppHandle) -> Result<(), String> {
     let service_binary = locate_service_sidecar(&app).await;
     let prepared = app
@@ -531,6 +655,9 @@ pub fn run() {
             resume_remote_access,
             set_autostart,
             create_diagnostics,
+            dashboard_snapshot,
+            activity_events,
+            acknowledge_events,
             repair_daemon
         ])
         .run(tauri::generate_context!())
