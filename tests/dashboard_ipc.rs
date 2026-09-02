@@ -460,12 +460,18 @@ fn same_user_without_an_explicit_admin_grant_is_denied() {
     let audit = Arc::new(Mutex::new(
         AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
     ));
+    let user_allow = admin_rule(
+        "user-admin-allow",
+        PolicyEffect::Allow,
+        "devicelane.policy.put",
+        ResourceClass::DeviceLanePolicy,
+    );
     let mut service = DashboardService::new(
         HostId::parse("mac").unwrap(),
         TopologyProjector::new(),
         EventJournal::new(1, 0),
         audit,
-        PolicyEngine::new(),
+        PolicyEngine::with_rules(vec![user_allow]).unwrap(),
     );
     let candidate = admin_rule(
         "candidate",
@@ -477,7 +483,26 @@ fn same_user_without_an_explicit_admin_grant_is_denied() {
         service.put_policy_rule(candidate, 10),
         Err(DashboardServiceError::PermissionDenied)
     );
-    assert!(service.policy_rules().is_empty());
+    assert_eq!(service.policy_rules().len(), 1);
+}
+
+#[test]
+fn restart_preserves_waiting_approval_when_pending_nonce_survives() {
+    let root = tempfile::tempdir().unwrap();
+    {
+        let mut service = persistent_service(root.path(), PolicyEngine::new());
+        service
+            .request_approval(access("waiting"), 60_000, 10)
+            .unwrap();
+    }
+    let service = persistent_service(root.path(), PolicyEngine::new());
+    let snapshot = service.snapshot(DashboardScope::Local, 11);
+    assert_eq!(service.pending_approvals(11).len(), 1);
+    assert_eq!(snapshot.activities.len(), 1);
+    assert_eq!(
+        snapshot.activities[0].state,
+        ActivityState::AwaitingApproval
+    );
 }
 
 #[test]

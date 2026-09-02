@@ -209,6 +209,12 @@ impl PolicyEngine {
         &self.rules
     }
 
+    pub(crate) fn is_verified_managed_rule(&self, id: &RuleId) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| &rule.id == id && rule.origin == PolicyOrigin::Managed)
+    }
+
     pub(crate) fn validate_restored(&self) -> Result<(), PolicyConfigurationError> {
         validate_rule_set(&self.rules, true)?;
         if self.approvals.len() > MAX_PENDING_APPROVALS {

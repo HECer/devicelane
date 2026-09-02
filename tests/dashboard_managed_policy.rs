@@ -3,10 +3,15 @@ use device_development_mesh::dashboard::managed_policy::{
     PolicyAdminTrustFile, PolicyAdminTrustStore, canonical_rules_digest,
 };
 use device_development_mesh::dashboard::{
-    OperationId, PolicyEffect, PolicyOrigin, PolicyRule, ResourceClass, RuleId,
+    HostId, OperationId, PolicyEffect, PolicyOrigin, PolicyRule, ResourceClass, RuleId,
+    audit::{AuditStore, Redactor, RetentionPolicy},
+    event_log::EventJournal,
     policy::PolicyEngine,
+    service::{DashboardService, DashboardServiceError},
+    topology::TopologyProjector,
 };
 use device_development_mesh::secure_transport::SecureTransport;
+use std::sync::{Arc, Mutex};
 
 fn managed_rule() -> PolicyRule {
     PolicyRule {
@@ -36,6 +41,127 @@ fn secure_file(_path: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
+}
+
+fn verified_engine(root: &std::path::Path, rules: Vec<PolicyRule>) -> PolicyEngine {
+    let signer = SecureTransport::load_or_create(root.join("signer"), "signer").unwrap();
+    let path = root.join("signer").join("managed.json");
+    let trust_path = root.join("signer").join("admins.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&ManagedPolicyFile {
+            signer_id: "signer".into(),
+            signature: signer
+                .sign(&canonical_rules_digest(&rules).unwrap())
+                .unwrap(),
+            rules,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    secure_file(&path);
+    let trust = write_admin_trust(
+        &trust_path,
+        vec![PolicyAdminTrustEntry {
+            signer_id: "signer".into(),
+            certificate_der: signer.certificate_der().to_vec(),
+            role: "policy_signer".into(),
+            revoked: false,
+        }],
+    );
+    let bundle = ManagedPolicyStore::load(&path, &trust).unwrap();
+    let mut engine = PolicyEngine::new();
+    engine.add_verified_managed_rules(bundle).unwrap();
+    engine
+}
+
+fn admin_rule(id: &str, effect: PolicyEffect, origin: PolicyOrigin) -> PolicyRule {
+    PolicyRule {
+        id: RuleId::parse(id).unwrap(),
+        revision: 1,
+        effect,
+        principal_id: Some(
+            device_development_mesh::dashboard::PrincipalId::parse("local-user").unwrap(),
+        ),
+        source_host_id: Some(HostId::parse("mac").unwrap()),
+        target_host_id: Some(HostId::parse("mac").unwrap()),
+        device_id: None,
+        operation: Some(OperationId::parse("devicelane.policy.put").unwrap()),
+        resources: vec![ResourceClass::DeviceLanePolicy],
+        expires_at_ms: None,
+        require_user_presence: false,
+        user_presence: None,
+        physical_device: None,
+        match_device_exact: true,
+        match_resources_exact: true,
+        enabled: true,
+        origin,
+    }
+}
+
+fn service(root: &std::path::Path, engine: PolicyEngine) -> DashboardService {
+    DashboardService::new(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(1, 0),
+        Arc::new(Mutex::new(
+            AuditStore::open(
+                root.join("audit"),
+                RetentionPolicy::default(),
+                Redactor::default(),
+            )
+            .unwrap(),
+        )),
+        engine,
+    )
+}
+
+#[test]
+fn verified_managed_admin_allow_is_unattended_but_deny_still_dominates() {
+    let allowed_root = tempfile::tempdir().unwrap();
+    let mut allowed = service(
+        allowed_root.path(),
+        verified_engine(
+            allowed_root.path(),
+            vec![admin_rule(
+                "managed-allow",
+                PolicyEffect::Allow,
+                PolicyOrigin::Managed,
+            )],
+        ),
+    );
+    assert_eq!(
+        allowed.put_policy_rule(
+            admin_rule("candidate", PolicyEffect::Allow, PolicyOrigin::User),
+            10
+        ),
+        Ok(())
+    );
+
+    let denied_root = tempfile::tempdir().unwrap();
+    let mut engine = verified_engine(
+        denied_root.path(),
+        vec![admin_rule(
+            "managed-allow",
+            PolicyEffect::Allow,
+            PolicyOrigin::Managed,
+        )],
+    );
+    engine
+        .put_user_rule(admin_rule(
+            "user-deny",
+            PolicyEffect::Deny,
+            PolicyOrigin::User,
+        ))
+        .unwrap();
+    let mut denied = service(denied_root.path(), engine);
+    assert_eq!(
+        denied.put_policy_rule(
+            admin_rule("candidate", PolicyEffect::Allow, PolicyOrigin::User),
+            10
+        ),
+        Err(DashboardServiceError::PermissionDenied)
+    );
 }
 
 fn write_admin_trust(

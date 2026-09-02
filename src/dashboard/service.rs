@@ -639,14 +639,7 @@ impl DashboardService {
         let active: Vec<_> = self
             .activities
             .values()
-            .filter(|event| {
-                matches!(
-                    event.state,
-                    ActivityState::AwaitingApproval
-                        | ActivityState::Queued
-                        | ActivityState::Running
-                )
-            })
+            .filter(|event| matches!(event.state, ActivityState::Queued | ActivityState::Running))
             .cloned()
             .collect();
         for mut event in active.iter().cloned() {
@@ -755,12 +748,18 @@ impl DashboardService {
             physical_device: false,
             user_present: true,
         };
-        if matches!(
-            self.policy.evaluate(&request, now_ms),
-            Ok(PolicyDecision::Denied { .. })
-        ) {
-            self.audit_access(&request, PolicyEffect::Deny, AuditResult::Denied, now_ms)?;
-            return Err(DashboardServiceError::PermissionDenied);
+        match self.policy.evaluate(&request, now_ms) {
+            Ok(PolicyDecision::Denied { .. }) => {
+                self.audit_access(&request, PolicyEffect::Deny, AuditResult::Denied, now_ms)?;
+                return Err(DashboardServiceError::PermissionDenied);
+            }
+            Ok(PolicyDecision::Allowed { rule_id })
+                if self.policy.is_verified_managed_rule(&rule_id) =>
+            {
+                return Ok(());
+            }
+            Ok(PolicyDecision::Allowed { .. } | PolicyDecision::ApprovalRequired { .. }) => {}
+            Err(_) => return Err(DashboardServiceError::InvalidRequest),
         }
         self.admin_grants
             .retain(|_, grant| grant.expires_at_ms > now_ms);
