@@ -215,17 +215,17 @@ fn windows_acl_is_restrictive(path: &Path, configured: &HashSet<String>) -> bool
     if !text.is_null() {
         unsafe { LocalFree(text as _) };
     }
+    let Some(current_user_sid) = current_process_user_sid() else {
+        unsafe { LocalFree(descriptor as _) };
+        return false;
+    };
+    if !acl_owner_allowed(&owner_sid, &current_user_sid, configured) {
+        unsafe { LocalFree(descriptor as _) };
+        return false;
+    }
     let mut allowed = configured.clone();
-    allowed.insert(owner_sid);
+    allowed.insert(current_user_sid);
     allowed.insert("s-1-5-18".into());
-    let dangerous = 0x4000_0000_u32
-        | 0x1000_0000
-        | 0x0001_0000
-        | 0x0004_0000
-        | 0x0008_0000
-        | 0x0000_0002
-        | 0x0000_0004
-        | 0x0000_0100;
     let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
     let info_ok = !dacl.is_null()
         && unsafe {
@@ -244,7 +244,12 @@ fn windows_acl_is_restrictive(path: &Path, configured: &HashSet<String>) -> bool
             break;
         }
         let ace = unsafe { &*(raw as *const ACCESS_ALLOWED_ACE) };
-        if ace.Header.AceType == 0 && ace.Mask & dangerous != 0 {
+        let ace_type = ace.Header.AceType;
+        if is_allow_ace_type(ace_type) && has_policy_write_rights(ace.Mask) {
+            if ace_type != 0 {
+                safe = false;
+                break;
+            }
             let sid = (&ace.SidStart as *const u32).cast_mut().cast();
             if let Some(sid) = sid_string(sid) {
                 if !acl_writer_allowed(&sid, &allowed) {
@@ -267,6 +272,62 @@ fn acl_writer_allowed(sid: &str, allowed: &HashSet<String>) -> bool {
 }
 
 #[cfg(windows)]
+fn acl_owner_allowed(owner: &str, current_user: &str, configured: &HashSet<String>) -> bool {
+    owner == current_user || configured.contains(owner)
+}
+
+#[cfg(windows)]
+fn is_allow_ace_type(ace_type: u8) -> bool {
+    matches!(ace_type, 0 | 4 | 5 | 9 | 11)
+}
+
+#[cfg(windows)]
+fn has_policy_write_rights(mask: u32) -> bool {
+    const WRITE_RIGHTS: u32 = 0x4000_0000
+        | 0x1000_0000
+        | 0x0001_0000
+        | 0x0004_0000
+        | 0x0008_0000
+        | 0x0000_0002
+        | 0x0000_0004
+        | 0x0000_0100;
+    mask & WRITE_RIGHTS != 0
+}
+
+#[cfg(windows)]
+fn current_process_user_sid() -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let mut required = 0;
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required) };
+    if required == 0 {
+        unsafe { CloseHandle(token) };
+        return None;
+    }
+    let mut buffer = vec![0_u8; required as usize];
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        )
+    };
+    unsafe { CloseHandle(token) };
+    if ok == 0 {
+        return None;
+    }
+    let user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    sid_string(user.User.Sid)
+}
+
+#[cfg(windows)]
 fn sid_string(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -286,7 +347,9 @@ fn sid_string(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
 
 #[cfg(all(test, windows))]
 mod windows_acl_tests {
-    use super::acl_writer_allowed;
+    use super::{
+        acl_owner_allowed, acl_writer_allowed, has_policy_write_rights, is_allow_ace_type,
+    };
     use std::collections::HashSet;
 
     #[test]
@@ -302,5 +365,29 @@ mod windows_acl_tests {
         for sid in ["S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-5-21-9-9-9-2001"] {
             assert!(!acl_writer_allowed(sid, &allowed));
         }
+    }
+
+    #[test]
+    fn object_callback_and_compound_allow_aces_with_write_are_unsupported() {
+        for ace_type in [4, 5, 9, 11] {
+            assert!(is_allow_ace_type(ace_type));
+            assert!(has_policy_write_rights(0x4000_0000));
+            assert!(!has_policy_write_rights(0x0012_0089));
+        }
+    }
+
+    #[test]
+    fn foreign_or_system_owner_is_rejected_unless_explicitly_configured() {
+        let current = "s-1-5-21-1-2-3-1001";
+        let mut configured = HashSet::new();
+        assert!(acl_owner_allowed(current, current, &configured));
+        assert!(!acl_owner_allowed(
+            "s-1-5-21-9-9-9-2001",
+            current,
+            &configured
+        ));
+        assert!(!acl_owner_allowed("s-1-5-18", current, &configured));
+        configured.insert("s-1-5-18".to_owned());
+        assert!(acl_owner_allowed("s-1-5-18", current, &configured));
     }
 }
