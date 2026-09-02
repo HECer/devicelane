@@ -615,20 +615,8 @@ fn forged_workspace_lease_and_grant_cannot_run_a_mutation_but_observer_reads_eve
 
 #[test]
 fn expired_writer_finishes_before_the_promoted_writer_starts() {
-    let harness = Harness::start(Duration::from_millis(1_200));
-    let first = acquire(&harness, &harness.client_a, 800);
-    assert_eq!(
-        lease(
-            &harness.address,
-            &harness.client_b,
-            &LeaseRequest::Queue {
-                device_id: DEVICE.into(),
-                lifetime_ms: 30_000,
-            },
-        )["lease_status"],
-        "queued"
-    );
-
+    let harness = Harness::start(Duration::from_millis(3_000));
+    let first = acquire(&harness, &harness.client_a, 2_000);
     let first_job = cli_json(
         &harness.address,
         &harness.client_a,
@@ -645,8 +633,19 @@ fn expired_writer_finishes_before_the_promoted_writer_starts() {
             .count()
             == 1
     });
+    assert_eq!(
+        lease(
+            &harness.address,
+            &harness.client_b,
+            &LeaseRequest::Queue {
+                device_id: DEVICE.into(),
+                lifetime_ms: 30_000,
+            },
+        )["lease_status"],
+        "queued"
+    );
 
-    thread::sleep(Duration::from_millis(850));
+    thread::sleep(Duration::from_millis(2_050));
     let promoted = wait_for_current_grant(&harness, &harness.client_b);
     let second_job = cli_json(
         &harness.address,
