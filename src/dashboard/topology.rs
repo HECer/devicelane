@@ -1,9 +1,9 @@
 use crate::dashboard::{
     ConnectionPath, DashboardDevice, DashboardHost, DashboardScope, DashboardSnapshot, DeviceId,
-    Freshness, HostId, Presence, SafeCode, TrustState,
+    Freshness, HostId, MAX_COLLECTION_ITEMS, MAX_ID_BYTES, Presence, SafeCode, TrustState,
 };
 use crate::network_processes::{DeviceSnapshot, HostSnapshot};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 #[derive(Clone, Debug)]
@@ -30,13 +30,28 @@ pub enum LeaseState {
     Uncertain,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopologyErrorKind {
+    InvalidField,
+    InvalidTrust,
+    UnauthenticatedRegistry,
+    InvalidRegistryEpoch,
+    LimitExceeded,
+    RevisionExhausted,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopologyError {
+    kind: TopologyErrorKind,
     field: &'static str,
     value: String,
 }
 
 impl TopologyError {
+    pub fn kind(&self) -> TopologyErrorKind {
+        self.kind
+    }
+
     pub fn field(&self) -> &'static str {
         self.field
     }
@@ -67,17 +82,70 @@ struct StoredLease {
 #[derive(Default)]
 pub struct TopologyProjector {
     hosts: BTreeMap<HostId, StoredHost>,
-    leases: HashMap<String, StoredLease>,
+    leases: BTreeMap<String, StoredLease>,
     local_host_id: Option<HostId>,
     local_revision: Option<u64>,
     registry_revision: Option<u64>,
     registry_authenticated: bool,
+    authenticated_registry: Option<(String, u64)>,
     revision: u64,
 }
 
 impl TopologyProjector {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn connect_registry(
+        &mut self,
+        session_id: impl Into<String>,
+        epoch: u64,
+        authenticated: bool,
+    ) -> Result<(), TopologyError> {
+        let session_id = session_id.into();
+        validate_identifier("registry_session_id", &session_id)?;
+        if !authenticated {
+            self.registry_authenticated = false;
+            self.mark_all_remote_stale();
+            self.bump_revision()?;
+            return Ok(());
+        }
+        let is_new_epoch = match &self.authenticated_registry {
+            None => true,
+            Some((stored_session, stored_epoch)) if stored_session == &session_id => {
+                if epoch < *stored_epoch {
+                    return Err(error(
+                        TopologyErrorKind::InvalidRegistryEpoch,
+                        "registry_epoch",
+                        epoch.to_string(),
+                    ));
+                }
+                epoch > *stored_epoch
+            }
+            Some((_, stored_epoch)) => {
+                if epoch <= *stored_epoch {
+                    return Err(error(
+                        TopologyErrorKind::InvalidRegistryEpoch,
+                        "registry_epoch",
+                        epoch.to_string(),
+                    ));
+                }
+                true
+            }
+        };
+        if is_new_epoch {
+            self.registry_revision = None;
+            self.authenticated_registry = Some((session_id, epoch));
+        }
+        self.registry_authenticated = true;
+        self.bump_revision()?;
+        Ok(())
+    }
+
+    pub fn disconnect_registry(&mut self, _detected_at_ms: u64) -> Result<(), TopologyError> {
+        self.registry_authenticated = false;
+        self.mark_all_remote_stale();
+        self.bump_revision()
     }
 
     pub fn observe_local(
@@ -120,7 +188,7 @@ impl TopologyProjector {
             },
         );
         self.local_revision = Some(source_revision);
-        self.bump_revision();
+        self.bump_revision()?;
         Ok(())
     }
 
@@ -131,6 +199,22 @@ impl TopologyProjector {
         authenticated: bool,
         hosts: Vec<RegistryHost>,
     ) -> Result<(), TopologyError> {
+        if !authenticated || !self.registry_authenticated {
+            self.registry_authenticated = false;
+            self.mark_all_remote_stale();
+            if hosts.is_empty() {
+                self.bump_revision()?;
+                return Ok(());
+            }
+            return Err(error(
+                TopologyErrorKind::UnauthenticatedRegistry,
+                "registry",
+                "registry snapshot requires an authenticated session".into(),
+            ));
+        }
+        ensure_limit("hosts", hosts.len())?;
+        let local_slots = usize::from(self.local_host_id.is_some());
+        ensure_limit("hosts", hosts.len() + local_slots)?;
         if self
             .registry_revision
             .is_some_and(|stored| source_revision <= stored)
@@ -139,6 +223,13 @@ impl TopologyProjector {
         }
         let mut projected = Vec::with_capacity(hosts.len());
         for host in hosts {
+            if host.trust == TrustState::Local {
+                return Err(error(
+                    TopologyErrorKind::InvalidTrust,
+                    "trust",
+                    "remote hosts cannot claim local trust".into(),
+                ));
+            }
             let host_id = parse_host_id(&host.snapshot.id)?;
             if self.local_host_id.as_ref() == Some(&host_id) {
                 continue;
@@ -158,6 +249,16 @@ impl TopologyProjector {
             )?;
             projected.push((host_id, dashboard));
         }
+        let observed_ids: HashSet<_> = projected.iter().map(|(id, _)| id.clone()).collect();
+        let absent_ids: Vec<_> = self
+            .hosts
+            .iter()
+            .filter(|(id, host)| !host.is_local && !observed_ids.contains(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in absent_ids {
+            self.mark_host_stale(&id);
+        }
         for (host_id, dashboard) in projected {
             self.hosts.insert(
                 host_id,
@@ -168,32 +269,23 @@ impl TopologyProjector {
                 },
             );
         }
+        self.prune_absent_hosts(&observed_ids);
         self.registry_revision = Some(source_revision);
         self.registry_authenticated = authenticated;
-        self.bump_revision();
+        self.bump_revision()?;
         Ok(())
     }
 
-    pub fn mark_disconnected(&mut self, host_id: &HostId, _detected_at_ms: u64) {
-        let Some(host) = self.hosts.get_mut(host_id) else {
-            return;
-        };
-        host.dashboard.presence = Presence::Offline;
-        host.dashboard.freshness = Freshness::Stale {
-            last_seen_at_ms: host.last_seen_at_ms,
-        };
-        for device in &mut host.dashboard.devices {
-            device.presence = Presence::Offline;
-            device.freshness = Freshness::Stale {
-                last_seen_at_ms: host.last_seen_at_ms,
-            };
+    pub fn mark_disconnected(
+        &mut self,
+        host_id: &HostId,
+        _detected_at_ms: u64,
+    ) -> Result<(), TopologyError> {
+        if !self.hosts.contains_key(host_id) {
+            return Ok(());
         }
-        for lease in self.leases.values_mut() {
-            if lease.owner_host_id == *host_id && lease.state == LeaseState::Active {
-                lease.state = LeaseState::Uncertain;
-            }
-        }
-        self.bump_revision();
+        self.mark_host_stale(host_id);
+        self.bump_revision()
     }
 
     pub fn snapshot(&self, generated_at_ms: u64) -> DashboardSnapshot {
@@ -229,9 +321,7 @@ impl TopologyProjector {
         device_id: impl Into<String>,
     ) -> Result<(), TopologyError> {
         let lease_id = lease_id.into();
-        if lease_id.trim().is_empty() {
-            return Err(invalid("lease_id", lease_id));
-        }
+        validate_identifier("lease_id", &lease_id)?;
         let owner_host_id = parse_host_id(&owner_host_id.into())?;
         let device_id = DeviceId::parse(device_id.into())
             .map_err(|error| invalid("device_id", error.to_string()))?;
@@ -240,6 +330,19 @@ impl TopologyProjector {
         } else {
             LeaseState::Uncertain
         };
+        if !self.leases.contains_key(&lease_id) && self.leases.len() >= MAX_COLLECTION_ITEMS {
+            if let Some(stale_id) = self
+                .leases
+                .iter()
+                .find(|(_, lease)| lease.state == LeaseState::Uncertain)
+                .map(|(id, _)| id.clone())
+            {
+                self.leases.remove(&stale_id);
+            }
+        }
+        if !self.leases.contains_key(&lease_id) {
+            ensure_limit("leases", self.leases.len() + 1)?;
+        }
         self.leases.insert(
             lease_id,
             StoredLease {
@@ -248,7 +351,7 @@ impl TopologyProjector {
                 state,
             },
         );
-        self.bump_revision();
+        self.bump_revision()?;
         Ok(())
     }
 
@@ -261,6 +364,7 @@ impl TopologyProjector {
             lease.state == LeaseState::Active
                 && self.host_is_live(&lease.owner_host_id)
                 && self.host_owns_device(&lease.owner_host_id, &lease.device_id)
+                && self.host_is_authorized(&lease.owner_host_id)
         })
     }
 
@@ -280,8 +384,79 @@ impl TopologyProjector {
         })
     }
 
-    fn bump_revision(&mut self) {
-        self.revision = self.revision.saturating_add(1);
+    fn host_is_authorized(&self, host_id: &HostId) -> bool {
+        self.hosts.get(host_id).is_some_and(|host| {
+            if host.is_local {
+                self.local_host_id.as_ref() == Some(host_id)
+                    && host.dashboard.trust == TrustState::Local
+            } else {
+                self.registry_authenticated && host.dashboard.trust == TrustState::Trusted
+            }
+        })
+    }
+
+    fn mark_all_remote_stale(&mut self) {
+        let ids: Vec<_> = self
+            .hosts
+            .iter()
+            .filter(|(_, host)| !host.is_local)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.mark_host_stale(&id);
+        }
+    }
+
+    fn prune_absent_hosts(&mut self, observed_ids: &HashSet<HostId>) {
+        if self.hosts.len() <= MAX_COLLECTION_ITEMS {
+            return;
+        }
+        let candidates: Vec<_> = self
+            .hosts
+            .iter()
+            .filter(|(id, host)| !host.is_local && !observed_ids.contains(*id))
+            .map(|(id, host)| (host.last_seen_at_ms, id.clone()))
+            .collect();
+        let mut candidates = candidates;
+        candidates.sort();
+        for (_, id) in candidates {
+            if self.hosts.len() <= MAX_COLLECTION_ITEMS {
+                break;
+            }
+            self.hosts.remove(&id);
+        }
+    }
+
+    fn mark_host_stale(&mut self, host_id: &HostId) {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return;
+        };
+        host.dashboard.presence = Presence::Offline;
+        host.dashboard.freshness = Freshness::Stale {
+            last_seen_at_ms: host.last_seen_at_ms,
+        };
+        for device in &mut host.dashboard.devices {
+            device.presence = Presence::Offline;
+            device.freshness = Freshness::Stale {
+                last_seen_at_ms: host.last_seen_at_ms,
+            };
+        }
+        for lease in self.leases.values_mut() {
+            if lease.owner_host_id == *host_id && lease.state == LeaseState::Active {
+                lease.state = LeaseState::Uncertain;
+            }
+        }
+    }
+
+    fn bump_revision(&mut self) -> Result<(), TopologyError> {
+        self.revision = self.revision.checked_add(1).ok_or_else(|| {
+            error(
+                TopologyErrorKind::RevisionExhausted,
+                "revision",
+                self.revision.to_string(),
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -293,6 +468,10 @@ fn project_host(
     permissions: Vec<String>,
     freshness: Freshness,
 ) -> Result<DashboardHost, TopologyError> {
+    ensure_limit("devices", snapshot.devices.len())?;
+    if let Some((_, devices)) = &details {
+        ensure_limit("device_details", devices.len())?;
+    }
     let host_id = parse_host_id(&snapshot.id)?;
     let (display_name, device_details) = details
         .map(|(name, devices)| (name, index_device_details(devices)))
@@ -312,7 +491,7 @@ fn project_host(
     capabilities.dedup();
     permissions.sort();
     permissions.dedup();
-    Ok(DashboardHost {
+    let dashboard = DashboardHost {
         id: host_id,
         display_name,
         platform: parse_code(&snapshot.operating_system, "operating_system")?,
@@ -324,7 +503,11 @@ fn project_host(
         capabilities,
         permissions,
         devices,
-    })
+    };
+    dashboard
+        .validate()
+        .map_err(|error| invalid("host", error.to_string()))?;
+    Ok(dashboard)
 }
 
 fn project_device(
@@ -397,6 +580,28 @@ fn parse_presence(value: &str) -> Presence {
     }
 }
 
+fn validate_identifier(field: &'static str, value: &str) -> Result<(), TopologyError> {
+    if value.trim().is_empty() || value.len() > MAX_ID_BYTES {
+        return Err(invalid(field, value.into()));
+    }
+    Ok(())
+}
+
+fn ensure_limit(field: &'static str, len: usize) -> Result<(), TopologyError> {
+    if len > MAX_COLLECTION_ITEMS {
+        return Err(error(
+            TopologyErrorKind::LimitExceeded,
+            field,
+            len.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn invalid(field: &'static str, value: String) -> TopologyError {
-    TopologyError { field, value }
+    error(TopologyErrorKind::InvalidField, field, value)
+}
+
+fn error(kind: TopologyErrorKind, field: &'static str, value: String) -> TopologyError {
+    TopologyError { kind, field, value }
 }

@@ -1,5 +1,5 @@
 use device_development_mesh::dashboard::topology::{
-    DeviceDetails, LeaseState, RegistryHost, TopologyProjector,
+    DeviceDetails, LeaseState, RegistryHost, TopologyErrorKind, TopologyProjector,
 };
 use device_development_mesh::dashboard::{
     ConnectionPath, DashboardScope, Freshness, HostId, Presence, TrustState,
@@ -43,9 +43,14 @@ fn registry_host(id: &str, devices: &[(&str, &str, &str)]) -> RegistryHost {
     }
 }
 
+fn connect(projector: &mut TopologyProjector, session: &str, epoch: u64) {
+    projector.connect_registry(session, epoch, true).unwrap();
+}
+
 #[test]
 fn hybrid_projection_is_stable_and_local_host_wins() {
     let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry-a", 1);
     projector
         .observe_registry(
             7,
@@ -112,21 +117,21 @@ fn hybrid_projection_is_stable_and_local_host_wins() {
 }
 
 #[test]
-fn authentication_controls_scope_and_replayed_revisions_are_ignored() {
+fn authentication_controls_scope_and_authenticated_replays_are_ignored() {
     let mut projector = TopologyProjector::new();
     projector
         .observe_local(1, 10, host("local", "online", &[]))
         .unwrap();
-    projector
-        .observe_registry(5, 11, false, vec![registry_host("remote", &[])])
-        .unwrap();
+    projector.connect_registry("registry-a", 1, false).unwrap();
+    projector.observe_registry(5, 11, false, vec![]).unwrap();
     assert_eq!(projector.snapshot(11).scope, DashboardScope::Local);
 
+    connect(&mut projector, "registry-a", 1);
     projector
         .observe_registry(6, 12, true, vec![registry_host("remote", &[])])
         .unwrap();
     projector
-        .observe_registry(5, 13, false, vec![registry_host("replayed", &[])])
+        .observe_registry(5, 13, true, vec![registry_host("replayed", &[])])
         .unwrap();
     let snapshot = projector.snapshot(13);
     assert_eq!(snapshot.scope, DashboardScope::Mesh);
@@ -147,6 +152,7 @@ fn authentication_controls_scope_and_replayed_revisions_are_ignored() {
 #[test]
 fn disconnect_retains_topology_and_reconnects_with_the_same_ids() {
     let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry-a", 1);
     projector
         .observe_registry(
             1,
@@ -158,7 +164,9 @@ fn disconnect_retains_topology_and_reconnects_with_the_same_ids() {
     let first = projector.snapshot(100);
     assert_eq!(first.hosts[0].freshness, Freshness::Unknown);
 
-    projector.mark_disconnected(&HostId::parse("remote").unwrap(), 120);
+    projector
+        .mark_disconnected(&HostId::parse("remote").unwrap(), 120)
+        .unwrap();
     let stale = projector.snapshot(121);
     assert_eq!(stale.hosts[0].presence, Presence::Offline);
     assert_eq!(
@@ -195,6 +203,7 @@ fn disconnect_retains_topology_and_reconnects_with_the_same_ids() {
 #[test]
 fn stale_owner_makes_active_lease_uncertain_and_not_authorizable() {
     let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry-a", 1);
     projector
         .observe_registry(
             1,
@@ -209,12 +218,173 @@ fn stale_owner_makes_active_lease_uncertain_and_not_authorizable() {
     assert_eq!(projector.lease_state("lease-1"), Some(LeaseState::Active));
     assert!(projector.lease_authorizable("lease-1"));
 
-    projector.mark_disconnected(&HostId::parse("remote").unwrap(), 120);
+    projector
+        .mark_disconnected(&HostId::parse("remote").unwrap(), 120)
+        .unwrap();
     assert_eq!(
         projector.lease_state("lease-1"),
         Some(LeaseState::Uncertain)
     );
     assert!(!projector.lease_authorizable("lease-1"));
+}
+
+#[test]
+fn leases_require_authenticated_trusted_ownership_and_registry_disconnect_revokes_scope() {
+    let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry-a", 1);
+    projector
+        .observe_registry(
+            1,
+            10,
+            true,
+            vec![registry_host("remote", &[("phone", "iOS", "online")])],
+        )
+        .unwrap();
+    projector
+        .track_active_lease("lease", "remote", "phone")
+        .unwrap();
+    assert!(projector.lease_authorizable("lease"));
+
+    projector.disconnect_registry(20).unwrap();
+    assert_eq!(projector.snapshot(20).scope, DashboardScope::Local);
+    assert_eq!(projector.lease_state("lease"), Some(LeaseState::Uncertain));
+    assert!(!projector.lease_authorizable("lease"));
+
+    connect(&mut projector, "registry-b", 2);
+    let mut revoked = registry_host("remote", &[("phone", "iOS", "online")]);
+    revoked.trust = TrustState::Revoked;
+    projector
+        .observe_registry(1, 30, true, vec![revoked])
+        .unwrap();
+    projector
+        .track_active_lease("revoked", "remote", "phone")
+        .unwrap();
+    assert!(!projector.lease_authorizable("revoked"));
+}
+
+#[test]
+fn local_lease_is_authorized_only_for_projector_owned_local_host() {
+    let mut projector = TopologyProjector::new();
+    projector
+        .observe_local(
+            1,
+            10,
+            host("local", "online", &[("phone", "iOS", "online")]),
+        )
+        .unwrap();
+    projector
+        .track_active_lease("local-lease", "local", "phone")
+        .unwrap();
+    assert!(projector.lease_authorizable("local-lease"));
+
+    let mut forged = registry_host("forged", &[("other", "iOS", "online")]);
+    forged.trust = TrustState::Local;
+    connect(&mut projector, "registry-a", 1);
+    let error = projector
+        .observe_registry(1, 11, true, vec![forged])
+        .unwrap_err();
+    assert_eq!(error.kind(), TopologyErrorKind::InvalidTrust);
+}
+
+#[test]
+fn authenticated_new_epoch_accepts_lower_revision_but_unauthenticated_reset_revokes_immediately() {
+    let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry-a", 9);
+    projector
+        .observe_registry(50, 10, true, vec![registry_host("old", &[])])
+        .unwrap();
+    projector.connect_registry("registry-b", 10, false).unwrap();
+    assert_eq!(projector.snapshot(11).scope, DashboardScope::Local);
+    let error = projector
+        .observe_registry(1, 12, false, vec![registry_host("forged", &[])])
+        .unwrap_err();
+    assert_eq!(error.kind(), TopologyErrorKind::UnauthenticatedRegistry);
+
+    connect(&mut projector, "registry-b", 10);
+    projector
+        .observe_registry(1, 13, true, vec![registry_host("new", &[])])
+        .unwrap();
+    let snapshot = projector.snapshot(13);
+    assert!(snapshot.hosts.iter().any(|host| host.id.as_str() == "new"));
+}
+
+#[test]
+fn complete_snapshot_marks_absent_remote_hosts_and_leases_stale() {
+    let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry-a", 1);
+    projector
+        .observe_registry(
+            1,
+            10,
+            true,
+            vec![
+                registry_host("one", &[("phone", "iOS", "online")]),
+                registry_host("two", &[]),
+            ],
+        )
+        .unwrap();
+    projector
+        .track_active_lease("lease", "one", "phone")
+        .unwrap();
+    projector
+        .observe_registry(2, 20, true, vec![registry_host("two", &[])])
+        .unwrap();
+
+    let snapshot = projector.snapshot(20);
+    let absent = snapshot
+        .hosts
+        .iter()
+        .find(|host| host.id.as_str() == "one")
+        .unwrap();
+    assert_eq!(absent.presence, Presence::Offline);
+    assert_eq!(
+        absent.freshness,
+        Freshness::Stale {
+            last_seen_at_ms: 10
+        }
+    );
+    assert_eq!(projector.lease_state("lease"), Some(LeaseState::Uncertain));
+}
+
+#[test]
+fn invalid_or_oversized_registry_updates_are_atomic_and_bounded() {
+    let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry-a", 1);
+    projector
+        .observe_registry(1, 10, true, vec![registry_host("valid", &[])])
+        .unwrap();
+    let before = projector.snapshot(10);
+
+    let mut invalid = registry_host("invalid", &[]);
+    invalid.display_name = "x".repeat(device_development_mesh::dashboard::MAX_TEXT_BYTES + 1);
+    let error = projector
+        .observe_registry(2, 11, true, vec![registry_host("partial", &[]), invalid])
+        .unwrap_err();
+    assert_eq!(error.kind(), TopologyErrorKind::InvalidField);
+    assert_eq!(projector.snapshot(11).hosts, before.hosts);
+
+    let too_many = (0..=device_development_mesh::dashboard::MAX_COLLECTION_ITEMS)
+        .map(|index| registry_host(&format!("host-{index}"), &[]))
+        .collect();
+    let error = projector
+        .observe_registry(2, 12, true, too_many)
+        .unwrap_err();
+    assert_eq!(error.kind(), TopologyErrorKind::LimitExceeded);
+
+    let full = (0..device_development_mesh::dashboard::MAX_COLLECTION_ITEMS)
+        .map(|index| registry_host(&format!("old-{index}"), &[]))
+        .collect();
+    projector.observe_registry(2, 13, true, full).unwrap();
+    let replacement = (0..device_development_mesh::dashboard::MAX_COLLECTION_ITEMS)
+        .map(|index| registry_host(&format!("new-{index}"), &[]))
+        .collect();
+    projector
+        .observe_registry(3, 14, true, replacement)
+        .unwrap();
+    assert_eq!(
+        projector.snapshot(14).hosts.len(),
+        device_development_mesh::dashboard::MAX_COLLECTION_ITEMS
+    );
 }
 
 #[test]
