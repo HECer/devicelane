@@ -329,14 +329,19 @@ fn agent_detach_recovers_a_writer_after_terminal_progress_is_lost() {
         "apple-run",
         &apple_request("lost-terminal", &grant_id(&owned)),
     );
-    wait_until("mutating tool start", || {
-        mutation_lines(&harness.marker).contains(&"mutation-start".into())
-    });
+    wait_for_mutation(&mut harness, "mutation-start", "mutating tool start", true);
+    harness._registry.kill().unwrap();
+    harness._registry.wait().unwrap();
+    wait_for_mutation(
+        &mut harness,
+        "mutation-end",
+        "tool completion while terminal delivery is unavailable",
+        false,
+    );
     harness._agent.kill().unwrap();
     harness._agent.wait().unwrap();
-    wait_until("orphaned tool completion", || {
-        mutation_lines(&harness.marker).contains(&"mutation-end".into())
-    });
+    harness._registry = start_registry(&harness.address, &harness._root.path().join("registry"));
+    wait_for_listener(&harness.address);
 
     let detached_inventory = rpc(
         &harness.address,
@@ -497,9 +502,7 @@ fn reconnected_device_keeps_its_agent_owner_after_writer_terminal() {
         "apple-run",
         &apple_request("transient-detach", &grant_id(&owned)),
     );
-    wait_until("mutating tool start", || {
-        mutation_lines(&harness.marker).contains(&"mutation-start".into())
-    });
+    wait_for_mutation(&mut harness, "mutation-start", "mutating tool start", true);
     for devices in [
         Vec::new(),
         vec![DeviceSnapshot {
@@ -947,6 +950,37 @@ fn mutation_lines(marker: &Path) -> Vec<String> {
         .collect()
 }
 
+fn wait_for_mutation(
+    harness: &mut Harness,
+    expected: &str,
+    label: &str,
+    registry_should_run: bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let markers = mutation_lines(&harness.marker);
+        if markers.iter().any(|line| line == expected) {
+            return;
+        }
+        let agent_status = harness._agent.try_wait().unwrap();
+        let registry_status = harness._registry.try_wait().unwrap();
+        assert!(
+            agent_status.is_none(),
+            "agent exited before {label}; agent_status={agent_status:?}; registry_status={registry_status:?}; markers={markers:?}"
+        );
+        assert_eq!(
+            registry_status.is_none(),
+            registry_should_run,
+            "registry state changed before {label}; agent_status={agent_status:?}; registry_status={registry_status:?}; markers={markers:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {label}; agent_status={agent_status:?}; registry_status={registry_status:?}; markers={markers:?}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn start_registry(address: &str, identity: &Path) -> ChildGuard {
     spawn(
         env!("CARGO_BIN_EXE_mesh-registry"),
@@ -956,7 +990,7 @@ fn start_registry(address: &str, identity: &Path) -> ChildGuard {
             "--identity",
             identity.to_str().unwrap(),
             "--offline-after-ms",
-            "500",
+            "5000",
             "--agent-peer",
             "agent",
             "--agent-peer",
@@ -1070,8 +1104,9 @@ fn rpc(address: &str, identity: &Path, request: &Request) -> serde_json::Value {
 }
 
 fn wait_for_host(address: &str, identity: &Path) {
-    wait_until("host", || {
-        Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
             .args([
                 "--registry",
                 address,
@@ -1081,10 +1116,27 @@ fn wait_for_host(address: &str, identity: &Path) {
                 "--json",
             ])
             .output()
-            .is_ok_and(|output| {
-                output.status.success() && String::from_utf8_lossy(&output.stdout).contains("mac-1")
+            .unwrap();
+        let snapshot = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
+        if output.status.success()
+            && snapshot.as_ref().is_some_and(|hosts| {
+                hosts.as_array().is_some_and(|hosts| {
+                    hosts
+                        .iter()
+                        .any(|host| host["id"] == "mac-1" && host["status"] == "online")
+                })
             })
-    });
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "registry never exposed online mac-1; status={}; stderr={}; snapshot={snapshot:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_for_listener(address: &str) {
