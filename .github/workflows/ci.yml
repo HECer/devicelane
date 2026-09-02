@@ -41,6 +41,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
       - name: Locked desktop dependencies
         run: npm ci --prefix desktop
+      - name: Dashboard UI production build
+        working-directory: desktop
+        run: npm run build
       - name: Stage native sidecars for workspace build
         run: npm run stage:sidecar --prefix desktop -- --debug
       - run: cargo build --workspace --locked
@@ -55,9 +58,6 @@ jobs:
       - name: Dashboard UI typecheck
         working-directory: desktop
         run: npm run typecheck
-      - name: Dashboard UI production build
-        working-directory: desktop
-        run: npm run build
       - name: Unix lifecycle transaction smoke
         if: runner.os != 'Windows'
         run: sh scripts/lifecycle-transaction-smoke.sh

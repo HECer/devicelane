@@ -28,11 +28,21 @@ fn ci_stages_each_native_sidecar_before_the_matrix_workspace_build() {
     let stage = matrix_job
         .find("run: npm run stage:sidecar --prefix desktop -- --debug")
         .expect("cross-platform debug sidecar staging step");
+    let frontend = matrix_job
+        .find("name: Dashboard UI production build")
+        .expect("Tauri frontend production build");
     let workspace_build = matrix_job
         .find("run: cargo build --workspace --locked")
         .expect("locked workspace build");
     assert!(
-        stage < workspace_build,
-        "the Tauri externalBin files must exist before Cargo evaluates the workspace"
+        frontend < stage && stage < workspace_build,
+        "frontendDist and externalBin files must exist before Cargo evaluates the workspace"
+    );
+    assert_eq!(
+        matrix_job
+            .matches("name: Dashboard UI production build")
+            .count(),
+        1,
+        "the prerequisite build must not duplicate the production build"
     );
 }
