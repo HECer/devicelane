@@ -123,6 +123,11 @@ impl Redactor {
             raw.workspace_path,
             raw.artifact_metadata,
         ));
+        let safe_message_code = raw
+            .message
+            .as_deref()
+            .and_then(MessageCode::from_safe_str)
+            .unwrap_or(MessageCode::OperationSucceeded);
         AuditRecord {
             sequence: raw.sequence,
             occurred_at_ms: raw.occurred_at_ms,
@@ -168,7 +173,7 @@ impl Redactor {
                     if contains_sensitive {
                         MessageCode::Redacted
                     } else {
-                        MessageCode::OperationSucceeded
+                        safe_message_code
                     },
                     Vec::new(),
                 )

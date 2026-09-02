@@ -123,6 +123,7 @@ pub struct DashboardService {
     activities: HashMap<ActivityId, ActivityEvent>,
     paused: bool,
     next_audit_sequence: u64,
+    audit_healthy: bool,
     checkpoint_path: Option<PathBuf>,
 }
 
@@ -174,6 +175,7 @@ impl DashboardService {
             activities: HashMap::new(),
             paused: false,
             next_audit_sequence,
+            audit_healthy: true,
             checkpoint_path: None,
         }
     }
@@ -427,7 +429,47 @@ impl DashboardService {
             .map_err(|_| DashboardServiceError::InvalidRequest)?
         {
             PolicyDecision::Denied { .. } => {
-                self.audit_access(&access, PolicyEffect::Deny, AuditResult::Denied, now_ms)?;
+                self.audit_access_with_message(
+                    &access,
+                    PolicyEffect::Deny,
+                    AuditResult::Denied,
+                    Some(super::MessageCode::PolicyDenied),
+                    now_ms,
+                )?;
+                let sequence = self
+                    .activities
+                    .get(&access.activity_id)
+                    .map_or(1, |event| event.sequence.saturating_add(1));
+                self.record_activity(
+                    ActivityEvent {
+                        activity_id: access.activity_id.clone(),
+                        sequence,
+                        occurred_at_ms: now_ms,
+                        principal_id: access.principal_id.clone(),
+                        source_host_id: access.source_host_id.clone(),
+                        target_host_id: access.target_host_id.clone(),
+                        device_id: access.device_id.clone(),
+                        operation: access.operation.clone(),
+                        resources: access.resources.clone(),
+                        authorization: Authorization {
+                            effect: PolicyEffect::Deny,
+                            rule_id: None,
+                            approval_id: None,
+                        },
+                        state: ActivityState::Denied,
+                        message: Some(
+                            super::DisplayMessage::new(
+                                super::MessageCode::PolicyDenied,
+                                Vec::new(),
+                            )
+                            .expect("constant message"),
+                        ),
+                        metrics: unavailable_metrics(),
+                        started_at_ms: None,
+                        finished_at_ms: Some(now_ms),
+                    },
+                    &format!("policy-denied:{}:{sequence}", access.activity_id.as_str()),
+                )?;
                 return Err(DashboardServiceError::PermissionDenied);
             }
             PolicyDecision::Allowed { .. } | PolicyDecision::ApprovalRequired { .. } => {}
@@ -585,8 +627,28 @@ impl DashboardService {
         let outcome = match next_policy.decide(nonce, session, access, decision, now_ms) {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.audit_access(access, effect, AuditResult::Failed, now_ms)?;
-                return Err(map_approval_error(error));
+                let mapped = map_approval_error(error);
+                if mapped == DashboardServiceError::ApprovalExpired {
+                    if let Some(id) = &pending_id {
+                        self.pending.remove(id);
+                    }
+                    self.transition_activity(
+                        &access.activity_id,
+                        ActivityState::Failed,
+                        unavailable_metrics(),
+                        Some(
+                            super::DisplayMessage::new(
+                                super::MessageCode::ApprovalExpired,
+                                Vec::new(),
+                            )
+                            .expect("constant message"),
+                        ),
+                        now_ms,
+                    )?;
+                } else {
+                    self.audit_access(access, effect, AuditResult::Failed, now_ms)?;
+                }
+                return Err(mapped);
             }
         };
         let approval_id = pending_id.clone();
@@ -822,6 +884,9 @@ impl DashboardService {
         cursor: Option<EventCursor>,
         limit: usize,
     ) -> Result<CursorPage<super::AuditRecord>, DashboardServiceError> {
+        if !self.audit_healthy {
+            return Err(DashboardServiceError::AuditUnavailable);
+        }
         self.audit
             .lock()
             .map_err(|_| DashboardServiceError::AuditUnavailable)?
@@ -834,6 +899,9 @@ impl DashboardService {
         filter: AuditFilter,
         signer: Option<&dyn AuditSigner>,
     ) -> Result<AuditExport, DashboardServiceError> {
+        if !self.audit_healthy {
+            return Err(DashboardServiceError::AuditUnavailable);
+        }
         self.audit
             .lock()
             .map_err(|_| DashboardServiceError::AuditUnavailable)?
@@ -846,6 +914,9 @@ impl DashboardService {
         filter: AuditFilter,
         signer: Option<&dyn AuditSigner>,
     ) -> Result<ExportManifest, DashboardServiceError> {
+        if !self.audit_healthy {
+            return Err(DashboardServiceError::AuditUnavailable);
+        }
         self.audit
             .lock()
             .map_err(|_| DashboardServiceError::AuditUnavailable)?
@@ -936,6 +1007,7 @@ impl DashboardService {
         let valid = matches!(
             (current.state, state),
             (ActivityState::Queued, ActivityState::Running)
+                | (ActivityState::AwaitingApproval, ActivityState::Failed)
                 | (ActivityState::Queued, ActivityState::Reconnecting)
                 | (ActivityState::Running, ActivityState::Reconnecting)
                 | (ActivityState::Running, ActivityState::Succeeded)
@@ -973,11 +1045,56 @@ impl DashboardService {
             _ => None,
         };
         if let Some(result) = result {
-            self.audit_access_from_event(&current, result, now_ms)?;
+            let message = (result == AuditResult::Failed)
+                .then(|| next.message.as_ref().map(|value| value.code))
+                .flatten();
+            self.audit_access_from_event_with_message(&next, result, message, now_ms)?;
         }
         self.record_activity(
             next,
             &format!("observer:{}:{sequence}:{state:?}", id.as_str()),
+        )?;
+        Ok(true)
+    }
+
+    /// Records the fail-closed UI state when durable auditing itself is unavailable. This event is
+    /// intentionally not presented as an audit record; audit APIs remain unavailable until restart
+    /// and recovery of the durable store.
+    pub(crate) fn record_audit_unavailable_terminal(
+        &mut self,
+        id: &ActivityId,
+        metrics: MetricSnapshot,
+        now_ms: u64,
+    ) -> Result<bool, DashboardServiceError> {
+        let current = self
+            .activities
+            .get(id)
+            .cloned()
+            .ok_or(DashboardServiceError::NotFound)?;
+        if matches!(
+            current.state,
+            ActivityState::Succeeded
+                | ActivityState::Failed
+                | ActivityState::Denied
+                | ActivityState::Cancelled
+        ) {
+            return Ok(false);
+        }
+        self.audit_healthy = false;
+        let mut terminal = current;
+        terminal.sequence = terminal.sequence.saturating_add(1);
+        terminal.occurred_at_ms = now_ms;
+        terminal.state = ActivityState::Failed;
+        terminal.metrics = metrics;
+        terminal.message = Some(
+            super::DisplayMessage::new(super::MessageCode::AuditUnavailable, Vec::new())
+                .expect("constant message"),
+        );
+        terminal.started_at_ms.get_or_insert(now_ms);
+        terminal.finished_at_ms = Some(now_ms);
+        self.record_activity(
+            terminal,
+            &format!("audit-unavailable:{}:{now_ms}", id.as_str()),
         )?;
         Ok(true)
     }
@@ -1018,12 +1135,21 @@ impl DashboardService {
         cancelled.sequence = cancelled.sequence.saturating_add(1);
         cancelled.occurred_at_ms = now_ms;
         cancelled.state = ActivityState::Cancelled;
+        cancelled.message = Some(
+            super::DisplayMessage::new(super::MessageCode::OperationCancelled, Vec::new())
+                .expect("constant message"),
+        );
         cancelled.finished_at_ms = Some(now_ms);
         if let Err(error) = self.record_activity(cancelled, &format!("cancel:{}", id.as_str())) {
             self.audit_access_from_event(&current, AuditResult::Failed, now_ms)?;
             return Err(error);
         }
-        self.audit_access_from_event(&current, AuditResult::Cancelled, now_ms)?;
+        self.audit_access_from_event_with_message(
+            &current,
+            AuditResult::Cancelled,
+            Some(super::MessageCode::OperationCancelled),
+            now_ms,
+        )?;
         Ok(true)
     }
 
@@ -1037,9 +1163,19 @@ impl DashboardService {
         for mut event in active.iter().cloned() {
             event.sequence = event.sequence.saturating_add(1);
             event.occurred_at_ms = now_ms;
-            event.state = ActivityState::Reconnecting;
+            event.state = ActivityState::Failed;
+            event.message = Some(
+                super::DisplayMessage::new(super::MessageCode::DaemonRestarted, Vec::new())
+                    .expect("constant message"),
+            );
             event.started_at_ms.get_or_insert(now_ms);
-            event.finished_at_ms = None;
+            event.finished_at_ms = Some(now_ms);
+            self.audit_access_from_event_with_message(
+                &event,
+                AuditResult::Failed,
+                Some(super::MessageCode::DaemonRestarted),
+                now_ms,
+            )?;
             let key = format!("restart:{}:{}", event.activity_id.as_str(), event.sequence);
             self.record_activity(event, &key)?;
         }
@@ -1101,6 +1237,17 @@ impl DashboardService {
         result: AuditResult,
         now_ms: u64,
     ) -> Result<(), DashboardServiceError> {
+        self.audit_access_with_message(access, effect, result, None, now_ms)
+    }
+
+    fn audit_access_with_message(
+        &mut self,
+        access: &AccessRequest,
+        effect: PolicyEffect,
+        result: AuditResult,
+        message: Option<super::MessageCode>,
+        now_ms: u64,
+    ) -> Result<(), DashboardServiceError> {
         self.append_audit(RawAuditRecord {
             sequence: self.next_audit_sequence,
             occurred_at_ms: now_ms,
@@ -1113,7 +1260,7 @@ impl DashboardService {
             resources: access.resources.clone(),
             decision: effect,
             result,
-            message: None,
+            message: message.map(|code| code.as_str().to_owned()),
             arguments: vec![],
             environment: vec![],
             stdout: None,
@@ -1193,22 +1340,36 @@ impl DashboardService {
         result: AuditResult,
         now_ms: u64,
     ) -> Result<(), DashboardServiceError> {
-        self.audit_access(
-            &AccessRequest {
-                activity_id: event.activity_id.clone(),
-                principal_id: event.principal_id.clone(),
-                source_host_id: event.source_host_id.clone(),
-                target_host_id: event.target_host_id.clone(),
-                device_id: event.device_id.clone(),
-                operation: event.operation.clone(),
-                resources: event.resources.clone(),
-                physical_device: false,
-                user_present: true,
-            },
-            event.authorization.effect,
+        self.audit_access_from_event_with_message(event, result, None, now_ms)
+    }
+
+    fn audit_access_from_event_with_message(
+        &mut self,
+        event: &ActivityEvent,
+        result: AuditResult,
+        message: Option<super::MessageCode>,
+        now_ms: u64,
+    ) -> Result<(), DashboardServiceError> {
+        self.append_audit(RawAuditRecord {
+            sequence: self.next_audit_sequence,
+            occurred_at_ms: now_ms,
+            activity_id: Some(event.activity_id.clone()),
+            principal_id: event.principal_id.clone(),
+            source_host_id: event.source_host_id.clone(),
+            target_host_id: event.target_host_id.clone(),
+            device_id: event.device_id.clone(),
+            operation: event.operation.clone(),
+            resources: event.resources.clone(),
+            decision: event.authorization.effect,
             result,
-            now_ms,
-        )
+            message: message.map(|code| code.as_str().to_owned()),
+            arguments: vec![],
+            environment: vec![],
+            stdout: None,
+            stderr: None,
+            workspace_path: None,
+            artifact_metadata: vec![],
+        })
     }
 
     fn audit_local(
@@ -1242,11 +1403,18 @@ impl DashboardService {
     }
 
     fn append_audit(&mut self, record: RawAuditRecord) -> Result<(), DashboardServiceError> {
-        self.audit
+        if !self.audit_healthy {
+            return Err(DashboardServiceError::AuditUnavailable);
+        }
+        let append_result = self
+            .audit
             .lock()
-            .map_err(|_| DashboardServiceError::AuditUnavailable)?
-            .append(record)
-            .map_err(map_audit_error)?;
+            .map_err(|_| DashboardServiceError::AuditUnavailable)
+            .and_then(|mut audit| audit.append(record).map_err(map_audit_error));
+        if let Err(error) = append_result {
+            self.audit_healthy = false;
+            return Err(error);
+        }
         self.next_audit_sequence = self
             .next_audit_sequence
             .checked_add(1)

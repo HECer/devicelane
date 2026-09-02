@@ -9,6 +9,10 @@
   path. The physical Mac gate now pins Darwin arm64 binaries by hash/version, requires an
   authenticated controller session, separates cursor resync from reconnect, and retains only one
   allow-listed redacted JSON record with a canonical audit digest.
+- Added stable fail-closed dashboard outcomes for offline targets, authenticated disconnects,
+  daemon restarts, observer loss, event resync, audit-store failure, expired approvals,
+  deny-overrides, stale leases, cancellation races, and incompatible older agents. Every outcome
+  preserves the original activity ID and uses a typed, redacted message code.
 - Added native DeviceLane desktop packaging for Windows MSI, notarized macOS DMG, and Linux
   AppImage/deb targets.
 - Added locked native builds, SHA-256 manifests, CycloneDX SBOMs, checksum signatures, and

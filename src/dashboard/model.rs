@@ -133,9 +133,68 @@ pub enum MessageCode {
     ObserverUnavailable,
     OperationSucceeded,
     OperationFailed,
+    TargetOffline,
+    RegistryDisconnected,
+    DaemonRestarted,
+    EventResyncRequired,
+    AuditUnavailable,
+    ApprovalExpired,
+    PolicyDenied,
+    LeaseStale,
+    OperationCancelled,
+    AgentIncompatible,
     AccessDenied,
     TargetConfirmationRequired,
     Redacted,
+}
+
+impl MessageCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ActivityStarted => "activity_started",
+            Self::RegistryStale => "registry_stale",
+            Self::ObserverUnavailable => "observer_unavailable",
+            Self::OperationSucceeded => "operation_succeeded",
+            Self::OperationFailed => "operation_failed",
+            Self::TargetOffline => "target_offline",
+            Self::RegistryDisconnected => "registry_disconnected",
+            Self::DaemonRestarted => "daemon_restarted",
+            Self::EventResyncRequired => "event_resync_required",
+            Self::AuditUnavailable => "audit_unavailable",
+            Self::ApprovalExpired => "approval_expired",
+            Self::PolicyDenied => "policy_denied",
+            Self::LeaseStale => "lease_stale",
+            Self::OperationCancelled => "operation_cancelled",
+            Self::AgentIncompatible => "agent_incompatible",
+            Self::AccessDenied => "access_denied",
+            Self::TargetConfirmationRequired => "target_confirmation_required",
+            Self::Redacted => "redacted",
+        }
+    }
+
+    pub fn from_safe_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "activity_started" => Self::ActivityStarted,
+            "registry_stale" => Self::RegistryStale,
+            "observer_unavailable" => Self::ObserverUnavailable,
+            "operation_succeeded" => Self::OperationSucceeded,
+            "operation_failed" => Self::OperationFailed,
+            "target_offline" => Self::TargetOffline,
+            "registry_disconnected" => Self::RegistryDisconnected,
+            "daemon_restarted" => Self::DaemonRestarted,
+            "event_resync_required" => Self::EventResyncRequired,
+            "audit_unavailable" => Self::AuditUnavailable,
+            "approval_expired" => Self::ApprovalExpired,
+            "policy_denied" => Self::PolicyDenied,
+            "lease_stale" => Self::LeaseStale,
+            "operation_cancelled" => Self::OperationCancelled,
+            "agent_incompatible" => Self::AgentIncompatible,
+            "access_denied" => Self::AccessDenied,
+            "target_confirmation_required" => Self::TargetConfirmationRequired,
+            "redacted" => Self::Redacted,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

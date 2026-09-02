@@ -310,6 +310,13 @@ Physical-device results are deliberately separate from mock, simulator, and fixt
 
 ### DeviceLane dashboard release gate
 
+The dashboard execution worker exposes typed terminal reasons instead of free-form remote errors.
+Failures preserve the approved activity ID across live events and audit records. If durable audit
+storage fails, DeviceLane terminates the visible activity with `audit_unavailable`, marks audit
+health unavailable, and rejects subsequent auditable mutations until the service has recovered the
+store. Registry event resync remains distinct from transport reconnect, and daemon restart recovery
+terminates interrupted work without inventing a replacement activity.
+
 The normal CI matrix runs the locked Rust workspace, the Tauri bridge, the React dashboard tests,
 type checking, production frontend build, and lifecycle contract/smoke checks on Windows, macOS,
 and Linux. That deterministic fixture coverage does not prove a physical Mac pass. A production

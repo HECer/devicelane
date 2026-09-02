@@ -487,6 +487,8 @@ pub struct DaemonState {
     dashboard_policy: Option<DashboardPolicyRuntime>,
     dashboard: Option<DashboardService>,
     remote_execution: Option<RemoteExecutionConfig>,
+    remote_execution_boundary: Option<Arc<dyn MeshRpcBoundary>>,
+    remote_execution_timeout: Duration,
     inflight_executions: HashSet<ActivityId>,
 }
 
@@ -498,9 +500,67 @@ pub struct RemoteExecutionConfig {
     pub client_id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteExecutionFailure {
+    TargetOffline,
+    RegistryDisconnected,
+    DaemonRestarted,
+    ObserverUnavailable,
+    EventResyncRequired,
+    AuditUnavailable,
+    ApprovalExpired,
+    PolicyDenied,
+    StaleLease,
+    Cancelled,
+    AgentIncompatible,
+}
+
+impl RemoteExecutionFailure {
+    fn message_code(self) -> MessageCode {
+        match self {
+            Self::TargetOffline => MessageCode::TargetOffline,
+            Self::RegistryDisconnected => MessageCode::RegistryDisconnected,
+            Self::DaemonRestarted => MessageCode::DaemonRestarted,
+            Self::ObserverUnavailable => MessageCode::ObserverUnavailable,
+            Self::EventResyncRequired => MessageCode::EventResyncRequired,
+            Self::AuditUnavailable => MessageCode::AuditUnavailable,
+            Self::ApprovalExpired => MessageCode::ApprovalExpired,
+            Self::PolicyDenied => MessageCode::PolicyDenied,
+            Self::StaleLease => MessageCode::LeaseStale,
+            Self::Cancelled => MessageCode::OperationCancelled,
+            Self::AgentIncompatible => MessageCode::AgentIncompatible,
+        }
+    }
+}
+
+pub trait MeshRpcBoundary: Send + Sync {
+    fn call(
+        &self,
+        config: &RemoteExecutionConfig,
+        request: &MeshRequest,
+    ) -> Result<MeshResponse, RemoteExecutionFailure>;
+}
+
+struct ProductionMeshRpcBoundary;
+
+impl MeshRpcBoundary for ProductionMeshRpcBoundary {
+    fn call(
+        &self,
+        config: &RemoteExecutionConfig,
+        request: &MeshRequest,
+    ) -> Result<MeshResponse, RemoteExecutionFailure> {
+        let transport = SecureTransport::load_or_create(&config.identity_path, &config.client_id)
+            .map_err(|_| RemoteExecutionFailure::RegistryDisconnected)?;
+        mesh_rpc(config, &transport, request)
+            .map_err(|_| RemoteExecutionFailure::RegistryDisconnected)
+    }
+}
+
+#[derive(Clone)]
 struct RemoteExecutionJob {
     config: RemoteExecutionConfig,
+    boundary: Arc<dyn MeshRpcBoundary>,
+    timeout: Duration,
     activity: ActivityEvent,
     workspace_path: String,
     request_id: String,
@@ -533,6 +593,8 @@ impl DaemonState {
             dashboard_policy: None,
             dashboard: None,
             remote_execution: None,
+            remote_execution_boundary: None,
+            remote_execution_timeout: Duration::from_secs(30),
             inflight_executions: HashSet::new(),
         }
     }
@@ -548,6 +610,8 @@ impl DaemonState {
             dashboard_policy: None,
             dashboard: None,
             remote_execution: None,
+            remote_execution_boundary: None,
+            remote_execution_timeout: Duration::from_secs(30),
             inflight_executions: HashSet::new(),
         }
     }
@@ -564,6 +628,8 @@ impl DaemonState {
             dashboard_policy: None,
             dashboard: None,
             remote_execution: None,
+            remote_execution_boundary: None,
+            remote_execution_timeout: Duration::from_secs(30),
             inflight_executions: HashSet::new(),
         }
     }
@@ -585,6 +651,19 @@ impl DaemonState {
 
     pub fn enable_remote_execution(&mut self, config: RemoteExecutionConfig) {
         self.remote_execution = Some(config);
+        self.remote_execution_boundary = Some(Arc::new(ProductionMeshRpcBoundary));
+        self.remote_execution_timeout = Duration::from_secs(30);
+    }
+
+    pub fn enable_remote_execution_with_boundary(
+        &mut self,
+        config: RemoteExecutionConfig,
+        boundary: Arc<dyn MeshRpcBoundary>,
+        timeout: Duration,
+    ) {
+        self.remote_execution = Some(config);
+        self.remote_execution_boundary = Some(boundary);
+        self.remote_execution_timeout = timeout.max(Duration::from_millis(1));
     }
 
     fn prepare_remote_execution(
@@ -626,6 +705,11 @@ impl DaemonState {
         }
         Ok(RemoteExecutionJob {
             config,
+            boundary: self
+                .remote_execution_boundary
+                .clone()
+                .ok_or(LocalProtocolError::FeatureUnavailable)?,
+            timeout: self.remote_execution_timeout,
             activity,
             workspace_path,
             request_id,
@@ -1057,46 +1141,85 @@ fn transition_execution(
     Ok(())
 }
 
+fn map_transition_failure(error: LocalProtocolError) -> RemoteExecutionFailure {
+    if error == LocalProtocolError::AuditUnavailable {
+        RemoteExecutionFailure::AuditUnavailable
+    } else {
+        RemoteExecutionFailure::RegistryDisconnected
+    }
+}
+
+fn classify_remote_rejection(value: Option<&str>) -> RemoteExecutionFailure {
+    let value = value.unwrap_or_default().to_ascii_lowercase();
+    if value.contains("observer_unavailable") {
+        RemoteExecutionFailure::ObserverUnavailable
+    } else if value.contains("resync") || value.contains("overflow") {
+        RemoteExecutionFailure::EventResyncRequired
+    } else if value.contains("daemon_restarted") {
+        RemoteExecutionFailure::DaemonRestarted
+    } else if value.contains("audit_unavailable") {
+        RemoteExecutionFailure::AuditUnavailable
+    } else if value.contains("lease") && (value.contains("stale") || value.contains("expired")) {
+        RemoteExecutionFailure::StaleLease
+    } else if value.contains("version")
+        || value.contains("unsupported")
+        || value.contains("incompatible")
+    {
+        RemoteExecutionFailure::AgentIncompatible
+    } else if value.contains("denied") || value.contains("policy") {
+        RemoteExecutionFailure::PolicyDenied
+    } else {
+        RemoteExecutionFailure::RegistryDisconnected
+    }
+}
+
 fn execute_remote_job(
     state: &Arc<Mutex<DaemonState>>,
     job: &RemoteExecutionJob,
-) -> Result<(), LocalProtocolError> {
-    let transport =
-        SecureTransport::load_or_create(&job.config.identity_path, &job.config.client_id)
-            .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
+) -> Result<(), RemoteExecutionFailure> {
     let device_id = job
         .activity
         .device_id
         .as_ref()
-        .ok_or(LocalProtocolError::PermissionDenied)?
+        .ok_or(RemoteExecutionFailure::PolicyDenied)?
         .as_str()
         .to_owned();
-    let lease = mesh_rpc(
-        &job.config,
-        &transport,
-        &MeshRequest::Lease {
-            operation: LeaseRequest::Acquire {
-                device_id: device_id.clone(),
-                lifetime_ms: 30_000,
+    let lease = job
+        .boundary
+        .call(
+            &job.config,
+            &MeshRequest::Lease {
+                operation: LeaseRequest::Acquire {
+                    device_id: device_id.clone(),
+                    lifetime_ms: 30_000,
+                },
             },
-        },
-    )?;
+        )
+        .map_err(|failure| {
+            if failure == RemoteExecutionFailure::RegistryDisconnected {
+                RemoteExecutionFailure::TargetOffline
+            } else {
+                failure
+            }
+        })?;
     let grant = lease
         .lease_grant
-        .ok_or(LocalProtocolError::RemoteUnavailable)?;
+        .ok_or_else(|| classify_remote_rejection(lease.error.as_deref()))?;
     {
-        let mut daemon = state.lock().map_err(|_| LocalProtocolError::Io)?;
+        let mut daemon = state
+            .lock()
+            .map_err(|_| RemoteExecutionFailure::AuditUnavailable)?;
         daemon
             .dashboard
             .as_mut()
-            .ok_or(LocalProtocolError::FeatureUnavailable)?
+            .ok_or(RemoteExecutionFailure::AuditUnavailable)?
             .observe_authenticated_controller(&job.config.registry_peer_id, now_ms())
-            .map_err(map_dashboard_error)?;
+            .map_err(map_dashboard_error)
+            .map_err(map_transition_failure)?;
         daemon.snapshot.connection = ConnectionState::Connected;
     }
-    let accepted = mesh_rpc(
+    let accepted = job.boundary.call(
         &job.config,
-        &transport,
         &MeshRequest::AppleRun {
             operation: AppleRequest {
                 version: RemoteProtocolVersion { major: 1, minor: 0 },
@@ -1112,41 +1235,49 @@ fn execute_remote_job(
             },
         },
     )?;
-    let job_id = accepted
-        .accepted
-        .then_some(accepted.job_id)
-        .flatten()
-        .ok_or(LocalProtocolError::RemoteUnavailable)?;
+    let job_id = if accepted.accepted {
+        accepted.job_id
+    } else if accepted.error.is_none() {
+        return Err(RemoteExecutionFailure::AgentIncompatible);
+    } else {
+        return Err(classify_remote_rejection(accepted.error.as_deref()));
+    }
+    .ok_or(RemoteExecutionFailure::AgentIncompatible)?;
     transition_execution(
         state,
         &job.activity.activity_id,
         ActivityState::Running,
         MessageCode::ActivityStarted,
-    )?;
+    )
+    .map_err(map_transition_failure)?;
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + job.timeout;
     let mut after = 0;
     let mut reconnecting = false;
+    let mut last_failure = RemoteExecutionFailure::RegistryDisconnected;
     loop {
         if Instant::now() >= deadline {
-            return Err(LocalProtocolError::RemoteUnavailable);
+            return Err(last_failure);
         }
-        match mesh_rpc(
+        match job.boundary.call(
             &job.config,
-            &transport,
             &MeshRequest::Events {
                 job_id: job_id.clone(),
                 after,
             },
         ) {
             Ok(response) => {
+                if !response.accepted {
+                    return Err(classify_remote_rejection(response.error.as_deref()));
+                }
                 if reconnecting {
                     transition_execution(
                         state,
                         &job.activity.activity_id,
                         ActivityState::Running,
                         MessageCode::ActivityStarted,
-                    )?;
+                    )
+                    .map_err(map_transition_failure)?;
                     reconnecting = false;
                 }
                 after = response
@@ -1159,20 +1290,18 @@ fn execute_remote_job(
                 if let Some(terminal) = response.events.iter().rev().find(|event| {
                     matches!(event.kind.as_str(), "completed" | "rejected" | "cancelled")
                 }) {
-                    let (terminal_state, message) = if terminal.kind == "completed" {
-                        (ActivityState::Succeeded, MessageCode::OperationSucceeded)
-                    } else {
-                        (ActivityState::Failed, MessageCode::OperationFailed)
+                    let (terminal_state, message) = match terminal.kind.as_str() {
+                        "completed" => (ActivityState::Succeeded, MessageCode::OperationSucceeded),
+                        "cancelled" => (ActivityState::Failed, MessageCode::OperationCancelled),
+                        _ => (
+                            ActivityState::Failed,
+                            classify_remote_rejection(Some(&terminal.payload)).message_code(),
+                        ),
                     };
-                    transition_execution(
-                        state,
-                        &job.activity.activity_id,
-                        terminal_state,
-                        message,
-                    )?;
-                    let _ = mesh_rpc(
+                    transition_execution(state, &job.activity.activity_id, terminal_state, message)
+                        .map_err(map_transition_failure)?;
+                    let _ = job.boundary.call(
                         &job.config,
-                        &transport,
                         &MeshRequest::Lease {
                             operation: LeaseRequest::Release {
                                 lease_id: grant.lease_id,
@@ -1182,16 +1311,18 @@ fn execute_remote_job(
                     return Ok(());
                 }
             }
-            Err(_) if !reconnecting => {
+            Err(failure) if !reconnecting => {
+                last_failure = failure;
                 transition_execution(
                     state,
                     &job.activity.activity_id,
                     ActivityState::Reconnecting,
                     MessageCode::RegistryStale,
-                )?;
+                )
+                .map_err(map_transition_failure)?;
                 reconnecting = true;
             }
-            Err(_) => {}
+            Err(failure) => last_failure = failure,
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1199,7 +1330,18 @@ fn execute_remote_job(
 
 fn run_remote_job(state: Arc<Mutex<DaemonState>>, job: RemoteExecutionJob) {
     let activity_id = job.activity.activity_id.clone();
-    if execute_remote_job(&state, &job).is_err() {
+    if let Err(failure) = execute_remote_job(&state, &job) {
+        if failure == RemoteExecutionFailure::AuditUnavailable {
+            if let Ok(mut daemon) = state.lock() {
+                if let Some(dashboard) = daemon.dashboard.as_mut() {
+                    let _ = dashboard.record_audit_unavailable_terminal(
+                        &activity_id,
+                        execution_metrics(),
+                        now_ms(),
+                    );
+                }
+            }
+        }
         let current = state
             .lock()
             .ok()
@@ -1210,15 +1352,23 @@ fn run_remote_job(state: Arc<Mutex<DaemonState>>, job: RemoteExecutionJob) {
                     &state,
                     &activity_id,
                     ActivityState::Reconnecting,
-                    MessageCode::RegistryStale,
+                    failure.message_code(),
                 );
             }
-            let _ = transition_execution(
-                &state,
-                &activity_id,
-                ActivityState::Failed,
-                MessageCode::OperationFailed,
-            );
+            if !matches!(
+                current.state,
+                ActivityState::Succeeded
+                    | ActivityState::Failed
+                    | ActivityState::Denied
+                    | ActivityState::Cancelled
+            ) {
+                let _ = transition_execution(
+                    &state,
+                    &activity_id,
+                    ActivityState::Failed,
+                    failure.message_code(),
+                );
+            }
         }
     }
     if let Ok(mut state) = state.lock() {

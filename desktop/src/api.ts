@@ -59,7 +59,7 @@ export type PolicyEffect = "allow" | "deny";
 export type ApprovalDecision = "allow_once" | "allow_and_remember" | "deny_once" | "deny_and_block";
 export type PolicyOrigin = "user" | "managed";
 export type AuditResult = "attempted" | "succeeded" | "failed" | "denied" | "cancelled" | "deleted";
-export type MessageCode = "activity_started" | "registry_stale" | "observer_unavailable" | "operation_succeeded" | "operation_failed" | "access_denied" | "target_confirmation_required" | "redacted";
+export type MessageCode = "activity_started" | "registry_stale" | "observer_unavailable" | "operation_succeeded" | "operation_failed" | "target_offline" | "registry_disconnected" | "daemon_restarted" | "event_resync_required" | "audit_unavailable" | "approval_expired" | "policy_denied" | "lease_stale" | "operation_cancelled" | "agent_incompatible" | "access_denied" | "target_confirmation_required" | "redacted";
 export type MessageParam = "local" | "remote" | "allowed" | "denied" | "unavailable";
 
 export interface DisplayMessage {

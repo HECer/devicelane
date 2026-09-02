@@ -125,6 +125,16 @@ export function messageCodeLabel(value: MessageCode): string {
     case "observer_unavailable": return "Prozessbeobachtung nicht verfügbar";
     case "operation_succeeded": return "Vorgang erfolgreich";
     case "operation_failed": return "Vorgang fehlgeschlagen";
+    case "target_offline": return "Zielgerät ist offline";
+    case "registry_disconnected": return "Registry-Verbindung wurde getrennt";
+    case "daemon_restarted": return "DeviceLane-Dienst wurde neu gestartet";
+    case "event_resync_required": return "Aktivitätsdaten müssen neu synchronisiert werden";
+    case "audit_unavailable": return "Audit-Speicher ist nicht verfügbar";
+    case "approval_expired": return "Freigabe ist abgelaufen";
+    case "policy_denied": return "Zugriff durch Richtlinie abgelehnt";
+    case "lease_stale": return "Gerätereservierung ist abgelaufen";
+    case "operation_cancelled": return "Vorgang wurde abgebrochen";
+    case "agent_incompatible": return "DeviceLane-Agent ist nicht kompatibel";
     case "access_denied": return "Zugriff abgelehnt";
     case "target_confirmation_required": return "Bestätigung am Ziel erforderlich";
     case "redacted": return "Inhalt redigiert";
