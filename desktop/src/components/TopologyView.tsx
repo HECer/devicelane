@@ -1,4 +1,4 @@
-import type { DashboardDevice, DashboardHost, Presence } from "../api";
+import type { DashboardDevice, DashboardHost, DashboardLease, Presence } from "../api";
 import {
   connectionPathLabel,
   freshnessLabel,
@@ -31,7 +31,7 @@ function TagList({ label, values }: { label: string; values: string[] }) {
   );
 }
 
-function DeviceRow({ device }: { device: DashboardDevice }) {
+function DeviceRow({ device, leases }: { device: DashboardDevice; leases: DashboardLease[] }) {
   return (
     <li className="device-row">
       <div>
@@ -40,6 +40,10 @@ function DeviceRow({ device }: { device: DashboardDevice }) {
       </div>
       <PresenceText presence={device.presence} />
       <span className="freshness">{freshnessLabel(device.freshness)}</span>
+      {leases.map((lease) => <span key={lease.id} className={`lease-state lease-state--${lease.state}`}>
+        <span aria-hidden="true">{lease.state === "active" ? "✓" : "!"}</span>
+        {lease.state === "active" ? "Lease aktiv" : "Lease unsicher – keine neue Autorisierung"}
+      </span>)}
       <TagList label="Gerätefähigkeiten" values={device.capabilities} />
       <TagList label="Geräteberechtigungen" values={device.permissions} />
     </li>
@@ -48,11 +52,12 @@ function DeviceRow({ device }: { device: DashboardDevice }) {
 
 export interface TopologyViewProps {
   hosts: DashboardHost[];
+  leases: DashboardLease[];
   selectedHostId?: string;
   onSelectHost: (hostId: string) => void;
 }
 
-export function TopologyView({ hosts, selectedHostId, onSelectHost }: TopologyViewProps) {
+export function TopologyView({ hosts, leases, selectedHostId, onSelectHost }: TopologyViewProps) {
   const sorted = [...hosts].sort((left, right) => {
     const state = presenceDisplay(left.presence).sortOrder - presenceDisplay(right.presence).sortOrder;
     return state || left.display_name.localeCompare(right.display_name, "de");
@@ -88,7 +93,7 @@ export function TopologyView({ hosts, selectedHostId, onSelectHost }: TopologyVi
                 <TagList label="Fähigkeiten" values={host.capabilities} />
                 <TagList label="Berechtigungen" values={host.permissions} />
                 {host.devices.length > 0 && <ul className="device-list" aria-label={`Geräte an ${host.display_name}`}>
-                  {host.devices.map((device) => <DeviceRow key={device.id} device={device} />)}
+                  {host.devices.map((device) => <DeviceRow key={device.id} device={device} leases={leases.filter((lease) => lease.device_id === device.id)} />)}
                 </ul>}
               </div>
             </li>

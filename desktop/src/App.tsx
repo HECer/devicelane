@@ -5,7 +5,7 @@ import { ActivityFeed } from "./components/ActivityFeed";
 import { ResourceOccupancy } from "./components/ResourceOccupancy";
 import { ScopeSwitcher } from "./components/ScopeSwitcher";
 import { TopologyView } from "./components/TopologyView";
-import { activeOccupancies, mergeActivityEvents, messageCodeLabel, reconnectDelayMs } from "./dashboard-model";
+import { activeOccupancies, compareU64, mergeActivityEvents, messageCodeLabel, reconnectDelayMs } from "./dashboard-model";
 import { usePretext } from "./usePretext";
 
 const connectionLabels = {
@@ -30,9 +30,24 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [selectedHostId, setSelectedHostId] = useState<string>();
   const [streamReconnecting, setStreamReconnecting] = useState(false);
+  const [meshAvailable, setMeshAvailable] = useState(false);
+  const meshAvailabilityKnown = useRef(false);
+  const dashboardRevision = useRef<string | undefined>(undefined);
   const subscriberId = useRef(`desktop-${globalThis.crypto?.randomUUID?.() ?? Date.now().toString(36)}`);
   usePretext();
   const occupancies = useMemo(() => activeOccupancies(events), [events]);
+  const activeJobCount = dashboard?.activities.filter(({ state }) =>
+    state === "awaiting_approval" || state === "queued" || state === "running" || state === "reconnecting"
+  ).length ?? 0;
+
+  const applyDashboard = (next: DashboardSnapshot) => {
+    if (dashboardRevision.current && compareU64(next.revision, dashboardRevision.current) < 0) return;
+    dashboardRevision.current = next.revision;
+    setDashboard(next);
+    setSelectedHostId((selected) => next.hosts.some((host) => host.id === selected)
+      ? selected
+      : next.hosts[0]?.id);
+  };
 
   const refresh = async () => {
     try {
@@ -49,34 +64,39 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
 
   useEffect(() => {
     const controller = new AbortController();
+    let timer: number | undefined;
     const updateSnapshot = async () => {
       try {
-        const next = await client.dashboardSnapshot(scope, controller.signal);
+        const requestedScope = meshAvailabilityKnown.current ? scope : "mesh";
+        const next = await client.dashboardSnapshot(requestedScope, controller.signal);
         if (controller.signal.aborted) return;
-        setDashboard(next);
-        setSelectedHostId((selected) => next.hosts.some((host) => host.id === selected)
-          ? selected
-          : next.hosts[0]?.id);
+        applyDashboard(next);
+        if (!meshAvailabilityKnown.current || requestedScope === "mesh") {
+          setMeshAvailable(next.scope === "mesh");
+          meshAvailabilityKnown.current = true;
+        }
+        if (next.scope !== scope) setScope(next.scope);
       } catch (error) {
         if (!controller.signal.aborted) {
           setErrorMessage(error instanceof Error ? error.message : String(error));
         }
+      } finally {
+        if (!controller.signal.aborted) timer = window.setTimeout(() => void updateSnapshot(), 10_000);
       }
     };
     void updateSnapshot();
-    const interval = window.setInterval(() => void updateSnapshot(), 10_000);
     return () => {
       controller.abort();
-      window.clearInterval(interval);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [client, scope]);
 
   useEffect(() => {
     const controller = new AbortController();
     let timer: number | undefined;
-    let cursor: EventCursor = { epoch: 0, sequence: 0 };
+    let cursor: EventCursor = { epoch: "0", sequence: "0" };
     let reconnectAttempt = 0;
-    let lastResyncRevision: number | undefined;
+    let lastResyncRevision: string | undefined;
 
     const schedule = (callback: () => void, delay: number) => {
       timer = window.setTimeout(callback, delay);
@@ -103,10 +123,8 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
             lastResyncRevision = page.snapshot_revision;
             const freshSnapshot = await client.dashboardSnapshot(scope, controller.signal);
             if (controller.signal.aborted) return;
-            setDashboard(freshSnapshot);
-            setSelectedHostId((selected) => freshSnapshot.hosts.some((host) => host.id === selected)
-              ? selected
-              : freshSnapshot.hosts[0]?.id);
+            applyDashboard(freshSnapshot);
+            setScope(freshSnapshot.scope);
             cursor = page.oldest_available;
             await pump();
             return;
@@ -166,7 +184,6 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   if (!snapshot) return <main className="shell shell--centered" aria-busy="true">DeviceLane wird geladen…</main>;
 
   const toggleRemoteAccess = snapshot.remote_access_paused ? client.resume : client.pause;
-  const meshAvailable = snapshot.connection !== "disconnected";
   return (
     <div className="app-frame">
       <aside className="sidebar" aria-label="Hauptnavigation">
@@ -178,7 +195,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
         {errorMessage && <p className="error-banner" role="alert" aria-live="assertive">{errorMessage}</p>}
         {streamError && <p className="error-banner" role="alert" aria-live="assertive">{streamError}</p>}
         <header className="page-header">
-          <div><p className="eyebrow">Lokales Netzwerk</p><h1 data-pretext>Geräteübersicht</h1></div>
+          <div><p className="eyebrow">Lokales Netzwerk</p><h1 data-pretext>Geräteübersicht</h1><p className="active-job-count">{activeJobCount} {activeJobCount === 1 ? "aktiver Job" : "aktive Jobs"}</p></div>
           <span className={`connection-pill connection-pill--${snapshot.connection}`}>
             <span className="status-mark" aria-hidden="true" />{connectionLabels[snapshot.connection]}
           </span>
@@ -186,9 +203,9 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
 
         <ScopeSwitcher scope={scope} meshAvailable={meshAvailable} onChange={setScope} />
 
-        <div id="mesh-dashboard-panel" role="tabpanel" className="dashboard-layout" aria-busy={!dashboard}>
+        <div id="mesh-dashboard-panel" role="tabpanel" aria-labelledby={scope === "local" ? "scope-local-tab" : "scope-mesh-tab"} className="dashboard-layout" aria-busy={!dashboard}>
           {dashboard ? <>
-            <TopologyView hosts={dashboard.hosts} selectedHostId={selectedHostId} onSelectHost={setSelectedHostId} />
+            <TopologyView hosts={dashboard.hosts} leases={dashboard.leases} selectedHostId={selectedHostId} onSelectHost={setSelectedHostId} />
             <div className="dashboard-side">
               <ResourceOccupancy occupancies={occupancies} />
               <ActivityFeed events={events} reconnecting={streamReconnecting} />

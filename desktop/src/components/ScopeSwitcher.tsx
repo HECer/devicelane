@@ -29,6 +29,7 @@ export function ScopeSwitcher({ scope, onChange, meshAvailable = true }: ScopeSw
     <div className="scope-switcher-wrap">
       <div className="scope-switcher" role="tablist" aria-label="Anzeigebereich">
         <button
+          id="scope-local-tab"
           ref={localRef}
           type="button"
           role="tab"
@@ -41,6 +42,7 @@ export function ScopeSwitcher({ scope, onChange, meshAvailable = true }: ScopeSw
           Dieser Computer
         </button>
         <button
+          id="scope-mesh-tab"
           ref={meshRef}
           type="button"
           role="tab"

@@ -6,7 +6,9 @@ import {
   formatBytes,
   formatMetric,
   formatTimestamp,
-  mergeActivityEvents
+  isoTimestamp,
+  messageCodeLabel,
+  mergeActivityEvents,
 } from "../dashboard-model";
 
 export interface ActivityFeedProps {
@@ -45,11 +47,24 @@ export function ActivityFeed({ events, reconnecting = false }: ActivityFeedProps
                   <span className={`presence presence--${event.state}`}>
                     <span className="presence__icon" aria-hidden="true">{state.icon}</span>{state.label}
                   </span>
-                  <time dateTime={new Date(event.occurred_at_ms).toISOString()}>{formatTimestamp(event.occurred_at_ms)}</time>
+                  <time dateTime={isoTimestamp(event.occurred_at_ms)}>{formatTimestamp(event.occurred_at_ms)}</time>
                 </header>
                 <strong className="activity-id">{event.activity_id}</strong>
                 <p className="activity-operation"><strong>{event.principal_id}</strong> · {event.operation}</p>
                 <p>{event.source_host_id} → {event.target_host_id}{event.device_id ? ` / ${event.device_id}` : ""}</p>
+                <p className="activity-authorization">
+                  <strong>{event.authorization.effect === "allow" ? "Erlaubt" : "Abgelehnt"}</strong>
+                  {event.authorization.rule_id && <> · Regel: {event.authorization.rule_id}</>}
+                  {event.authorization.approval_id && <> · Freigabe: {event.authorization.approval_id}</>}
+                </p>
+                {event.message && <p className="activity-message">
+                  {event.message.code === "redacted" && <><strong>Redigierte Ausgabe</strong> · </>}
+                  <span>{messageCodeLabel(event.message.code)}</span>
+                </p>}
+                <p className="activity-duration">
+                  Gestartet: {event.started_at_ms ? formatTimestamp(event.started_at_ms) : "Nicht gemeldet"}
+                  {event.finished_at_ms && <> · Beendet: {formatTimestamp(event.finished_at_ms)}</>}
+                </p>
                 <ul className="resource-tags" aria-label="Verwendete Ressourcen">
                   {event.resources.map((resource) => <li key={resource}>{resource}</li>)}
                 </ul>

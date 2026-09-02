@@ -9,14 +9,14 @@ const occupancies: ResourceOccupancyModel[] = [{
   target_host_id: "mac-build-host",
   device_id: "iphone-1",
   resource: "device_lease",
-  acquired_at_ms: 1_725_000_000_000
+  acquired_at_ms: "1725000000000"
 }, {
   activity_id: "activity-2",
   principal_id: "Xcode",
   target_host_id: "mac-build-host",
   device_id: null,
   resource: "workspace_read",
-  acquired_at_ms: 1_725_000_000_100
+  acquired_at_ms: "1725000000100"
 }];
 
 describe("ResourceOccupancy", () => {

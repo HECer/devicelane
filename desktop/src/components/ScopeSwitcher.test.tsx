@@ -13,8 +13,11 @@ describe("ScopeSwitcher", () => {
     expect(screen.getByRole("tablist", { name: "Anzeigebereich" })).toBeVisible();
     expect(tabs).toHaveLength(2);
     expect(tabs[0]).toHaveAccessibleName("Dieser Computer");
+    expect(tabs[0]).toHaveAttribute("id", "scope-local-tab");
+    expect(tabs[0]).toHaveAttribute("aria-controls", "mesh-dashboard-panel");
     expect(tabs[0]).toHaveAttribute("aria-selected", "true");
     expect(tabs[1]).toHaveAccessibleName("Alle autorisierten Geräte");
+    expect(tabs[1]).toHaveAttribute("id", "scope-mesh-tab");
 
     tabs[0].focus();
     await user.keyboard("{ArrowRight}");

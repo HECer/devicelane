@@ -1,5 +1,5 @@
 import type { ResourceOccupancy as ResourceOccupancyModel } from "../api";
-import { formatTimestamp, resourceLabel } from "../dashboard-model";
+import { formatTimestamp, isoTimestamp, resourceLabel } from "../dashboard-model";
 
 export interface ResourceOccupancyProps {
   occupancies: ResourceOccupancyModel[];
@@ -20,7 +20,7 @@ export function ResourceOccupancy({ occupancies }: ResourceOccupancyProps) {
                 {occupancy.principal_id} → {occupancy.target_host_id}{occupancy.device_id ? ` / ${occupancy.device_id}` : ""}
               </span>
               <strong>{resourceLabel(occupancy.resource)}</strong>
-              <time dateTime={new Date(occupancy.acquired_at_ms).toISOString()}>Seit {formatTimestamp(occupancy.acquired_at_ms)}</time>
+              <time dateTime={isoTimestamp(occupancy.acquired_at_ms)}>Seit {formatTimestamp(occupancy.acquired_at_ms)}</time>
             </li>
           ))}
         </ul>

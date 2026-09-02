@@ -108,20 +108,47 @@ export function freshnessLabel(value: Freshness): string {
   return assertNever(value);
 }
 
-export function formatMetric(metric: MetricValue, formatter: (value: number) => string = String): string {
+export function compareU64(left: string, right: string): number {
+  const leftValue = BigInt(left);
+  const rightValue = BigInt(right);
+  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+}
+
+export function formatMetric(metric: MetricValue, formatter: (value: string) => string = String): string {
   if ("available" in metric) return formatter(metric.available.value);
   if ("unavailable" in metric) return `Nicht verfügbar: ${metric.unavailable.reason}`;
   return assertNever(metric);
 }
 
-export function formatBytes(value: number): string {
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
-  return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+export function formatBytes(value: string): string {
+  const bytes = BigInt(value);
+  const kibibyte = 1024n;
+  const mebibyte = kibibyte * kibibyte;
+  const formatUnit = (divisor: bigint, unit: string) => {
+    const tenths = bytes * 10n / divisor;
+    return `${tenths / 10n}.${tenths % 10n} ${unit}`;
+  };
+  if (bytes < kibibyte) return `${value} B`;
+  if (bytes < mebibyte) return formatUnit(kibibyte, "KiB");
+  return formatUnit(mebibyte, "MiB");
 }
 
-export function formatTimestamp(value: number): string {
-  return new Intl.DateTimeFormat("de-DE", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+export function timestampDate(value: string): Date | undefined {
+  const milliseconds = BigInt(value);
+  if (milliseconds > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+  const date = new Date(Number(milliseconds));
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+export function formatTimestamp(value: string): string {
+  const date = timestampDate(value);
+  return date
+    ? new Intl.DateTimeFormat("de-DE", { dateStyle: "medium", timeStyle: "short" }).format(date)
+    : "Zeitstempel nicht darstellbar";
+}
+
+export function isoTimestamp(value: string): string | undefined {
+  return timestampDate(value)?.toISOString();
 }
 
 export function eventKey(event: ActivityEvent): string {
@@ -132,7 +159,7 @@ export function mergeActivityEvents(current: ActivityEvent[], incoming: Activity
   const merged = new Map<string, ActivityEvent>();
   for (const event of [...current, ...incoming]) merged.set(eventKey(event), event);
   return [...merged.values()]
-    .sort((left, right) => right.occurred_at_ms - left.occurred_at_ms || right.sequence - left.sequence)
+    .sort((left, right) => compareU64(right.occurred_at_ms, left.occurred_at_ms) || compareU64(right.sequence, left.sequence))
     .slice(0, maximum);
 }
 
@@ -140,7 +167,7 @@ export function activeOccupancies(events: ActivityEvent[]): ResourceOccupancy[] 
   const newestByActivity = new Map<string, ActivityEvent>();
   for (const event of events) {
     const previous = newestByActivity.get(event.activity_id);
-    if (!previous || event.sequence > previous.sequence) newestByActivity.set(event.activity_id, event);
+    if (!previous || compareU64(event.sequence, previous.sequence) > 0) newestByActivity.set(event.activity_id, event);
   }
   return [...newestByActivity.values()]
     .filter((event) => event.state === "running" || event.state === "reconnecting")

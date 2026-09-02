@@ -1,6 +1,6 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import type { ActivityEvent, DaemonClient, DaemonSnapshot, DashboardSnapshot } from "./api";
 
@@ -18,12 +18,13 @@ const connected: DaemonSnapshot = {
   autostart: true,
   warnings: ["Xcode license requires confirmation"],
   log_location: "/Users/hecer/Library/Logs/DeviceLane/service.log"
+  ,features: ["dashboard_v1"]
 };
 
 const dashboard: DashboardSnapshot = {
-  revision: 7,
-  generated_at_ms: 1_725_000_000_000,
-  scope: "mesh",
+  revision: "7",
+  generated_at_ms: "1725000000000",
+  scope: "local",
   hosts: [{
     id: "mac-agent",
     display_name: "Hermanns MacBook Pro",
@@ -38,14 +39,15 @@ const dashboard: DashboardSnapshot = {
     devices: []
   }],
   activities: [],
+  leases: [],
   pending_approvals: [],
   warnings: []
 };
 
 const streamedEvent: ActivityEvent = {
   activity_id: "activity-streamed",
-  sequence: 1,
-  occurred_at_ms: 1_725_000_000_100,
+  sequence: "1",
+  occurred_at_ms: "1725000000100",
   principal_id: "agent-codex",
   source_host_id: "windows-workstation",
   target_host_id: "mac-agent",
@@ -56,12 +58,12 @@ const streamedEvent: ActivityEvent = {
   state: "running",
   message: null,
   metrics: {
-    current_memory_bytes: { available: { value: 1024 } },
-    peak_memory_bytes: { available: { value: 2048 } },
+    current_memory_bytes: { available: { value: "1024" } },
+    peak_memory_bytes: { available: { value: "2048" } },
     cpu_time_ms: { unavailable: { reason: "observer_pending" } },
-    process_count: { available: { value: 1 } }
+    process_count: { available: { value: "1" } }
   },
-  started_at_ms: 1_725_000_000_100,
+  started_at_ms: "1725000000100",
   finished_at_ms: null
 };
 
@@ -81,7 +83,7 @@ function fakeClient(overrides: Partial<DaemonClient> = {}): DaemonClient {
     activityEvents: vi.fn().mockResolvedValue({
       result: "events",
       events: [],
-      next_cursor: { epoch: 1, sequence: 0 }
+      next_cursor: { epoch: "1", sequence: "0" }
     }),
     acknowledgeEvents: vi.fn().mockResolvedValue(undefined),
     ...overrides
@@ -90,6 +92,7 @@ function fakeClient(overrides: Partial<DaemonClient> = {}): DaemonClient {
 }
 
 describe("DeviceLane desktop foundation", () => {
+  afterEach(() => vi.useRealTimers());
   it("shows daemon, host, role, warning, autostart and remote access state", async () => {
     render(<App client={fakeClient()} />);
 
@@ -178,18 +181,18 @@ describe("DeviceLane desktop foundation", () => {
     const activityEvents = vi.fn()
       .mockResolvedValueOnce({
         result: "resync_required",
-        oldest_available: { epoch: 4, sequence: 8 },
-        snapshot_revision: 8
+        oldest_available: { epoch: "4", sequence: "8" },
+        snapshot_revision: "8"
       })
       .mockResolvedValueOnce({
         result: "events",
         events: [streamedEvent, streamedEvent],
-        next_cursor: { epoch: 4, sequence: 9 }
+        next_cursor: { epoch: "4", sequence: "9" }
       })
       .mockResolvedValue({
         result: "events",
         events: [],
-        next_cursor: { epoch: 4, sequence: 9 }
+        next_cursor: { epoch: "4", sequence: "9" }
       });
     const client = fakeClient({ activityEvents });
 
@@ -200,12 +203,12 @@ describe("DeviceLane desktop foundation", () => {
     expect(screen.getByRole("list", { name: "Aktivitätsereignisse" }).children).toHaveLength(1);
     await waitFor(() => expect(client.acknowledgeEvents).toHaveBeenCalledWith(
       expect.any(String),
-      { epoch: 4, sequence: 9 },
+      { epoch: "4", sequence: "9" },
       expect.any(AbortSignal)
     ));
     expect(client.dashboardSnapshot).toHaveBeenCalledTimes(2);
-    expect(activityEvents).toHaveBeenNthCalledWith(1, { epoch: 0, sequence: 0 }, 100, expect.any(AbortSignal));
-    expect(activityEvents).toHaveBeenNthCalledWith(2, { epoch: 4, sequence: 8 }, 100, expect.any(AbortSignal));
+    expect(activityEvents).toHaveBeenNthCalledWith(1, { epoch: "0", sequence: "0" }, 100, expect.any(AbortSignal));
+    expect(activityEvents).toHaveBeenNthCalledWith(2, { epoch: "4", sequence: "8" }, 100, expect.any(AbortSignal));
   });
 
   it("shows a reconnect state and clears the transient error after the stream recovers", async () => {
@@ -214,7 +217,7 @@ describe("DeviceLane desktop foundation", () => {
       .mockResolvedValue({
         result: "events",
         events: [streamedEvent],
-        next_cursor: { epoch: 1, sequence: 1 }
+        next_cursor: { epoch: "1", sequence: "1" }
       });
     render(<App client={fakeClient({ activityEvents })} />);
 
@@ -226,4 +229,65 @@ describe("DeviceLane desktop foundation", () => {
     expect(screen.queryByText("Stream verbindet erneut")).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   }, 4_000);
+
+  it("derives mesh availability only from the authenticated dashboard snapshot and adopts its scope", async () => {
+    const localOnly = { ...dashboard, scope: "local" as const };
+    const { unmount } = render(<App client={fakeClient({ dashboardSnapshot: vi.fn().mockResolvedValue(localOnly) })} />);
+    expect(await screen.findByRole("tab", { name: "Alle autorisierten Geräte" })).toBeDisabled();
+    unmount();
+
+    const mesh = { ...dashboard, scope: "mesh" as const };
+    render(<App client={fakeClient({ dashboardSnapshot: vi.fn().mockResolvedValue(mesh) })} />);
+    expect(await screen.findByRole("tab", { name: "Alle autorisierten Geräte" })).toBeEnabled();
+    expect(screen.getByRole("tab", { name: "Alle autorisierten Geräte" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("serializes snapshot polls and never replaces a newer revision with an older response", async () => {
+    vi.useFakeTimers();
+    let resolveFirst!: (value: DashboardSnapshot) => void;
+    const first = new Promise<DashboardSnapshot>((resolve) => { resolveFirst = resolve; });
+    const old = { ...dashboard, revision: "9", hosts: [{ ...dashboard.hosts[0], display_name: "Alter Host" }] };
+    const dashboardSnapshot = vi.fn()
+      .mockReturnValueOnce(first)
+      .mockResolvedValue(old);
+    const activityEvents = vi.fn(() => new Promise<never>(() => undefined));
+    const { unmount } = render(<App client={fakeClient({ dashboardSnapshot, activityEvents })} />);
+    await act(async () => Promise.resolve());
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(dashboardSnapshot).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveFirst({ ...dashboard, revision: "10", hosts: [{ ...dashboard.hosts[0], display_name: "Neuer Host" }] });
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Neuer Host")).toBeVisible();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await act(async () => Promise.resolve());
+    expect(screen.queryByText("Alter Host")).not.toBeInTheDocument();
+    unmount();
+  });
+
+  it("names the active tabpanel and reports active jobs from the snapshot", async () => {
+    const active = {
+      ...dashboard,
+      activities: [{
+        activity_id: "job-1",
+        principal_id: "agent-codex",
+        source_host_id: "windows-workstation",
+        target_host_id: "mac-agent",
+        device_id: null,
+        operation: "xcode.build",
+        resources: ["workspace_read" as const],
+        state: "running" as const,
+        started_at_ms: "1725000000100",
+        finished_at_ms: null
+      }]
+    };
+    render(<App client={fakeClient({ dashboardSnapshot: vi.fn().mockResolvedValue(active) })} />);
+
+    const panel = await screen.findByRole("tabpanel");
+    expect(panel).toHaveAttribute("id", "mesh-dashboard-panel");
+    expect(panel).toHaveAttribute("aria-labelledby", "scope-local-tab");
+    expect(screen.getByText("1 aktiver Job")).toBeVisible();
+  });
 });

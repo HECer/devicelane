@@ -17,7 +17,10 @@ export interface DaemonSnapshot {
   remote_access_paused: boolean;
   autostart: boolean;
   log_location: string;
+  features: string[];
 }
+
+export type U64Decimal = string;
 
 export interface DiagnosticItem {
   code: string;
@@ -32,7 +35,7 @@ export interface DiagnosticsResult {
 
 export type DashboardScope = "local" | "mesh";
 export type Presence = "offline" | "connecting" | "online" | "busy" | "attention_required" | "remote_access_paused";
-export type Freshness = "live" | "unknown" | { stale: { last_seen_at_ms: number } };
+export type Freshness = "live" | "unknown" | { stale: { last_seen_at_ms: U64Decimal } };
 export type TrustState = "local" | "trusted" | "untrusted" | "revoked";
 export type ConnectionPath = "local" | "direct" | "registry" | "unavailable";
 export type ResourceClass =
@@ -61,7 +64,7 @@ export interface DisplayMessage {
   params: MessageParam[];
 }
 
-export type MetricValue = { available: { value: number } } | { unavailable: { reason: string } };
+export type MetricValue = { available: { value: U64Decimal } } | { unavailable: { reason: string } };
 
 export interface MetricSnapshot {
   current_memory_bytes: MetricValue;
@@ -103,8 +106,8 @@ export interface Authorization {
 
 export interface ActivityEvent {
   activity_id: string;
-  sequence: number;
-  occurred_at_ms: number;
+  sequence: U64Decimal;
+  occurred_at_ms: U64Decimal;
   principal_id: string;
   source_host_id: string;
   target_host_id: string;
@@ -115,8 +118,8 @@ export interface ActivityEvent {
   state: ActivityState;
   message: DisplayMessage | null;
   metrics: MetricSnapshot;
-  started_at_ms: number | null;
-  finished_at_ms: number | null;
+  started_at_ms: U64Decimal | null;
+  finished_at_ms: U64Decimal | null;
 }
 
 export interface ActivitySummary {
@@ -128,8 +131,8 @@ export interface ActivitySummary {
   operation: string;
   resources: ResourceClass[];
   state: ActivityState;
-  started_at_ms: number | null;
-  finished_at_ms: number | null;
+  started_at_ms: U64Decimal | null;
+  finished_at_ms: U64Decimal | null;
 }
 
 export interface ResourceOccupancy {
@@ -138,7 +141,7 @@ export interface ResourceOccupancy {
   target_host_id: string;
   device_id: string | null;
   resource: ResourceClass;
-  acquired_at_ms: number;
+  acquired_at_ms: U64Decimal;
 }
 
 export interface ApprovalRequest {
@@ -150,8 +153,8 @@ export interface ApprovalRequest {
   device_id: string | null;
   operation: string;
   resources: ResourceClass[];
-  requested_at_ms: number;
-  expires_at_ms: number;
+  requested_at_ms: U64Decimal;
+  expires_at_ms: U64Decimal;
   risk: string;
 }
 
@@ -162,24 +165,34 @@ export interface DashboardWarning {
 }
 
 export interface DashboardSnapshot {
-  revision: number;
-  generated_at_ms: number;
+  revision: U64Decimal;
+  generated_at_ms: U64Decimal;
   scope: DashboardScope;
   hosts: DashboardHost[];
   activities: ActivitySummary[];
+  leases: DashboardLease[];
   pending_approvals: ApprovalRequest[];
   warnings: DashboardWarning[];
 }
 
 export interface EventCursor {
-  epoch: number;
-  sequence: number;
+  epoch: U64Decimal;
+  sequence: U64Decimal;
+}
+
+export type LeaseState = "active" | "uncertain";
+
+export interface DashboardLease {
+  id: string;
+  owner_host_id: string;
+  device_id: string;
+  state: LeaseState;
 }
 
 export type EventRead =
   | { result: "events"; events: ActivityEvent[]; next_cursor: EventCursor }
   | { result: "cursor_ahead"; newest_available: EventCursor }
-  | { result: "resync_required"; oldest_available: EventCursor; snapshot_revision: number }
+  | { result: "resync_required"; oldest_available: EventCursor; snapshot_revision: U64Decimal }
   | { result: "limit_exceeded" };
 
 export interface DaemonClient {
