@@ -157,6 +157,7 @@ fn grant_once(endpoint: &str, activity: &str, operation: &str, resource: &str) {
 }
 
 fn observed_watch_service() -> (tempfile::TempDir, String, EventJournal) {
+    static NEXT_SERVER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("runtime");
     std::fs::create_dir_all(&runtime).unwrap();
@@ -165,7 +166,11 @@ fn observed_watch_service() -> (tempfile::TempDir, String, EventJournal) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let text = format!("{}-observed", endpoint_text(&runtime));
+    let text = format!(
+        "{}-observed-{}",
+        endpoint_text(&runtime),
+        NEXT_SERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let endpoint = local_endpoint(&runtime, &text).unwrap();
     let journal = EventJournal::new(1, 0);
     let unavailable = || MetricValue::Unavailable {
@@ -733,4 +738,68 @@ fn activity_watch_acknowledges_only_stdout_delivered_cursor() {
         None,
         "broken stdout must not create or advance subscriber acknowledgement"
     );
+}
+
+#[test]
+fn activity_watch_preserves_daemon_cursor_errors_exactly_once() {
+    let (_root, endpoint, _journal) = observed_watch_service();
+    for (cursor, expected) in [("1:999", "cursor_ahead"), ("0:0", "resync_required")] {
+        let output = cli_endpoint(
+            &endpoint,
+            &[
+                "activities",
+                "watch",
+                "--local",
+                "--json",
+                "--cursor",
+                cursor,
+                "--limit",
+                "1",
+            ],
+        );
+        assert!(!output.status.success());
+        let lines: Vec<_> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<LocalResponse>(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "daemon error must be emitted exactly once");
+        assert!(matches!(&lines[0],LocalResponse::Error{code,..} if code==expected));
+    }
+}
+
+#[test]
+fn activity_watch_preserves_acknowledgement_error_after_delivered_event() {
+    let (_root, endpoint, journal) = observed_watch_service();
+    for index in 0..32 {
+        journal
+            .subscribe(
+                SubscriberId::parse(format!("occupied-{index}")).unwrap(),
+                u64::MAX,
+            )
+            .unwrap();
+    }
+    let output = cli_endpoint(
+        &endpoint,
+        &[
+            "activities",
+            "watch",
+            "--local",
+            "--json",
+            "--cursor",
+            "1:0",
+            "--limit",
+            "1",
+        ],
+    );
+    assert!(!output.status.success());
+    let lines: Vec<_> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["activity_id"], "watch-event");
+    assert_eq!(lines[1]["type"], "error");
+    assert_eq!(lines[1]["payload"]["code"], "limit_exceeded");
 }

@@ -621,10 +621,28 @@ fn structured_watch_error(message: &str) -> Result<(), String> {
     })
     .map_err(|error| error.to_string())
 }
-fn watch_activity(e: &LocalEndpoint, mut c: EventCursor, l: usize, j: bool) -> Result<(), String> {
+enum WatchFailure {
+    Transport(String),
+    Daemon { code: String, message: String },
+    Protocol(String),
+}
+impl WatchFailure {
+    fn message(&self) -> String {
+        match self {
+            Self::Transport(message) | Self::Protocol(message) => message.clone(),
+            Self::Daemon { code, message } => format!("daemon error ({code}): {message}"),
+        }
+    }
+}
+fn watch_activity(
+    e: &LocalEndpoint,
+    mut c: EventCursor,
+    l: usize,
+    j: bool,
+) -> Result<(), WatchFailure> {
     let z = LocalProtocolVersion::CURRENT;
-    let s =
-        SubscriberId::parse(format!("cli-{}", std::process::id())).map_err(|x| x.to_string())?;
+    let s = SubscriberId::parse(format!("cli-{}", std::process::id()))
+        .map_err(|x| WatchFailure::Protocol(x.to_string()))?;
     loop {
         match send(
             e,
@@ -633,7 +651,9 @@ fn watch_activity(e: &LocalEndpoint, mut c: EventCursor, l: usize, j: bool) -> R
                 cursor: c,
                 limit: l,
             },
-        )? {
+        )
+        .map_err(WatchFailure::Transport)?
+        {
             LocalResponse::ActivityEvents(EventRead::Events {
                 events,
                 next_cursor,
@@ -648,7 +668,7 @@ fn watch_activity(e: &LocalEndpoint, mut c: EventCursor, l: usize, j: bool) -> R
                         return if q.kind() == io::ErrorKind::BrokenPipe {
                             Ok(())
                         } else {
-                            Err(q.to_string())
+                            Err(WatchFailure::Transport(q.to_string()))
                         };
                     }
                 }
@@ -662,19 +682,21 @@ fn watch_activity(e: &LocalEndpoint, mut c: EventCursor, l: usize, j: bool) -> R
                             subscriber_id: s.clone(),
                             cursor: next_cursor,
                         },
-                    )? {
+                    )
+                    .map_err(WatchFailure::Transport)?
+                    {
                         LocalResponse::Acknowledged => c = next_cursor,
                         LocalResponse::Error { code, message } => {
-                            return Err(format!("daemon error ({code}): {message}"));
+                            return Err(WatchFailure::Daemon { code, message });
                         }
-                        _ => return Err("unexpected acknowledge".into()),
+                        _ => return Err(WatchFailure::Protocol("unexpected acknowledge".into())),
                     }
                 }
             }
             LocalResponse::Error { code, message } => {
-                return Err(format!("daemon error ({code}): {message}"));
+                return Err(WatchFailure::Daemon { code, message });
             }
-            _ => return Err("unexpected response".into()),
+            _ => return Err(WatchFailure::Protocol("unexpected response".into())),
         }
     }
 }
@@ -695,12 +717,26 @@ fn run() -> Result<(), String> {
     match a.watch {
         Watch::Activities(c, l) => {
             let result = watch_activity(&e, c, l, a.json);
-            if let Err(message) = &result
-                && a.json
-            {
-                structured_watch_error(message)?;
-            }
-            return result;
+            return match result {
+                Ok(()) => Ok(()),
+                Err(WatchFailure::Daemon { code, message }) => {
+                    if a.json {
+                        json(&LocalResponse::Error {
+                            code: code.clone(),
+                            message: message.clone(),
+                        })
+                        .map_err(|e| e.to_string())?;
+                    }
+                    Err(format!("daemon error ({code}): {message}"))
+                }
+                Err(error) => {
+                    let message = error.message();
+                    if a.json {
+                        structured_watch_error(&message)?;
+                    }
+                    Err(message)
+                }
+            };
         }
         Watch::Mesh(s) => loop {
             let r = match send(
