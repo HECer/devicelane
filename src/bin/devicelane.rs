@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-const HELP: &str = "DeviceLane unified client\n\nUsage:\n  devicelane status --local [--json] [--endpoint ENDPOINT]\n  devicelane remote-access <pause|resume> --local\n  devicelane diagnostics --local\n  devicelane mesh <status|watch> --local [--scope local|mesh]\n  devicelane activities <list|watch|cancel> --local [--cursor EPOCH:SEQUENCE] [--limit 1..256]\n  devicelane approvals <list|request|decide> --local [typed access options]\n  devicelane policy <list|put|delete> --local [typed rule options]\n  devicelane audit <list|export> --local [filters]";
+const HELP: &str = "DeviceLane unified client\n\nUsage:\n  devicelane status --local [--json] [--endpoint ENDPOINT]\n  devicelane remote-access <pause|resume> --local\n  devicelane diagnostics --local\n  devicelane mesh <status|watch> --local [--scope local|mesh]\n  devicelane activities <list|watch|cancel> --local [--cursor EPOCH:SEQUENCE] [--limit 1..256]\n  devicelane approvals <list|request|decide> --local [typed access options]\n  devicelane policy <list|put|delete> --local [typed rule options]\n  devicelane audit <list|export> --local [filters]\n\nGrant flow:\n  approvals request --activity-id ID --principal-id ID --source-host-id ID --target-host-id ID --operation OP --resource RESOURCE\n  approvals decide --nonce NONCE [same exact access flags] --decision allow_once|allow_and_remember|deny_once|deny_and_block\n  then invoke the exact mutation before the five-minute grant expires.\n\nAdministrative operations: devicelane.policy.put, devicelane.policy.delete, devicelane.activity.cancel.\nResources: workspace_read, workspace_write, artifact_upload, artifact_download, device_lease, application_install, application_launch, debugger, signing, microphone, screen_capture, network_endpoint, device_lane_policy, device_lane_service.";
 #[derive(Default)]
 struct P {
     pos: Vec<String>,
@@ -214,6 +214,93 @@ fn rule(p: &P) -> Result<PolicyRule, String> {
     Ok(x)
 }
 
+fn reject_foreign_flags(p: &P, command: &[&str]) -> Result<(), String> {
+    let allowed: &[&str] = match command {
+        ["mesh", _] => &["--scope"],
+        ["activities", "list" | "watch"] => &["--cursor", "--limit"],
+        ["activities", "cancel"] => &["--activity-id"],
+        ["approvals", "list"]
+        | ["policy", "list"]
+        | ["status"]
+        | ["diagnostics"]
+        | ["remote-access", _] => &[],
+        ["approvals", "request"] => &[
+            "--lifetime-ms",
+            "--activity-id",
+            "--principal-id",
+            "--source-host-id",
+            "--target-host-id",
+            "--device-id",
+            "--operation",
+            "--resource",
+            "--physical-device",
+            "--user-present",
+        ],
+        ["approvals", "decide"] => &[
+            "--nonce",
+            "--decision",
+            "--activity-id",
+            "--principal-id",
+            "--source-host-id",
+            "--target-host-id",
+            "--device-id",
+            "--operation",
+            "--resource",
+            "--physical-device",
+            "--user-present",
+        ],
+        ["policy", "put"] => &[
+            "--rule-id",
+            "--revision",
+            "--effect",
+            "--principal-id",
+            "--source-host-id",
+            "--target-host-id",
+            "--device-id",
+            "--operation",
+            "--resource",
+            "--expires-at-ms",
+            "--require-user-presence",
+            "--match-device-exact",
+            "--match-resources-exact",
+            "--enabled",
+            "--origin",
+        ],
+        ["policy", "delete"] => &["--rule-id"],
+        ["audit", "list"] => &[
+            "--from-ms",
+            "--through-ms",
+            "--principal-id",
+            "--source-host-id",
+            "--target-host-id",
+            "--device-id",
+            "--operation",
+            "--resource",
+            "--decision",
+            "--result",
+            "--cursor",
+            "--limit",
+        ],
+        ["audit", "export"] => &[
+            "--from-ms",
+            "--through-ms",
+            "--principal-id",
+            "--source-host-id",
+            "--target-host-id",
+            "--device-id",
+            "--operation",
+            "--resource",
+            "--decision",
+            "--result",
+        ],
+        _ => &[],
+    };
+    if let Some(flag) = p.f.keys().find(|flag| !allowed.contains(&flag.as_str())) {
+        return Err(format!("{flag} is not valid for {}", command.join(" ")));
+    }
+    Ok(())
+}
+
 fn parse() -> Result<Option<Args>, String> {
     let v: Vec<_> = std::env::args().skip(1).collect();
     if v.iter().any(|x| x == "--help" || x == "-h") {
@@ -232,6 +319,7 @@ fn parse() -> Result<Option<Args>, String> {
     }
     let z = LocalProtocolVersion::CURRENT;
     let c: Vec<_> = p.pos.iter().map(String::as_str).collect();
+    reject_foreign_flags(&p, &c)?;
     let (r, m, w) = match c.as_slice() {
         ["status"] => (
             LocalRequest::Status { version: z },
@@ -403,7 +491,17 @@ fn json(x: &impl serde::Serialize) -> io::Result<()> {
 }
 fn human(r: &LocalResponse, m: &str) -> Result<String, String> {
     match r {
-        LocalResponse::Snapshot(s) => Ok(format!("{} - {:?}", s.public_identity, s.connection)),
+        LocalResponse::Snapshot(s) => Ok(format!(
+            "{} - role {:?}, connection {:?}, remote access {}",
+            s.public_identity,
+            s.role,
+            s.connection,
+            if s.remote_access_paused {
+                "paused"
+            } else {
+                "active"
+            }
+        )),
         LocalResponse::DashboardSnapshot(s) => Ok(s
             .hosts
             .iter()
@@ -426,6 +524,82 @@ fn human(r: &LocalResponse, m: &str) -> Result<String, String> {
             .map(|e| format!("{}: {:?}", e.activity_id, e.state))
             .collect::<Vec<_>>()
             .join("\n")),
+        LocalResponse::PendingApprovals(values) => Ok(values
+            .iter()
+            .map(|a| {
+                format!(
+                    "{}: {:?} {} -> {}, operation {}, resources {:?}, expires {}",
+                    a.id,
+                    a.risk,
+                    a.source_host_id,
+                    a.target_host_id,
+                    a.operation,
+                    a.resources,
+                    a.expires_at_ms
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")),
+        LocalResponse::PolicyRules(values) => Ok(values
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} rev {}: {:?}, operation {:?}, resources {:?}, enabled {}, expires {:?}",
+                    r.id,
+                    r.revision,
+                    r.effect,
+                    r.operation,
+                    r.resources,
+                    r.enabled,
+                    r.expires_at_ms
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")),
+        LocalResponse::AuditRecords(page) => Ok(page
+            .items
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}: {:?} {:?}, {} -> {}, operation {}, resources {:?}",
+                    r.sequence,
+                    r.result,
+                    r.decision,
+                    r.source_host_id,
+                    r.target_host_id,
+                    r.operation,
+                    r.resources
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")),
+        LocalResponse::ApprovalCreated {
+            nonce,
+            expires_at_ms,
+        } => Ok(format!(
+            "approval requested: nonce {nonce}, expires {expires_at_ms}"
+        )),
+        LocalResponse::ApprovalDecided {
+            decision,
+            created_rule,
+        } => Ok(format!(
+            "approval decided: {:?}, created rule {:?}",
+            decision,
+            created_rule.as_ref().map(|r| &r.id)
+        )),
+        LocalResponse::Cancellation { cancelled } => Ok(format!(
+            "activity state: {}",
+            if *cancelled { "cancelled" } else { "unchanged" }
+        )),
+        LocalResponse::RuleDeleted { deleted } => Ok(format!(
+            "policy rule {}",
+            if *deleted { "deleted" } else { "not found" }
+        )),
+        LocalResponse::AuditExport(export) => Ok(format!(
+            "audit export: {} records, hash {}",
+            export.records.len(),
+            export.manifest.records_sha256
+        )),
         LocalResponse::Error { code, message } => Err(format!("daemon error ({code}): {message}")),
         LocalResponse::Diagnostics(v) => Ok(v
             .iter()
@@ -437,6 +611,13 @@ fn human(r: &LocalResponse, m: &str) -> Result<String, String> {
 }
 fn send(e: &LocalEndpoint, r: &LocalRequest) -> Result<LocalResponse, String> {
     send_local_request(e, r).map_err(|x| x.to_string())
+}
+fn structured_watch_error(message: &str) -> Result<(), String> {
+    json(&LocalResponse::Error {
+        code: "local_ipc_error".into(),
+        message: message.into(),
+    })
+    .map_err(|error| error.to_string())
 }
 fn watch_activity(e: &LocalEndpoint, mut c: EventCursor, l: usize, j: bool) -> Result<(), String> {
     let z = LocalProtocolVersion::CURRENT;
@@ -510,15 +691,37 @@ fn run() -> Result<(), String> {
         Err(m) => return Err(m),
     };
     match a.watch {
-        Watch::Activities(c, l) => return watch_activity(&e, c, l, a.json),
+        Watch::Activities(c, l) => {
+            let result = watch_activity(&e, c, l, a.json);
+            if let Err(message) = &result
+                && a.json
+            {
+                structured_watch_error(message)?;
+            }
+            return result;
+        }
         Watch::Mesh(s) => loop {
-            let r = send(
+            let r = match send(
                 &e,
                 &LocalRequest::DashboardSnapshot {
                     version: LocalProtocolVersion::CURRENT,
                     scope: s,
                 },
-            )?;
+            ) {
+                Ok(response) => response,
+                Err(message) => {
+                    if a.json {
+                        structured_watch_error(&message)?;
+                    }
+                    return Err(message);
+                }
+            };
+            if let LocalResponse::Error { code, message } = &r {
+                if a.json {
+                    json(&r).map_err(|e| e.to_string())?;
+                }
+                return Err(format!("daemon error ({code}): {message}"));
+            }
             if a.json {
                 json(&r).map_err(|e| e.to_string())?
             } else {
