@@ -1174,6 +1174,8 @@ fn named_pipe_worker_pool_applies_bounded_backpressure() {
 fn production_unix_socket_serves_state_and_recovers_after_bad_frames() {
     use std::os::unix::fs::MetadataExt;
     let temp = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = temp.path().join("devicelane.sock");
     let stale = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     drop(stale);
