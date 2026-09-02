@@ -5,6 +5,10 @@
 - Added a Mesh dashboard end-to-end gate covering typed CLI/IPC/Tauri parity, bounded recovery and
   release checks on Windows, macOS, and Linux, plus a separate physical Windows-to-Mac evidence
   path that persists only pseudonymized, redacted metadata.
+- Bound approved dashboard activities to the real mTLS registry, device-lease, and Apple execution
+  path. The physical Mac gate now pins Darwin arm64 binaries by hash/version, requires an
+  authenticated controller session, separates cursor resync from reconnect, and retains only one
+  allow-listed redacted JSON record with a canonical audit digest.
 - Added native DeviceLane desktop packaging for Windows MSI, notarized macOS DMG, and Linux
   AppImage/deb targets.
 - Added locked native builds, SHA-256 manifests, CycloneDX SBOMs, checksum signatures, and

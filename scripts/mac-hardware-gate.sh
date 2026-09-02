@@ -20,6 +20,10 @@ WINDOWS_PRINCIPAL=
 WINDOWS_SOURCE_HOST=
 MESH_ACTIVITY_ID=
 MESH_TIMEOUT_SECONDS=300
+DEVICELANE_BINARY=
+DEVICELANE_SHA256=
+DEVICELANE_VERSION=
+CONTROLLER_PEER_ID=
 
 repair() {
     printf 'hardware_gate_failed=%s\nnext_step=%s\n' "$1" "$2" >&2
@@ -43,6 +47,10 @@ while [ "$#" -gt 0 ]; do
         --windows-source-host) shift; WINDOWS_SOURCE_HOST=${1:-} ;;
         --mesh-activity-id) shift; MESH_ACTIVITY_ID=${1:-} ;;
         --mesh-timeout-seconds) shift; MESH_TIMEOUT_SECONDS=${1:-} ;;
+        --devicelane-binary) shift; DEVICELANE_BINARY=${1:-} ;;
+        --devicelane-sha256) shift; DEVICELANE_SHA256=${1:-} ;;
+        --devicelane-version) shift; DEVICELANE_VERSION=${1:-} ;;
+        --controller-peer-id) shift; CONTROLLER_PEER_ID=${1:-} ;;
         --archive-stdout) ARCHIVE_STDOUT=true ;;
         *) repair invalid_argument "Use --device UDID --team TEAM_ID --output DIRECTORY --job-id ID --agent-peer ID and the documented --mesh-* arguments." ;;
     esac
@@ -51,22 +59,30 @@ done
 
 run_mesh_gate() {
     [ "${DEVICELANE_REAL_MESH_GATE:-0}" = 1 ] || repair mesh_gate_not_authorized "Set DEVICELANE_REAL_MESH_GATE=1 only for a real paired Windows-to-Mac run."
-    for value in "$MESH_CONTROLLER" "$MESH_ENDPOINT" "$WINDOWS_PRINCIPAL" "$WINDOWS_SOURCE_HOST" "$MESH_ACTIVITY_ID"; do
-        [ -n "$value" ] || repair mesh_gate_argument_missing "Pass --mesh-controller, --mesh-endpoint, --windows-principal, --windows-source-host, and --mesh-activity-id."
+    for value in "$MESH_CONTROLLER" "$MESH_ENDPOINT" "$WINDOWS_PRINCIPAL" "$WINDOWS_SOURCE_HOST" "$MESH_ACTIVITY_ID" "$CONTROLLER_PEER_ID"; do
+        [ -n "$value" ] || repair mesh_gate_argument_missing "Pass the documented controller, endpoint, principal, source, activity, and controller-peer arguments."
     done
     case "$MESH_TIMEOUT_SECONDS" in ''|*[!0-9]*) repair invalid_mesh_timeout "Use a positive integer for --mesh-timeout-seconds." ;; esac
     [ "$MESH_TIMEOUT_SECONDS" -gt 0 ] || repair invalid_mesh_timeout "Use a positive integer for --mesh-timeout-seconds."
-    DEVICELANE_CLI=$(command -v devicelane 2>/dev/null || true)
-    [ -x "$DEVICELANE_CLI" ] || repair devicelane_cli_missing "Install DeviceLane on the Mac with scripts/setup-mac.sh --upgrade."
+    [ -n "$DEVICELANE_BINARY" ] && [ -n "$DEVICELANE_SHA256" ] && [ -n "$DEVICELANE_VERSION" ] || repair unpinned_devicelane "Pass --devicelane-binary, --devicelane-sha256, and --devicelane-version from the approved build manifest."
+    case "$DEVICELANE_BINARY" in /*) ;; *) repair unpinned_devicelane "Use an absolute path to the approved DeviceLane binary." ;; esac
+    [ -x "$DEVICELANE_BINARY" ] && [ ! -L "$DEVICELANE_BINARY" ] || repair devicelane_cli_missing "Install the approved non-symlink DeviceLane binary."
+    case "$DEVICELANE_SHA256" in *[!0-9a-f]*|'') repair invalid_devicelane_hash "Use the lowercase SHA-256 from the approved build manifest." ;; esac
+    [ "${#DEVICELANE_SHA256}" -eq 64 ] || repair invalid_devicelane_hash "Use the 64-character lowercase SHA-256 from the approved build manifest."
+    ACTUAL_SHA256=$(/usr/bin/shasum -a 256 "$DEVICELANE_BINARY" | /usr/bin/awk '{print $1}')
+    [ "$ACTUAL_SHA256" = "$DEVICELANE_SHA256" ] || repair devicelane_hash_mismatch "Install the exact approved DeviceLane build."
+    ACTUAL_VERSION=$($DEVICELANE_BINARY --version 2>/dev/null || true)
+    [ "$ACTUAL_VERSION" = "$DEVICELANE_VERSION" ] || repair devicelane_version_mismatch "Install the exact approved DeviceLane version."
+    DEVICELANE_CLI=$DEVICELANE_BINARY
 
     # All daemon replies stay in memory. Only an allow-listed, pseudonymized summary is written.
     # The command spellings below are also the operator contract for the physical gate:
     # devicelane mesh status --local --json; devicelane activities watch --local --json;
     # devicelane approvals list --local --json; devicelane audit list --local --json.
-    "$PYTHON3" - "$DEVICELANE_CLI" "$MESH_ENDPOINT" "$MESH_CONTROLLER" "$WINDOWS_PRINCIPAL" "$WINDOWS_SOURCE_HOST" "$MESH_ACTIVITY_ID" "$MESH_TIMEOUT_SECONDS" "$RUN_DIR/evidence/mesh-evidence.json" <<'PY'
-import hashlib, json, select, socket, subprocess, sys, time
+    "$PYTHON3" - "$DEVICELANE_CLI" "$MESH_ENDPOINT" "$MESH_CONTROLLER" "$CONTROLLER_PEER_ID" "$WINDOWS_PRINCIPAL" "$WINDOWS_SOURCE_HOST" "$MESH_ACTIVITY_ID" "$MESH_TIMEOUT_SECONDS" "$DEVICELANE_SHA256" "$DEVICELANE_VERSION" "$RUN_DIR/evidence/mesh-evidence.json" <<'PY'
+import hashlib, json, select, subprocess, sys, time
 
-cli, endpoint, controller, principal, source, activity_id, timeout_raw, output = sys.argv[1:]
+cli, endpoint, controller, controller_peer, principal, source, activity_id, timeout_raw, binary_sha256, binary_version, output = sys.argv[1:]
 timeout = int(timeout_raw)
 
 def fail(code, message):
@@ -81,8 +97,8 @@ def run(*parts):
     try: return json.loads(result.stdout)
     except Exception: fail("mesh_invalid_json", f"DeviceLane returned invalid JSON: {' '.join(parts)}")
 
-def watch_once():
-    command = [cli, "activities", "watch", "--cursor", "1:0", "--limit", "256", "--local", "--json", "--endpoint", endpoint]
+def watch_once(cursor):
+    command = [cli, "activities", "watch", "--cursor", cursor, "--limit", "256", "--local", "--json", "--endpoint", endpoint]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     lines = []
     try:
@@ -102,24 +118,23 @@ def watch_once():
             process.kill(); process.wait()
     return lines
 
-host, separator, port = controller.rpartition(":")
-if not separator or not host or not port.isdigit():
-    fail("invalid_mesh_controller", "Use --mesh-controller HOST:PORT.")
-try:
-    with socket.create_connection((host, int(port)), timeout=5): pass
-except OSError:
-    fail("mesh_controller_unreachable", "Start the paired Windows registry and allow the configured controller port.")
-
 deadline = time.monotonic() + timeout
-seen = {"approval": False, "running": False, "reconnecting": False, "terminal": False, "audit": False}
+seen = {"approval": False, "running": False, "reconnecting": False, "resync": False, "terminal": False, "audit": False}
 terminal_event = None
+terminal_audit = None
 metric_state = None
 decision = None
 status_scope = None
+authenticated_controller = False
+cursor = "1:0"
 while time.monotonic() < deadline:
     status = run("mesh", "status", "--scope", "mesh")
     if status.get("type") == "dashboard_snapshot":
         status_scope = status.get("payload", {}).get("scope")
+        for host in status.get("payload", {}).get("hosts", []):
+            if (host.get("id") == controller_peer and host.get("trust") == "trusted"
+                    and host.get("presence") in {"online", "busy"}):
+                authenticated_controller = True
 
     approvals = run("approvals", "list")
     for item in approvals.get("payload", []):
@@ -129,16 +144,28 @@ while time.monotonic() < deadline:
                 and {"workspace_read", "device_lease"}.issubset(set(resources))):
             seen["approval"] = True
 
-    activities = run("activities", "list", "--cursor", "1:0", "--limit", "256")
+    activities = run("activities", "list", "--cursor", cursor, "--limit", "256")
     payload = activities.get("payload", {})
     if payload.get("result") == "resync_required":
-        # A bounded resync is an expected recovery signal, never a silent partial page.
-        seen["reconnecting"] = True
-    watched = watch_once()
+        reset = payload.get("oldest_available", {})
+        revision = payload.get("snapshot_revision")
+        snapshot = run("mesh", "status", "--scope", "mesh").get("payload", {})
+        if not isinstance(revision, int) or snapshot.get("revision", -1) < revision:
+            fail("resync_snapshot_stale", "Fetch a snapshot at or beyond the requested resync revision before resuming the event stream.")
+        if not isinstance(reset.get("epoch"), int) or not isinstance(reset.get("sequence"), int):
+            fail("resync_cursor_missing", "The daemon must return an explicit epoch and sequence for resynchronization.")
+        cursor = f'{reset["epoch"]}:{reset["sequence"]}'
+        seen["resync"] = True
+        continue
+    if payload.get("result") == "events":
+        next_cursor = payload.get("next_cursor", {})
+        if isinstance(next_cursor.get("epoch"), int) and isinstance(next_cursor.get("sequence"), int):
+            cursor = f'{next_cursor["epoch"]}:{next_cursor["sequence"]}'
+    watched = watch_once(cursor)
     streamed_events = [item for item in watched if isinstance(item, dict) and "activity_id" in item]
     for error in watched:
         if error.get("type") == "error" and error.get("payload", {}).get("code") == "resync_required":
-            seen["reconnecting"] = True
+            fail("watch_resync_without_cursor", "Recover resync through activities list so the snapshot revision and replacement epoch are explicit.")
     for event in [*payload.get("events", []), *streamed_events]:
         if event.get("activity_id") != activity_id: continue
         resources = set(event.get("resources", []))
@@ -157,25 +184,54 @@ while time.monotonic() < deadline:
     audit = run("audit", "list", "--limit", "256")
     for record in audit.get("payload", {}).get("items", []):
         if (record.get("activity_id") == activity_id and record.get("principal_id") == principal
-                and record.get("source_host_id") == source):
+                and record.get("source_host_id") == source
+                and record.get("result") in {"succeeded", "failed", "cancelled", "denied"}):
             raw = json.dumps(record, sort_keys=True).lower()
             if not any(word in raw for word in ("private_key", "bearer ", "authorization:", "environment")):
-                seen["audit"] = True
-    if all(seen.values()) and status_scope == "mesh" and metric_state and terminal_event:
+                seen["audit"] = True; terminal_audit = record
+    if all(seen.values()) and authenticated_controller and status_scope == "mesh" and metric_state and terminal_event:
         break
     time.sleep(1)
 
 if not all(seen.values()):
     fail("mesh_observation_incomplete", "Keep the Windows operation and Mac approval UI active through disconnect/reconnect and completion.")
 if status_scope != "mesh": fail("mesh_scope_unavailable", "Restore authenticated registry connectivity.")
+if not authenticated_controller: fail("controller_session_unauthenticated", "Restore the paired controller identity and authenticated mesh session; TCP reachability is insufficient.")
 if not metric_state: fail("observer_invalid", "Metrics must be nonzero or explicitly observer_unavailable.")
 if decision != "allow": fail("approval_not_allowed", "Approve the exact Windows operation on the target Mac before it starts.")
+
+expected_audit = {
+    "activity_id": activity_id,
+    "principal_id": principal,
+    "source_host_id": source,
+    "target_host_id": terminal_event.get("target_host_id"),
+    "operation": terminal_event.get("operation"),
+    "resources": sorted(terminal_event.get("resources", [])),
+    "decision": decision,
+    "terminal": terminal_event.get("state"),
+    "redaction": None,
+}
+actual_audit = {
+    "activity_id": terminal_audit.get("activity_id"),
+    "principal_id": terminal_audit.get("principal_id"),
+    "source_host_id": terminal_audit.get("source_host_id"),
+    "target_host_id": terminal_audit.get("target_host_id"),
+    "operation": terminal_audit.get("operation"),
+    "resources": sorted(terminal_audit.get("resources", [])),
+    "decision": terminal_audit.get("decision"),
+    "terminal": terminal_audit.get("result"),
+    "redaction": terminal_audit.get("redacted_message"),
+}
+if actual_audit != expected_audit:
+    fail("audit_record_mismatch", "Preserve the exact target, principal, source, operation, resources, decision, activity, terminal result, and redaction across execution and audit.")
+audit_digest = hashlib.sha256(json.dumps(actual_audit, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 def pseudonym(value): return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
 evidence = {
     "schema": "devicelane.mesh-gate.redacted.v1",
     "redacted": True,
     "controller": pseudonym(controller),
+    "controller_peer": pseudonym(controller_peer),
     "principal": pseudonym(principal),
     "source_host": pseudonym(source),
     "activity_id": pseudonym(activity_id),
@@ -184,15 +240,35 @@ evidence = {
     "states_observed": sorted(k for k, value in seen.items() if value),
     "metric_status": metric_state,
     "terminal_state": terminal_event.get("state"),
-    "audit_record": "same_redacted_activity_record_observed",
-    "recovery": "resync_required_or_reconnecting_observed",
+    "audit_record_digest": "sha256:" + audit_digest,
+    "recovery": "resync_and_authenticated_reconnect_observed",
+    "binary_sha256": binary_sha256,
+    "binary_version": binary_version,
 }
 with open(output, "x", encoding="utf-8") as handle:
     json.dump(evidence, handle, sort_keys=True, indent=2)
 PY
 }
 
+if [ "${DEVICELANE_REAL_MESH_GATE:-0}" = 1 ] || [ -n "$MESH_CONTROLLER$MESH_ENDPOINT$WINDOWS_PRINCIPAL$WINDOWS_SOURCE_HOST$MESH_ACTIVITY_ID" ]; then
+    [ "$(uname -s)" = Darwin ] || repair not_macos "Run the physical mesh gate on the paired Mac."
+    [ "$(uname -m)" = arm64 ] || repair wrong_architecture "Run the physical mesh gate on the approved Darwin arm64 Mac."
+    PYTHON3=/usr/bin/python3
+    [ -x "$PYTHON3" ] || repair python_missing "Install the Apple-provided Python 3 runtime and retry."
+    mkdir -p "$OUTPUT_ROOT"
+    RUN_DIR="$OUTPUT_ROOT/$JOB_ID"
+    [ ! -e "$RUN_DIR" ] || repair output_exists "Choose a new --job-id; existing evidence is never overwritten."
+    mkdir -m 700 -p "$RUN_DIR/evidence"
+    run_mesh_gate
+    [ "$(find "$RUN_DIR/evidence" -type f -print | wc -l | tr -d ' ')" = 1 ] || repair evidence_not_allowlisted "Delete the gate directory; only generated mesh-evidence.json may be retained."
+    [ -f "$RUN_DIR/evidence/mesh-evidence.json" ] || repair evidence_not_allowlisted "Only generated mesh-evidence.json may be retained."
+    chmod 600 "$RUN_DIR/evidence/mesh-evidence.json"
+    printf 'mesh_hardware_gate_evidence=%s\n' "$RUN_DIR/evidence/mesh-evidence.json"
+    exit 0
+fi
+
 [ "$(uname -s)" = Darwin ] || repair not_macos "Run scripts/mac-hardware-gate.sh on the paired Mac."
+[ "$(uname -m)" = arm64 ] || repair wrong_architecture "Run this gate on the approved Darwin arm64 Mac."
 [ -d "$PROJECT" ] || repair missing_project "Re-run scripts/setup-mac.sh --upgrade on the Mac."
 DEVELOPER_DIR=$(/usr/bin/xcode-select -p 2>/dev/null) || repair xcode_missing "Install Xcode, open it once, then run sudo xcode-select -s /Applications/Xcode.app/Contents/Developer."
 XCODEBUILD=$(/usr/bin/xcrun --find xcodebuild 2>/dev/null) || repair xcodebuild_missing "Install the selected Xcode command-line tools."

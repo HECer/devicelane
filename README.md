@@ -319,26 +319,33 @@ release evidence.
 
 Start the gate on the Mac before submitting the matching operation from Windows. The expected
 operation must request both `workspace_read` and `device_lease`, be approved on the Mac, survive a
-disconnect/reconnect, and reach a terminal state. The script refuses fixture mode and writes only
-redacted metadata: identifiers and the controller address are stored as SHA-256 pseudonyms, while
-raw local audit databases, identity files, bearer values, and private keys are never copied.
+disconnect/reconnect plus an explicit cursor resynchronization, and reach a terminal state. The
+script requires Darwin arm64, an authenticated trusted controller session, and the exact binary,
+SHA-256, and version from the approved build manifest. It refuses fixture mode and writes exactly
+one generated allow-listed JSON file containing only redacted metadata. Identifiers and the controller address are SHA-256
+pseudonyms; raw logs, xcresults, screenshots, audit databases, identities, and secrets are never
+copied or archived by the mesh gate.
 
 ```sh
 DEVICELANE_REAL_MESH_GATE=1 sh ./scripts/mac-hardware-gate.sh \
   --mesh-controller "<WINDOWS_CONTROLLER_HOST>:7443" \
+  --controller-peer-id windows-controller \
   --mesh-endpoint "$TMPDIR/devicelane/devicelane.sock" \
   --windows-principal codex-windows \
   --windows-source-host windows-controller \
   --mesh-activity-id release-gate-20260902 \
-  --device PHYSICAL_IPHONE_UDID \
-  --team APPLE_TEAM_ID
+  --devicelane-binary /absolute/path/to/devicelane \
+  --devicelane-sha256 "<APPROVED_LOWERCASE_SHA256>" \
+  --devicelane-version "devicelane 0.1.0"
 ```
 
 The mesh gate is green only when it observes the Windows principal/source in a target-local
 approval, live activity through the CLI stream, explicit nonzero-or-unavailable metrics,
-`reconnecting` or `resync_required`, a terminal result, and the corresponding redacted audit
-record. If SSH or the DeviceLane ports are unavailable, report the physical gate as blocked; never
-replace it with a fixture pass.
+both a real `reconnecting` transition and `resync_required` recovery through a fresh snapshot and
+replacement epoch/cursor, a terminal result, and exact canonical audit equality. Evidence contains
+only the canonical audit digest and redacted allow-listed metadata. If the authenticated DeviceLane
+session is unavailable, report the physical gate as blocked; never replace it with TCP reachability
+or a fixture pass.
 
 For Yoke-managed work, `passes: true` is valid only when the mapped **story-spezifische Akzeptanzprüfung** also passes. The global quality gate additionally runs the complete workspace tests, Clippy with warnings denied, and the formatting check.
 
