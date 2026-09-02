@@ -615,13 +615,14 @@ fn forged_workspace_lease_and_grant_cannot_run_a_mutation_but_observer_reads_eve
 
 #[test]
 fn expired_writer_finishes_before_the_promoted_writer_starts() {
-    let harness = Harness::start(Duration::from_millis(3_000));
-    let first = acquire(&harness, &harness.client_a, 2_000);
+    let harness = Harness::start(Duration::from_millis(5_000));
+    let first = acquire(&harness, &harness.client_a, 30_000);
+    let first_id = grant_id(&first);
     let first_job = cli_json(
         &harness.address,
         &harness.client_a,
         "apple-run",
-        &apple_request("slow-a", &grant_id(&first)),
+        &apple_request("slow-a", &first_id),
     )["job_id"]
         .as_str()
         .unwrap()
@@ -644,6 +645,16 @@ fn expired_writer_finishes_before_the_promoted_writer_starts() {
         )["lease_status"],
         "queued"
     );
+
+    let renewed = lease(
+        &harness.address,
+        &harness.client_a,
+        &LeaseRequest::Renew {
+            lease_id: first_id,
+            lifetime_ms: 2_000,
+        },
+    );
+    assert_eq!(renewed["lease_status"], "renewed", "{renewed}");
 
     thread::sleep(Duration::from_millis(2_050));
     let promoted = wait_for_current_grant(&harness, &harness.client_b);
@@ -958,12 +969,18 @@ fn fake_tool(root: &Path, name: &str, marker: &Path, mutation_delay: Duration) -
     #[cfg(windows)]
     {
         let path = root.join(format!("{name}.cmd"));
+        let delay_command = if mutation_delay.is_zero() {
+            "rem no mutation delay".to_owned()
+        } else {
+            let ping_count = mutation_delay.as_millis().div_ceil(1_000) + 1;
+            format!("ping.exe -n {ping_count} 127.0.0.1 >nul")
+        };
         std::fs::write(
             &path,
             format!(
-                "@echo off\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"install\" goto mutation\r\nif \"%1\"==\"-version\" goto version\r\nif \"{name}\"==\"devicectl\" if \"%1\"==\"list\" goto devices\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"list\" goto simulators\r\necho tool-output {name} %*\r\nexit /b 0\r\n:mutation\r\necho mutation-start>>\"{}\"\r\npowershell.exe -NoProfile -Command \"Start-Sleep -Milliseconds {}\"\r\necho mutation-end>>\"{}\"\r\necho installed\r\nexit /b 0\r\n:version\r\necho Xcode 16\r\nexit /b 0\r\n:devices\r\necho {{\"result\":{{\"devices\":[]}}}}\r\nexit /b 0\r\n:simulators\r\necho {{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}\r\nexit /b 0\r\n",
+                "@echo off\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"install\" goto mutation\r\nif \"%1\"==\"-version\" goto version\r\nif \"{name}\"==\"devicectl\" if \"%1\"==\"list\" goto devices\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"list\" goto simulators\r\necho tool-output {name} %*\r\nexit /b 0\r\n:mutation\r\necho mutation-start>>\"{}\"\r\n{}\r\necho mutation-end>>\"{}\"\r\necho installed\r\nexit /b 0\r\n:version\r\necho Xcode 16\r\nexit /b 0\r\n:devices\r\necho {{\"result\":{{\"devices\":[]}}}}\r\nexit /b 0\r\n:simulators\r\necho {{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}\r\nexit /b 0\r\n",
                 marker.display(),
-                mutation_delay.as_millis(),
+                delay_command,
                 marker.display()
             ),
         )
@@ -1008,8 +1025,12 @@ fn cli<T: serde::Serialize>(address: &str, identity: &Path, command: &str, body:
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {
             child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("mesh-cli timed out");
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "mesh-cli {command} timed out after five seconds; status={}; stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         thread::sleep(Duration::from_millis(10));
     }
