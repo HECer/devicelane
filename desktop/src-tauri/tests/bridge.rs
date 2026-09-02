@@ -1,5 +1,7 @@
 use device_development_mesh::dashboard::event_log::EventRead;
-use device_development_mesh::dashboard::{EventCursor, SubscriberId};
+use device_development_mesh::dashboard::{
+    DashboardScope, DashboardSnapshot, EventCursor, SubscriberId,
+};
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, LocalProtocolVersion, LocalRequest, LocalResponse,
 };
@@ -165,6 +167,37 @@ fn dashboard_bridge_uses_typed_versioned_requests_and_preserves_resync_details()
                 sequence: 0
             },
             limit: 100,
+        }]
+    );
+}
+
+#[test]
+fn dashboard_snapshot_bridge_uses_the_typed_scope_and_response() {
+    let requests = Arc::new(Mutex::new(vec![]));
+    let snapshot = DashboardSnapshot {
+        revision: 7,
+        generated_at_ms: 42,
+        scope: DashboardScope::Mesh,
+        hosts: vec![],
+        activities: vec![],
+        leases: vec![],
+        pending_approvals: vec![],
+        warnings: vec![],
+    };
+    let bridge = DesktopBridge::new(FakeTransport {
+        requests: Arc::clone(&requests),
+        response: LocalResponse::DashboardSnapshot(snapshot.clone()),
+    });
+
+    assert_eq!(
+        bridge.dashboard_snapshot(DashboardScope::Mesh).unwrap(),
+        snapshot
+    );
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![LocalRequest::DashboardSnapshot {
+            version: LocalProtocolVersion::CURRENT,
+            scope: DashboardScope::Mesh,
         }]
     );
 }
