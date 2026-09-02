@@ -184,6 +184,30 @@ fn rejects_tampering_unknown_artifacts_invalid_offsets_and_non_participants() {
 }
 
 #[test]
+fn cli_reports_unknown_artifact_without_panicking() {
+    let setup = Setup::new();
+    let cli_identity = setup._root.path().join("cli");
+    let output = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
+        .args([
+            "--registry",
+            &setup.address,
+            "--identity",
+            cli_identity.to_str().unwrap(),
+            "artifact-download",
+            "--json-request",
+            r#"{"artifact_id":"missing"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        r#"{"error":"unknown_artifact"}"#
+    );
+}
+
+#[test]
 fn aggregate_hash_failure_does_not_confirm_or_publish_the_final_chunk() {
     let setup = Setup::new();
     let contents = b"abcdefgh";

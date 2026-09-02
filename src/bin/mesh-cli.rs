@@ -87,15 +87,21 @@ fn main() {
     if a.iter().any(|item| item == "artifact-download") {
         let body: serde_json::Value = serde_json::from_str(&value(&a, "--json-request")).unwrap();
         let artifact_id = body["artifact_id"].as_str().unwrap();
-        let metadata = registry_rpc(
+        let response = registry_rpc(
             &address,
             &transport,
             Request::ArtifactInfo {
                 artifact_id: artifact_id.into(),
             },
-        )
-        .artifact_metadata
-        .unwrap();
+        );
+        let metadata = response.artifact_metadata.unwrap_or_else(|| {
+            exit_with_error(
+                response
+                    .error
+                    .as_deref()
+                    .unwrap_or("artifact_metadata_unavailable"),
+            )
+        });
         let mut bytes = Vec::new();
         while bytes.len() < metadata.total_size as usize {
             let response = registry_rpc(
@@ -109,9 +115,22 @@ fn main() {
                     sha256: metadata.sha256.clone(),
                 },
             );
-            bytes.extend(response.artifact_chunk.unwrap().bytes);
+            let chunk = response.artifact_chunk.unwrap_or_else(|| {
+                exit_with_error(
+                    response
+                        .error
+                        .as_deref()
+                        .unwrap_or("artifact_chunk_unavailable"),
+                )
+            });
+            if chunk.offset != bytes.len() as u64 || chunk.bytes.is_empty() {
+                exit_with_error("artifact_chunk_invalid");
+            }
+            bytes.extend(chunk.bytes);
         }
-        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), metadata.sha256);
+        if format!("{:x}", Sha256::digest(&bytes)) != metadata.sha256 {
+            exit_with_error("artifact_hash_mismatch");
+        }
         println!(
             "{}",
             serde_json::json!({"bytes": bytes, "sha256": metadata.sha256})
@@ -197,6 +216,11 @@ fn registry_rpc(address: &str, transport: &SecureTransport, request: Request) ->
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).unwrap();
     serde_json::from_str(&line).unwrap()
+}
+
+fn exit_with_error(code: &str) -> ! {
+    eprintln!("{}", serde_json::json!({"error": code}));
+    std::process::exit(1)
 }
 
 fn run_hardware_gate(args: &[String], address: &str, transport: &SecureTransport) {
