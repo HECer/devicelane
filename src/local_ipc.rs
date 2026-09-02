@@ -1072,6 +1072,7 @@ fn dispatch_connection(
                             | LocalRequest::DeletePolicyRuleIfRevision { .. }
                             | LocalRequest::AuditQuery { .. }
                             | LocalRequest::AuditExport { .. }
+                            | LocalRequest::AuditExportManifest { .. }
                             | LocalRequest::AuditDelete { .. }
                             | LocalRequest::CancelActivity { .. }
                             | LocalRequest::PauseRemoteAccessWithJobs { .. }

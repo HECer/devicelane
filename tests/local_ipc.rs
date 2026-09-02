@@ -612,6 +612,17 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
     assert!(
         matches!(send_eventually(&endpoint, &LocalRequest::AuditExport { version: LocalProtocolVersion::CURRENT, filter: AuditFilter::default() }), LocalResponse::AuditExport(export) if !export.records.is_empty())
     );
+    let export_manifest = send_eventually(
+        &endpoint,
+        &LocalRequest::AuditExportManifest {
+            version: LocalProtocolVersion::CURRENT,
+            filter: AuditFilter::default(),
+        },
+    );
+    assert!(
+        matches!(&export_manifest, LocalResponse::AuditExportManifest(manifest) if manifest.record_count > 0 && !manifest.records_sha256.is_empty()),
+        "unexpected export manifest response: {export_manifest:?}"
+    );
     approve_once(
         &endpoint,
         &admin_access(
