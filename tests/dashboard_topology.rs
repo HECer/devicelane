@@ -48,6 +48,60 @@ fn connect(projector: &mut TopologyProjector, session: &str, epoch: u64) {
 }
 
 #[test]
+fn normalized_snapshot_text_is_bounded_before_normalization() {
+    let mut oversized_os = host("local", "online", &[]);
+    oversized_os.operating_system = format!("{}linux", " ".repeat(128));
+    let mut projector = TopologyProjector::new();
+    assert_eq!(
+        projector
+            .observe_local(1, 1, oversized_os)
+            .unwrap_err()
+            .kind(),
+        TopologyErrorKind::InvalidField
+    );
+
+    let mut oversized_arch = host("local", "online", &[]);
+    oversized_arch.architecture = format!("{}arm64", " ".repeat(128));
+    assert_eq!(
+        projector
+            .observe_local(1, 1, oversized_arch)
+            .unwrap_err()
+            .kind(),
+        TopologyErrorKind::InvalidField
+    );
+
+    let mut oversized_status = host("local", "online", &[]);
+    oversized_status.status = format!("{}online", " ".repeat(4096));
+    assert_eq!(
+        projector
+            .observe_local(1, 1, oversized_status)
+            .unwrap_err()
+            .kind(),
+        TopologyErrorKind::InvalidField
+    );
+
+    let mut oversized_device = host("local", "online", &[("phone", "iOS", "online")]);
+    oversized_device.devices[0].platform = format!("{}ios", " ".repeat(128));
+    assert_eq!(
+        projector
+            .observe_local(1, 1, oversized_device)
+            .unwrap_err()
+            .kind(),
+        TopologyErrorKind::InvalidField
+    );
+
+    let mut oversized_device_state = host("local", "online", &[("phone", "iOS", "online")]);
+    oversized_device_state.devices[0].state = format!("{}online", " ".repeat(4096));
+    assert_eq!(
+        projector
+            .observe_local(1, 1, oversized_device_state)
+            .unwrap_err()
+            .kind(),
+        TopologyErrorKind::InvalidField
+    );
+}
+
+#[test]
 fn hybrid_projection_is_stable_and_local_host_wins() {
     let mut projector = TopologyProjector::new();
     connect(&mut projector, "registry-a", 1);

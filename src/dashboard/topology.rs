@@ -516,6 +516,9 @@ fn project_host(
     freshness: Freshness,
     observed_at_ms: u64,
 ) -> Result<DashboardHost, TopologyError> {
+    validate_code_input("operating_system", &snapshot.operating_system)?;
+    validate_code_input("architecture", &snapshot.architecture)?;
+    validate_raw_text("status", &snapshot.status)?;
     ensure_limit("devices", snapshot.devices.len())?;
     ensure_limit("capabilities", snapshot.capabilities.len())?;
     ensure_limit("permissions", permissions.len())?;
@@ -582,6 +585,8 @@ fn project_device(
     freshness: Freshness,
     observed_at_ms: u64,
 ) -> Result<DashboardDevice, TopologyError> {
+    validate_code_input("device_platform", &snapshot.platform)?;
+    validate_raw_text("device_state", &snapshot.state)?;
     let id = DeviceId::parse(snapshot.id.clone())
         .map_err(|error| invalid("device_id", error.to_string()))?;
     let (display_name, capabilities, permissions) = details.map_or_else(
@@ -677,6 +682,20 @@ fn validate_display(field: &'static str, value: &str) -> Result<(), TopologyErro
 
 fn validate_code_inputs(field: &'static str, values: &[String]) -> Result<(), TopologyError> {
     if let Some(value) = values.iter().find(|value| value.len() > 128) {
+        return Err(invalid(field, value.len().to_string()));
+    }
+    Ok(())
+}
+
+fn validate_code_input(field: &'static str, value: &str) -> Result<(), TopologyError> {
+    if value.len() > 128 {
+        return Err(invalid(field, value.len().to_string()));
+    }
+    Ok(())
+}
+
+fn validate_raw_text(field: &'static str, value: &str) -> Result<(), TopologyError> {
+    if value.len() > MAX_TEXT_BYTES {
         return Err(invalid(field, value.len().to_string()));
     }
     Ok(())

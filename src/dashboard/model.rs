@@ -70,12 +70,12 @@ pub struct ValidatedId(String);
 impl ValidatedId {
     pub fn parse(value: impl Into<String>) -> Result<Self, ValidationError> {
         let value = value.into();
+        if value.len() > MAX_ID_BYTES {
+            return Err(ValidationError::at("id_too_long", "id"));
+        }
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return Err(ValidationError::at("empty_id", "id"));
-        }
-        if trimmed.len() > MAX_ID_BYTES {
-            return Err(ValidationError::at("id_too_long", "id"));
         }
         Ok(Self(trimmed.to_owned()))
     }
