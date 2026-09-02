@@ -6,7 +6,7 @@ use crate::dashboard::model::{
 };
 use crate::dashboard::model::{ApprovalDecision, ApprovalRequest, PolicyRule};
 use crate::dashboard::policy::{AccessRequest, PolicyEngine};
-use crate::dashboard::service::{DashboardService, ExistingJobs};
+use crate::dashboard::service::{AdminMutation, DashboardService, ExistingJobs};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 use std::io::{BufRead, Write};
@@ -85,6 +85,11 @@ pub enum LocalRequest {
     RequestApproval {
         version: LocalProtocolVersion,
         access: AccessRequest,
+        lifetime_ms: u64,
+    },
+    RequestAdminMutationApproval {
+        version: LocalProtocolVersion,
+        mutation: AdminMutation,
         lifetime_ms: u64,
     },
     DecideApproval {
@@ -171,6 +176,7 @@ impl LocalRequest {
             | Self::SetAutostart { version, .. }
             | Self::Diagnostics { version }
             | Self::RequestApproval { version, .. }
+            | Self::RequestAdminMutationApproval { version, .. }
             | Self::DecideApproval { version, .. }
             | Self::DecidePendingApproval { version, .. }
             | Self::DashboardSnapshot { version, .. }
@@ -583,6 +589,9 @@ impl DaemonState {
             | LocalRequest::PauseRemoteAccessWithJobs { .. } => {
                 Err(LocalProtocolError::Unauthorized)
             }
+            LocalRequest::RequestAdminMutationApproval { .. } => {
+                Err(LocalProtocolError::Unauthorized)
+            }
         }
     }
 
@@ -632,6 +641,22 @@ impl DaemonState {
                 Ok(LocalResponse::ApprovalCreated {
                     nonce: approval.nonce,
                     expires_at_ms: approval.expires_at_ms,
+                })
+            }
+            LocalRequest::RequestAdminMutationApproval {
+                mutation,
+                lifetime_ms,
+                ..
+            } => {
+                let (nonce, expires_at_ms) = self
+                    .dashboard
+                    .as_mut()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .request_admin_mutation_approval(mutation, lifetime_ms, now_ms)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::ApprovalCreated {
+                    nonce,
+                    expires_at_ms,
                 })
             }
             LocalRequest::DecideApproval {
@@ -793,15 +818,11 @@ impl DaemonState {
                 Ok(LocalResponse::AuditExport(export))
             }
             LocalRequest::AuditDelete { scope, filter, .. } => {
-                let effective_filter = match scope {
-                    AuditDeletionScope::CurrentFilter => filter,
-                    AuditDeletionScope::AllRetained => AuditFilter::default(),
-                };
                 let deleted = self
                     .dashboard
                     .as_mut()
                     .ok_or(LocalProtocolError::FeatureUnavailable)?
-                    .delete_audit(effective_filter, now_ms)
+                    .delete_audit_exact(scope, filter, now_ms)
                     .map_err(map_dashboard_error)?;
                 Ok(LocalResponse::AuditDeleted { deleted })
             }
@@ -1020,6 +1041,7 @@ fn dispatch_connection(
                     if matches!(
                         request,
                         LocalRequest::RequestApproval { .. }
+                            | LocalRequest::RequestAdminMutationApproval { .. }
                             | LocalRequest::DecideApproval { .. }
                             | LocalRequest::DecidePendingApproval { .. }
                             | LocalRequest::DashboardSnapshot { .. }

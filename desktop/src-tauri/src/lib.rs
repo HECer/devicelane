@@ -1,6 +1,7 @@
 use command_group::CommandGroup;
 use device_development_mesh::dashboard::audit::{AuditDeletionScope, AuditExport, AuditFilter};
 use device_development_mesh::dashboard::event_log::EventRead;
+use device_development_mesh::dashboard::service::AdminMutation;
 use device_development_mesh::dashboard::{
     ApprovalDecision, ApprovalId, ApprovalRequest, AuditRecord, CursorPage, DashboardScope,
     DashboardSnapshot, EventCursor, PolicyRule, RuleId, SubscriberId,
@@ -259,6 +260,19 @@ impl<T: DaemonTransport> DesktopBridge<T> {
             version: LocalProtocolVersion::CURRENT,
             rule,
         })
+    }
+
+    pub fn request_admin_mutation_approval(&self, mutation: AdminMutation) -> Result<(), String> {
+        match self
+            .transport
+            .send(LocalRequest::RequestAdminMutationApproval {
+                version: LocalProtocolVersion::CURRENT,
+                mutation,
+                lifetime_ms: 5 * 60 * 1_000,
+            })? {
+            LocalResponse::ApprovalCreated { .. } => Ok(()),
+            response => Err(unexpected_response(response)),
+        }
     }
 
     pub fn delete_policy_rule(
@@ -771,6 +785,55 @@ fn put_policy_rule(
 }
 
 #[tauri::command]
+fn request_admin_policy_put(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    rule: PolicyRule,
+    expected_revision: String,
+) -> Result<(), String> {
+    let result = parse_u64_decimal("expected_revision", expected_revision).and_then(|revision| {
+        bridge.request_admin_mutation_approval(AdminMutation::PolicyPut {
+            rule,
+            expected_revision: revision,
+        })
+    });
+    report(&app, result)
+}
+
+#[tauri::command]
+fn request_admin_policy_delete(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    rule_id: String,
+    expected_revision: String,
+) -> Result<(), String> {
+    let result = RuleId::parse(rule_id)
+        .map_err(|error| format!("invalid rule_id: {error}"))
+        .and_then(|rule_id| {
+            parse_u64_decimal("expected_revision", expected_revision).and_then(|revision| {
+                bridge.request_admin_mutation_approval(AdminMutation::PolicyDelete {
+                    rule_id,
+                    expected_revision: revision,
+                })
+            })
+        });
+    report(&app, result)
+}
+
+#[tauri::command]
+fn request_admin_audit_delete(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    scope: AuditDeletionScope,
+    filter: AuditFilter,
+) -> Result<(), String> {
+    report(
+        &app,
+        bridge.request_admin_mutation_approval(AdminMutation::AuditDelete { scope, filter }),
+    )
+}
+
+#[tauri::command]
 fn delete_policy_rule(
     app: AppHandle,
     bridge: State<'_, AppBridge>,
@@ -929,6 +992,9 @@ pub fn run() {
             decide_approval,
             policy_rules,
             put_policy_rule,
+            request_admin_policy_put,
+            request_admin_policy_delete,
+            request_admin_audit_delete,
             delete_policy_rule,
             audit_query,
             audit_export,

@@ -1,5 +1,5 @@
 use device_development_mesh::dashboard::audit::AuditFilter;
-use device_development_mesh::dashboard::service::ExistingJobs;
+use device_development_mesh::dashboard::service::{AdminMutation, ExistingJobs};
 use device_development_mesh::dashboard::{
     ActivityId, ActivityState, ApprovalDecision, DashboardScope, EventCursor, HostId, OperationId,
     PolicyEffect, PolicyOrigin, PolicyRule, PrincipalId, ResourceClass, RuleId, SubscriberId,
@@ -67,6 +67,48 @@ fn approve_once(
                 version: LocalProtocolVersion::CURRENT,
                 nonce,
                 access: access.clone(),
+                decision: ApprovalDecision::AllowOnce,
+            }
+        )
+        .unwrap(),
+        LocalResponse::ApprovalDecided { .. }
+    ));
+}
+
+#[cfg(windows)]
+fn approve_admin_mutation_once(
+    endpoint: &device_development_mesh::local_ipc::LocalEndpoint,
+    mutation: AdminMutation,
+) {
+    assert!(matches!(
+        send_local_request(
+            endpoint,
+            &LocalRequest::RequestAdminMutationApproval {
+                version: LocalProtocolVersion::CURRENT,
+                mutation,
+                lifetime_ms: 60_000,
+            }
+        )
+        .unwrap(),
+        LocalResponse::ApprovalCreated { .. }
+    ));
+    let approval_id = match send_local_request(
+        endpoint,
+        &LocalRequest::PendingApprovals {
+            version: LocalProtocolVersion::CURRENT,
+        },
+    )
+    .unwrap()
+    {
+        LocalResponse::PendingApprovals(mut approvals) => approvals.remove(0).id,
+        response => panic!("unexpected pending approvals response: {response:?}"),
+    };
+    assert!(matches!(
+        send_local_request(
+            endpoint,
+            &LocalRequest::DecidePendingApproval {
+                version: LocalProtocolVersion::CURRENT,
+                approval_id,
                 decision: ApprovalDecision::AllowOnce,
             }
         )
@@ -500,14 +542,12 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         .unwrap(),
         LocalResponse::PolicyRules(_)
     ));
-    approve_once(
+    approve_admin_mutation_once(
         &endpoint,
-        &admin_access(
-            "admin-put",
-            "devicelane.policy.put",
-            ResourceClass::DeviceLanePolicy,
-            &public_identity,
-        ),
+        AdminMutation::PolicyPut {
+            rule: user_rule(),
+            expected_revision: 0,
+        },
     );
     assert!(matches!(
         send_local_request(
@@ -547,21 +587,20 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
     assert!(
         matches!(send_local_request(&endpoint, &LocalRequest::DecideApproval { version: LocalProtocolVersion::CURRENT, nonce: expiring_nonce, access: expiring, decision: ApprovalDecision::AllowOnce }).unwrap(), LocalResponse::Error { code, .. } if code == "approval_expired")
     );
-    approve_once(
+    approve_admin_mutation_once(
         &endpoint,
-        &admin_access(
-            "admin-delete",
-            "devicelane.policy.delete",
-            ResourceClass::DeviceLanePolicy,
-            &public_identity,
-        ),
+        AdminMutation::PolicyDelete {
+            rule_id: RuleId::parse("ipc-rule").unwrap(),
+            expected_revision: 1,
+        },
     );
     assert!(matches!(
         send_local_request(
             &endpoint,
-            &LocalRequest::DeletePolicyRule {
+            &LocalRequest::DeletePolicyRuleIfRevision {
                 version: LocalProtocolVersion::CURRENT,
-                rule_id: RuleId::parse("ipc-rule").unwrap()
+                rule_id: RuleId::parse("ipc-rule").unwrap(),
+                expected_revision: 1,
             }
         )
         .unwrap(),

@@ -297,6 +297,28 @@ async function invokeWithSignal<T>(command: string, args: Record<string, unknown
   return value;
 }
 
+async function invokeAdminMutation(
+  command: string,
+  args: Record<string, unknown>,
+  approvalCommand: string,
+  approvalArgs: Record<string, unknown>,
+  signal?: AbortSignal
+) {
+  try {
+    await invokeWithSignal<void>(command, args, signal);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes("permission_denied")) throw error;
+    await invokeWithSignal<void>(approvalCommand, approvalArgs, signal);
+    throw new Error("Exakte Administratorfreigabe angefordert. Nach der Bestätigung erneut ausführen.");
+  }
+}
+
+function previousRevision(revision: U64Decimal) {
+  const value = BigInt(revision);
+  return (value > 0n ? value - 1n : 0n).toString();
+}
+
 export const tauriDaemonClient: DaemonClient = {
   status: () => invoke<DaemonSnapshot>("daemon_status"),
   pause: () => invoke("pause_remote_access"),
@@ -310,11 +332,11 @@ export const tauriDaemonClient: DaemonClient = {
   pendingApprovals: (signal) => invokeWithSignal("pending_approvals", {}, signal),
   decideApproval: (approvalId, decision, signal) => invokeWithSignal("decide_approval", { approvalId, decision }, signal),
   policyRules: (signal) => invokeWithSignal("policy_rules", {}, signal),
-  putPolicyRule: (rule, signal) => invokeWithSignal("put_policy_rule", { rule }, signal),
-  deletePolicyRule: (ruleId, expectedRevision, signal) => invokeWithSignal("delete_policy_rule", { ruleId, expectedRevision }, signal),
+  putPolicyRule: (rule, signal) => invokeAdminMutation("put_policy_rule", { rule }, "request_admin_policy_put", { rule, expectedRevision: previousRevision(rule.revision) }, signal),
+  deletePolicyRule: (ruleId, expectedRevision, signal) => invokeAdminMutation("delete_policy_rule", { ruleId, expectedRevision }, "request_admin_policy_delete", { ruleId, expectedRevision }, signal),
   auditQuery: (filter, cursor, limit, signal) => invokeWithSignal("audit_query", { filter, cursor, limit }, signal),
   auditExport: (filter, signal) => invokeWithSignal("audit_export", { filter }, signal),
-  deleteAudit: (scope, filter, signal) => invokeWithSignal("delete_audit", { scope, filter }, signal),
+  deleteAudit: (scope, filter, signal) => invokeAdminMutation("delete_audit", { scope, filter }, "request_admin_audit_delete", { scope, filter }, signal),
   notifyPendingApproval: (approvalId, signal) => invokeWithSignal("notify_pending_approval", { approvalId }, signal),
   onOpenApproval: (listener) => listen<string>("open-approval", (event) => listener(event.payload))
 };

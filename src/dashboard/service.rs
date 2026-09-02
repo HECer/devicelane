@@ -1,6 +1,6 @@
 use super::audit::{
-    AuditError, AuditExport, AuditFilter, AuditSigner, AuditStore, RawAuditRecord,
-    read_activity_checkpoint, write_activity_checkpoint,
+    AuditDeletionScope, AuditError, AuditExport, AuditFilter, AuditSigner, AuditStore,
+    RawAuditRecord, read_activity_checkpoint, write_activity_checkpoint,
 };
 use super::event_log::{
     AcknowledgeError, AppendTransactionError, EventJournal, EventRead, ReadLimit,
@@ -23,6 +23,46 @@ use std::sync::{Arc, Mutex};
 pub enum ExistingJobs {
     Finish,
     Cancel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mutation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AdminMutation {
+    PolicyPut {
+        rule: PolicyRule,
+        expected_revision: u64,
+    },
+    PolicyDelete {
+        rule_id: RuleId,
+        expected_revision: u64,
+    },
+    AuditDelete {
+        scope: AuditDeletionScope,
+        filter: AuditFilter,
+    },
+}
+
+impl AdminMutation {
+    fn digest(&self) -> Result<String, DashboardServiceError> {
+        let canonical =
+            serde_json::to_vec(self).map_err(|_| DashboardServiceError::InvalidRequest)?;
+        Ok(Sha256::digest(canonical)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    fn operation_and_resource(&self) -> (&'static str, ResourceClass) {
+        match self {
+            Self::PolicyPut { .. } => ("devicelane.policy.put", ResourceClass::DeviceLanePolicy),
+            Self::PolicyDelete { .. } => {
+                ("devicelane.policy.delete", ResourceClass::DeviceLanePolicy)
+            }
+            Self::AuditDelete { .. } => {
+                ("devicelane.audit.delete", ResourceClass::DeviceLanePolicy)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,12 +99,16 @@ struct Pending {
     nonce: String,
     request: ApprovalRequest,
     access: AccessRequest,
+    #[serde(default)]
+    admin_mutation_digest: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AdminGrant {
     access: AccessRequest,
     expires_at_ms: u64,
+    #[serde(default)]
+    admin_mutation_digest: Option<String>,
 }
 
 pub struct DashboardService {
@@ -374,6 +418,7 @@ impl DashboardService {
                 risk: super::SafeCode::parse("target_confirmation").expect("constant safe code"),
             },
             access: access.clone(),
+            admin_mutation_digest: None,
         };
         let sequence = self
             .activities
@@ -412,6 +457,53 @@ impl DashboardService {
             return Err(error);
         }
         Ok((challenge.nonce, challenge.expires_at_ms))
+    }
+
+    pub fn request_admin_mutation_approval(
+        &mut self,
+        mutation: AdminMutation,
+        lifetime_ms: u64,
+        now_ms: u64,
+    ) -> Result<(String, u64), DashboardServiceError> {
+        let digest = mutation.digest()?;
+        let (operation, resource) = mutation.operation_and_resource();
+        let access = AccessRequest {
+            activity_id: ActivityId::parse(format!("admin-{}", &digest[..16]))
+                .map_err(|_| DashboardServiceError::InvalidRequest)?,
+            principal_id: PrincipalId::parse("local-user").expect("constant id"),
+            source_host_id: self.local_host_id.clone(),
+            target_host_id: self.local_host_id.clone(),
+            device_id: None,
+            operation: OperationId::parse(operation)
+                .map_err(|_| DashboardServiceError::InvalidRequest)?,
+            resources: vec![resource],
+            physical_device: false,
+            user_present: true,
+        };
+        let created = self.request_approval(access, lifetime_ms, now_ms)?;
+        let pending = self
+            .pending
+            .values_mut()
+            .find(|pending| pending.nonce == created.0)
+            .ok_or(DashboardServiceError::InvalidRequest)?;
+        pending.admin_mutation_digest = Some(digest);
+        if let Err(error) = self.persist_state(
+            &self.activities,
+            &self.pending,
+            &self.admin_grants,
+            &self.policy,
+            self.paused,
+        ) {
+            if let Some(pending) = self
+                .pending
+                .values_mut()
+                .find(|pending| pending.nonce == created.0)
+            {
+                pending.admin_mutation_digest = None;
+            }
+            return Err(error);
+        }
+        Ok(created)
     }
 
     pub fn decide_approval(
@@ -457,6 +549,10 @@ impl DashboardService {
             }
         };
         let approval_id = pending_id.clone();
+        let admin_mutation_digest = pending_id
+            .as_ref()
+            .and_then(|id| self.pending.get(id))
+            .and_then(|pending| pending.admin_mutation_digest.clone());
         let state = if effect == PolicyEffect::Deny {
             ActivityState::Denied
         } else {
@@ -490,6 +586,7 @@ impl DashboardService {
                 AdminGrant {
                     access: access.clone(),
                     expires_at_ms: now_ms.saturating_add(5 * 60 * 1_000),
+                    admin_mutation_digest,
                 },
             );
         }
@@ -550,11 +647,39 @@ impl DashboardService {
         rule: PolicyRule,
         now_ms: u64,
     ) -> Result<(), DashboardServiceError> {
+        let expected_revision = rule.revision.saturating_sub(1);
+        self.put_policy_rule_exact(rule, expected_revision, now_ms)
+    }
+
+    pub fn put_policy_rule_exact(
+        &mut self,
+        rule: PolicyRule,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> Result<(), DashboardServiceError> {
+        let mutation = AdminMutation::PolicyPut {
+            rule: rule.clone(),
+            expected_revision,
+        };
+        let digest = mutation.digest()?;
         self.authorize_admin(
             "devicelane.policy.put",
             ResourceClass::DeviceLanePolicy,
+            Some(&digest),
             now_ms,
         )?;
+        match self
+            .policy
+            .rules()
+            .iter()
+            .find(|current| current.id == rule.id)
+        {
+            Some(current) if current.revision != expected_revision => {
+                return Err(DashboardServiceError::RevisionConflict);
+            }
+            None if expected_revision != 0 => return Err(DashboardServiceError::RevisionConflict),
+            _ => {}
+        }
         self.audit_local("policy-put", AuditResult::Attempted, now_ms)?;
         let mut next_policy = self.policy.clone();
         if next_policy.put_user_rule(rule).is_err() {
@@ -575,11 +700,54 @@ impl DashboardService {
         id: &RuleId,
         now_ms: u64,
     ) -> Result<bool, DashboardServiceError> {
+        let mutation = AdminMutation::PolicyDelete {
+            rule_id: id.clone(),
+            expected_revision: 0,
+        };
+        let digest = mutation.digest()?;
         self.authorize_admin(
             "devicelane.policy.delete",
             ResourceClass::DeviceLanePolicy,
+            Some(&digest),
             now_ms,
         )?;
+        self.delete_policy_rule_authorized(id, now_ms)
+    }
+
+    fn delete_policy_rule_exact(
+        &mut self,
+        id: &RuleId,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> Result<bool, DashboardServiceError> {
+        let mutation = AdminMutation::PolicyDelete {
+            rule_id: id.clone(),
+            expected_revision,
+        };
+        let digest = mutation.digest()?;
+        self.authorize_admin(
+            "devicelane.policy.delete",
+            ResourceClass::DeviceLanePolicy,
+            Some(&digest),
+            now_ms,
+        )?;
+        let current = self
+            .policy
+            .rules()
+            .iter()
+            .find(|rule| &rule.id == id)
+            .ok_or(DashboardServiceError::NotFound)?;
+        if current.revision != expected_revision {
+            return Err(DashboardServiceError::RevisionConflict);
+        }
+        self.delete_policy_rule_authorized(id, now_ms)
+    }
+
+    fn delete_policy_rule_authorized(
+        &mut self,
+        id: &RuleId,
+        now_ms: u64,
+    ) -> Result<bool, DashboardServiceError> {
         self.audit_local("policy-delete", AuditResult::Attempted, now_ms)?;
         let mut next_policy = self.policy.clone();
         let deleted = match next_policy.delete_user_rule(id) {
@@ -604,16 +772,7 @@ impl DashboardService {
         expected_revision: u64,
         now_ms: u64,
     ) -> Result<bool, DashboardServiceError> {
-        let current = self
-            .policy
-            .rules()
-            .iter()
-            .find(|rule| &rule.id == id)
-            .ok_or(DashboardServiceError::NotFound)?;
-        if current.revision != expected_revision {
-            return Err(DashboardServiceError::RevisionConflict);
-        }
-        self.delete_policy_rule(id, now_ms)
+        self.delete_policy_rule_exact(id, expected_revision, now_ms)
     }
 
     pub fn audit_query(
@@ -646,15 +805,34 @@ impl DashboardService {
         filter: AuditFilter,
         now_ms: u64,
     ) -> Result<usize, DashboardServiceError> {
+        self.delete_audit_exact(AuditDeletionScope::CurrentFilter, filter, now_ms)
+    }
+
+    pub fn delete_audit_exact(
+        &mut self,
+        scope: AuditDeletionScope,
+        filter: AuditFilter,
+        now_ms: u64,
+    ) -> Result<usize, DashboardServiceError> {
+        let mutation = AdminMutation::AuditDelete {
+            scope,
+            filter: filter.clone(),
+        };
+        let digest = mutation.digest()?;
         self.authorize_admin(
             "devicelane.audit.delete",
             ResourceClass::DeviceLanePolicy,
+            Some(&digest),
             now_ms,
         )?;
+        let effective_filter = match scope {
+            AuditDeletionScope::CurrentFilter => filter,
+            AuditDeletionScope::AllRetained => AuditFilter::default(),
+        };
         self.audit
             .lock()
             .map_err(|_| DashboardServiceError::AuditUnavailable)?
-            .delete(filter, now_ms)
+            .delete(effective_filter, now_ms)
             .map_err(map_audit_error)
     }
 
@@ -691,6 +869,7 @@ impl DashboardService {
         self.authorize_admin(
             "devicelane.activity.cancel",
             ResourceClass::DeviceLaneService,
+            None,
             now_ms,
         )?;
         self.cancel_activity_inner(id, now_ms)
@@ -754,6 +933,7 @@ impl DashboardService {
         self.authorize_admin(
             "devicelane.service.pause",
             ResourceClass::DeviceLaneService,
+            None,
             now_ms,
         )?;
         self.audit_local("remote-access-pause", AuditResult::Attempted, now_ms)?;
@@ -780,6 +960,7 @@ impl DashboardService {
         self.authorize_admin(
             "devicelane.service.resume",
             ResourceClass::DeviceLaneService,
+            None,
             now_ms,
         )?;
         self.audit_local("remote-access-resume", AuditResult::Attempted, now_ms)?;
@@ -825,6 +1006,7 @@ impl DashboardService {
         &mut self,
         operation: &str,
         resource: ResourceClass,
+        mutation_digest: Option<&str>,
         now_ms: u64,
     ) -> Result<(), DashboardServiceError> {
         let request = AccessRequest {
@@ -862,7 +1044,8 @@ impl DashboardService {
                 (grant.access.operation == request.operation
                     && grant.access.resources == request.resources
                     && grant.access.source_host_id == request.source_host_id
-                    && grant.access.target_host_id == request.target_host_id)
+                    && grant.access.target_host_id == request.target_host_id
+                    && grant.admin_mutation_digest.as_deref() == mutation_digest)
                     .then(|| nonce.clone())
             })
             .ok_or(DashboardServiceError::PermissionDenied)?;
@@ -1087,5 +1270,128 @@ fn unavailable_metrics() -> MetricSnapshot {
         peak_memory_bytes: value(),
         cpu_time_ms: value(),
         process_count: value(),
+    }
+}
+
+#[cfg(test)]
+mod admin_mutation_tests {
+    use super::*;
+    use crate::dashboard::audit::{AuditDeletionScope, Redactor, RetentionPolicy};
+    use crate::dashboard::event_log::EventJournal;
+    use crate::dashboard::model::PolicyOrigin;
+    use crate::dashboard::topology::TopologyProjector;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    fn service() -> DashboardService {
+        let root = tempfile::tempdir().unwrap().keep();
+        let audit = Arc::new(Mutex::new(
+            AuditStore::open(root, RetentionPolicy::default(), Redactor::default()).unwrap(),
+        ));
+        DashboardService::new(
+            HostId::parse("mac").unwrap(),
+            TopologyProjector::new(),
+            EventJournal::new(1, 0),
+            audit,
+            PolicyEngine::new(),
+        )
+    }
+
+    fn rule(id: &str) -> PolicyRule {
+        PolicyRule {
+            id: RuleId::parse(id).unwrap(),
+            revision: 1,
+            effect: PolicyEffect::Allow,
+            principal_id: Some(PrincipalId::parse("agent").unwrap()),
+            source_host_id: Some(HostId::parse("windows").unwrap()),
+            target_host_id: Some(HostId::parse("mac").unwrap()),
+            device_id: None,
+            operation: Some(OperationId::parse("build").unwrap()),
+            resources: vec![ResourceClass::WorkspaceRead],
+            expires_at_ms: None,
+            require_user_presence: false,
+            user_presence: None,
+            physical_device: None,
+            match_device_exact: true,
+            match_resources_exact: true,
+            enabled: true,
+            origin: PolicyOrigin::User,
+        }
+    }
+
+    fn approve(service: &mut DashboardService, mutation: AdminMutation) {
+        service
+            .request_admin_mutation_approval(mutation, 60_000, 10)
+            .unwrap();
+        let id = service.pending_approvals(11).remove(0).id;
+        let session =
+            crate::local_ipc::authenticated_target_session_for_test(HostId::parse("mac").unwrap());
+        service
+            .decide_pending_approval(&id, &session, ApprovalDecision::AllowOnce, 11)
+            .unwrap();
+    }
+
+    #[test]
+    fn exact_policy_payload_cannot_be_substituted_and_is_consumed_once_under_race() {
+        let mut service = service();
+        let approved = rule("approved");
+        approve(
+            &mut service,
+            AdminMutation::PolicyPut {
+                rule: approved.clone(),
+                expected_revision: 0,
+            },
+        );
+        assert_eq!(
+            service.put_policy_rule_exact(rule("substituted"), 0, 12),
+            Err(DashboardServiceError::PermissionDenied)
+        );
+
+        let service = Arc::new(Mutex::new(service));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let service = Arc::clone(&service);
+            let barrier = Arc::clone(&barrier);
+            let approved = approved.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                service
+                    .lock()
+                    .unwrap()
+                    .put_policy_rule_exact(approved, 0, 12)
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    }
+
+    #[test]
+    fn filtered_audit_delete_grant_cannot_be_substituted_for_all_retained() {
+        let mut service = service();
+        let filter = AuditFilter {
+            principal_id: Some(PrincipalId::parse("agent").unwrap()),
+            ..AuditFilter::default()
+        };
+        approve(
+            &mut service,
+            AdminMutation::AuditDelete {
+                scope: AuditDeletionScope::CurrentFilter,
+                filter: filter.clone(),
+            },
+        );
+
+        assert_eq!(
+            service
+                .delete_audit_exact(AuditDeletionScope::AllRetained, AuditFilter::default(), 12,),
+            Err(DashboardServiceError::PermissionDenied)
+        );
+        assert_eq!(
+            service.delete_audit_exact(AuditDeletionScope::CurrentFilter, filter, 12),
+            Ok(0)
+        );
     }
 }
