@@ -275,7 +275,7 @@ pub enum MetricValue {
     Unavailable { reason: SafeCode },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceClass {
     WorkspaceRead,
@@ -574,6 +574,8 @@ pub struct PolicyRule {
     pub require_user_presence: bool,
     pub user_presence: Option<bool>,
     pub physical_device: Option<bool>,
+    pub match_device_exact: bool,
+    pub match_resources_exact: bool,
     pub enabled: bool,
     pub origin: PolicyOrigin,
 }
@@ -1015,6 +1017,10 @@ struct PolicyRuleWire {
     user_presence: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     physical_device: Option<bool>,
+    #[serde(default)]
+    match_device_exact: bool,
+    #[serde(default)]
+    match_resources_exact: bool,
     enabled: bool,
     origin: PolicyOrigin,
 }
@@ -1034,6 +1040,8 @@ validate_wire!(PolicyRuleWire, PolicyRule, |wire: PolicyRuleWire| {
         require_user_presence: wire.require_user_presence,
         user_presence: wire.user_presence,
         physical_device: wire.physical_device,
+        match_device_exact: wire.match_device_exact,
+        match_resources_exact: wire.match_resources_exact,
         enabled: wire.enabled,
         origin: wire.origin,
     }
@@ -1053,6 +1061,8 @@ validated_serialize!(PolicyRule, PolicyRuleWire, |value: &PolicyRule| {
         require_user_presence: value.require_user_presence,
         user_presence: value.user_presence,
         physical_device: value.physical_device,
+        match_device_exact: value.match_device_exact,
+        match_resources_exact: value.match_resources_exact,
         enabled: value.enabled,
         origin: value.origin,
     }

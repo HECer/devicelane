@@ -8,6 +8,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 const MAX_APPROVAL_LIFETIME_MS: u64 = 5 * 60 * 1_000;
+pub const MAX_POLICY_RULES: usize = super::model::MAX_COLLECTION_ITEMS;
+pub const MAX_PENDING_APPROVALS: usize = super::model::MAX_COLLECTION_ITEMS;
+const NONCE_GENERATION_ATTEMPTS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,9 +54,48 @@ pub enum ApprovalError {
     RequestMismatch,
     Expired,
     AlreadyUsed,
+    ApprovalLimitExceeded,
+    RuleLimitExceeded,
+    NonceGenerationFailed,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PolicyConfigurationError {
+    InvalidRule(ValidationError),
+    RuleLimitExceeded,
+    DuplicateRuleId,
+    ManagedOriginRequiresVerification,
+}
+
+/// Proof that the caller was authenticated as the target host.
+///
+/// ```compile_fail
+/// use device_development_mesh::dashboard::{HostId, policy::AuthenticatedTargetSession};
+/// let _ = AuthenticatedTargetSession { target_host_id: HostId::parse("forged").unwrap() };
+/// ```
+pub struct AuthenticatedTargetSession {
+    target_host_id: HostId,
+}
+
+impl AuthenticatedTargetSession {
+    #[allow(dead_code)]
+    pub(crate) fn new(target_host_id: HostId) -> Self {
+        Self { target_host_id }
+    }
+}
+
+pub struct VerifiedManagedPolicyBundle {
+    rules: Vec<PolicyRule>,
+}
+
+impl VerifiedManagedPolicyBundle {
+    #[allow(dead_code)]
+    pub(crate) fn new(rules: Vec<PolicyRule>) -> Self {
+        Self { rules }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct PendingApproval {
     request_digest: [u8; 32],
     target_host_id: HostId,
@@ -61,6 +103,7 @@ struct PendingApproval {
     used: bool,
 }
 
+#[derive(Debug)]
 pub struct PolicyEngine {
     rules: Vec<PolicyRule>,
     approvals: HashMap<String, PendingApproval>,
@@ -80,10 +123,20 @@ impl PolicyEngine {
         }
     }
 
-    pub fn with_rules(rules: Vec<PolicyRule>) -> Result<Self, ValidationError> {
-        for rule in &rules {
-            rule.validate()?;
-        }
+    pub fn with_rules(rules: Vec<PolicyRule>) -> Result<Self, PolicyConfigurationError> {
+        validate_rule_set(&rules, false)?;
+        Ok(Self {
+            rules,
+            approvals: HashMap::new(),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_verified_managed_rules(
+        bundle: VerifiedManagedPolicyBundle,
+    ) -> Result<Self, PolicyConfigurationError> {
+        validate_rule_set(&bundle.rules, true)?;
+        let rules = bundle.rules;
         Ok(Self {
             rules,
             approvals: HashMap::new(),
@@ -139,15 +192,26 @@ impl PolicyEngine {
         if lifetime_ms == 0 {
             return Err(ApprovalError::InvalidLifetime);
         }
+        self.approvals
+            .retain(|_, approval| !approval.used && approval.expires_at_ms > now_ms);
+        if self.approvals.len() >= MAX_PENDING_APPROVALS {
+            return Err(ApprovalError::ApprovalLimitExceeded);
+        }
         let expires_at_ms = now_ms.saturating_add(lifetime_ms.min(MAX_APPROVAL_LIFETIME_MS));
-        let nonce = loop {
+        let mut nonce = None;
+        for _ in 0..NONCE_GENERATION_ATTEMPTS {
             let mut bytes = [0_u8; 32];
             rand::thread_rng().fill_bytes(&mut bytes);
             let candidate = hex(&bytes);
-            if !self.approvals.contains_key(&candidate) {
-                break candidate;
+            let rule_id = generated_rule_id(&candidate);
+            if !self.approvals.contains_key(&candidate)
+                && self.rules.iter().all(|rule| rule.id != rule_id)
+            {
+                nonce = Some(candidate);
+                break;
             }
-        };
+        }
+        let nonce = nonce.ok_or(ApprovalError::NonceGenerationFailed)?;
         self.approvals.insert(
             nonce.clone(),
             PendingApproval {
@@ -166,7 +230,7 @@ impl PolicyEngine {
     pub fn decide(
         &mut self,
         nonce: &str,
-        deciding_host_id: &HostId,
+        session: &AuthenticatedTargetSession,
         request: &AccessRequest,
         decision: ApprovalDecision,
         now_ms: u64,
@@ -182,13 +246,20 @@ impl PolicyEngine {
         if now_ms >= pending.expires_at_ms {
             return Err(ApprovalError::Expired);
         }
-        if deciding_host_id != &pending.target_host_id {
+        if session.target_host_id != pending.target_host_id {
             return Err(ApprovalError::WrongTarget);
         }
         if request_digest(request) != pending.request_digest {
             return Err(ApprovalError::RequestMismatch);
         }
 
+        let creates_rule = matches!(
+            decision,
+            ApprovalDecision::AllowAndRemember | ApprovalDecision::DenyAndBlock
+        );
+        if creates_rule && self.rules.len() >= MAX_POLICY_RULES {
+            return Err(ApprovalError::RuleLimitExceeded);
+        }
         pending.used = true;
         let created_rule = match decision {
             ApprovalDecision::AllowAndRemember => Some(exact_rule(
@@ -226,6 +297,27 @@ fn validate_request(request: &AccessRequest) -> Result<(), ApprovalError> {
     Ok(())
 }
 
+fn validate_rule_set(
+    rules: &[PolicyRule],
+    verified_managed: bool,
+) -> Result<(), PolicyConfigurationError> {
+    if rules.len() > MAX_POLICY_RULES {
+        return Err(PolicyConfigurationError::RuleLimitExceeded);
+    }
+    let mut ids = HashSet::with_capacity(rules.len());
+    for rule in rules {
+        rule.validate()
+            .map_err(PolicyConfigurationError::InvalidRule)?;
+        if !ids.insert(rule.id.clone()) {
+            return Err(PolicyConfigurationError::DuplicateRuleId);
+        }
+        if (rule.origin == PolicyOrigin::Managed) != verified_managed {
+            return Err(PolicyConfigurationError::ManagedOriginRequiresVerification);
+        }
+    }
+    Ok(())
+}
+
 fn rule_matches(rule: &PolicyRule, request: &AccessRequest, now_ms: u64) -> bool {
     rule.enabled
         && rule.expires_at_ms.is_none_or(|expiry| expiry > now_ms)
@@ -241,15 +333,22 @@ fn rule_matches(rule: &PolicyRule, request: &AccessRequest, now_ms: u64) -> bool
             .target_host_id
             .as_ref()
             .is_none_or(|value| value == &request.target_host_id)
-        && rule
-            .device_id
-            .as_ref()
-            .is_none_or(|value| request.device_id.as_ref() == Some(value))
+        && if rule.match_device_exact {
+            rule.device_id == request.device_id
+        } else {
+            rule.device_id
+                .as_ref()
+                .is_none_or(|value| request.device_id.as_ref() == Some(value))
+        }
         && rule
             .operation
             .as_ref()
             .is_none_or(|value| value == &request.operation)
-        && (rule.resources.is_empty() || same_resources(&rule.resources, &request.resources))
+        && if rule.match_resources_exact {
+            same_resources(&rule.resources, &request.resources)
+        } else {
+            rule.resources.is_empty() || same_resources(&rule.resources, &request.resources)
+        }
         && (!rule.require_user_presence || request.user_present)
         && rule
             .user_presence
@@ -275,9 +374,9 @@ fn specificity(rule: &PolicyRule) -> u8 {
     u8::from(rule.principal_id.is_some())
         + u8::from(rule.source_host_id.is_some())
         + u8::from(rule.target_host_id.is_some())
-        + u8::from(rule.device_id.is_some())
+        + u8::from(rule.device_id.is_some() || rule.match_device_exact)
         + u8::from(rule.operation.is_some())
-        + u8::from(!rule.resources.is_empty())
+        + u8::from(!rule.resources.is_empty() || rule.match_resources_exact)
         + u8::from(rule.require_user_presence || rule.user_presence.is_some())
         + u8::from(rule.physical_device.is_some())
 }
@@ -302,7 +401,10 @@ fn is_high_risk(request: &AccessRequest) -> bool {
 }
 
 fn request_digest(request: &AccessRequest) -> [u8; 32] {
-    let encoded = serde_json::to_vec(request).expect("typed access request serializes");
+    let mut canonical = request.clone();
+    canonical.resources.sort_unstable();
+    canonical.resources.dedup();
+    let encoded = serde_json::to_vec(&canonical).expect("typed access request serializes");
     Sha256::digest(encoded).into()
 }
 
@@ -312,8 +414,11 @@ fn exact_rule(
     revision: u64,
     nonce: &str,
 ) -> PolicyRule {
+    let mut resources = request.resources.clone();
+    resources.sort_unstable();
+    resources.dedup();
     PolicyRule {
-        id: RuleId::parse(format!("approval-{}", &nonce[..16])).expect("nonce creates valid id"),
+        id: generated_rule_id(nonce),
         revision,
         effect,
         principal_id: Some(request.principal_id.clone()),
@@ -321,14 +426,20 @@ fn exact_rule(
         target_host_id: Some(request.target_host_id.clone()),
         device_id: request.device_id.clone(),
         operation: Some(request.operation.clone()),
-        resources: request.resources.clone(),
+        resources,
         expires_at_ms: None,
         require_user_presence: false,
         user_presence: Some(request.user_present),
         physical_device: Some(request.physical_device),
+        match_device_exact: true,
+        match_resources_exact: true,
         enabled: true,
         origin: PolicyOrigin::User,
     }
+}
+
+fn generated_rule_id(nonce: &str) -> RuleId {
+    RuleId::parse(format!("approval-{}", &nonce[..32])).expect("nonce creates valid 128-bit id")
 }
 
 fn next_revision(rules: &[PolicyRule]) -> u64 {
@@ -348,4 +459,253 @@ fn hex(bytes: &[u8]) -> String {
         encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u64 = 5_000;
+
+    fn request(resources: Vec<ResourceClass>) -> AccessRequest {
+        AccessRequest {
+            activity_id: ActivityId::parse("activity").unwrap(),
+            principal_id: PrincipalId::parse("principal").unwrap(),
+            source_host_id: HostId::parse("source").unwrap(),
+            target_host_id: HostId::parse("target").unwrap(),
+            device_id: None,
+            operation: OperationId::parse("workspace.write").unwrap(),
+            resources,
+            physical_device: false,
+            user_present: false,
+        }
+    }
+
+    fn managed_rule() -> PolicyRule {
+        PolicyRule {
+            id: RuleId::parse("managed-rule").unwrap(),
+            revision: 1,
+            effect: PolicyEffect::Allow,
+            principal_id: None,
+            source_host_id: None,
+            target_host_id: Some(HostId::parse("target").unwrap()),
+            device_id: None,
+            operation: Some(OperationId::parse("debug.attach").unwrap()),
+            resources: vec![ResourceClass::Debugger],
+            expires_at_ms: None,
+            require_user_presence: false,
+            user_presence: None,
+            physical_device: None,
+            match_device_exact: false,
+            match_resources_exact: true,
+            enabled: true,
+            origin: PolicyOrigin::Managed,
+        }
+    }
+
+    #[test]
+    fn only_authenticated_target_session_can_decide_and_nonce_is_one_use() {
+        let req = request(vec![ResourceClass::WorkspaceWrite]);
+        let mut engine = PolicyEngine::new();
+        let approval = engine.create_approval(&req, NOW, 100).unwrap();
+        let source = AuthenticatedTargetSession::new(req.source_host_id.clone());
+        assert_eq!(
+            engine.decide(
+                &approval.nonce,
+                &source,
+                &req,
+                ApprovalDecision::AllowOnce,
+                NOW + 1,
+            ),
+            Err(ApprovalError::WrongTarget)
+        );
+        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        assert!(
+            engine
+                .decide(
+                    &approval.nonce,
+                    &target,
+                    &req,
+                    ApprovalDecision::AllowOnce,
+                    NOW + 1,
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            engine.decide(
+                &approval.nonce,
+                &target,
+                &req,
+                ApprovalDecision::AllowOnce,
+                NOW + 2,
+            ),
+            Err(ApprovalError::AlreadyUsed)
+        );
+    }
+
+    #[test]
+    fn canonical_resource_order_is_bound_to_the_same_approval_digest() {
+        let req = request(vec![
+            ResourceClass::WorkspaceWrite,
+            ResourceClass::WorkspaceRead,
+        ]);
+        let mut reordered = req.clone();
+        reordered.resources.reverse();
+        let mut engine = PolicyEngine::new();
+        let approval = engine.create_approval(&req, NOW, 100).unwrap();
+        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        assert!(
+            engine
+                .decide(
+                    &approval.nonce,
+                    &target,
+                    &reordered,
+                    ApprovalDecision::AllowOnce,
+                    NOW + 1,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn remembered_rule_binds_absent_device_empty_resources_and_uses_unique_128_bit_ids() {
+        let req = request(vec![]);
+        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        let mut engine = PolicyEngine::new();
+        let mut ids = HashSet::new();
+        for index in 0..32 {
+            let mut distinct = req.clone();
+            distinct.activity_id = ActivityId::parse(format!("activity-{index}")).unwrap();
+            let approval = engine.create_approval(&distinct, NOW, 100).unwrap();
+            let rule = engine
+                .decide(
+                    &approval.nonce,
+                    &target,
+                    &distinct,
+                    ApprovalDecision::AllowAndRemember,
+                    NOW + 1,
+                )
+                .unwrap()
+                .created_rule
+                .unwrap();
+            assert!(rule.match_device_exact);
+            assert!(rule.match_resources_exact);
+            assert!(rule.id.as_str().strip_prefix("approval-").unwrap().len() >= 32);
+            assert!(ids.insert(rule.id));
+        }
+        let mut with_device = req.clone();
+        with_device.device_id = Some(DeviceId::parse("phone").unwrap());
+        assert!(matches!(
+            engine.evaluate(&with_device, NOW + 2),
+            PolicyDecision::ApprovalRequired { .. }
+        ));
+        let mut with_resource = req;
+        with_resource.resources = vec![ResourceClass::WorkspaceRead];
+        assert!(matches!(
+            engine.evaluate(&with_resource, NOW + 2),
+            PolicyDecision::ApprovalRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn blocking_rule_binds_absent_device_and_empty_resources_exactly() {
+        let req = request(vec![]);
+        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        let mut engine = PolicyEngine::new();
+        let approval = engine.create_approval(&req, NOW, 100).unwrap();
+        let block = engine
+            .decide(
+                &approval.nonce,
+                &target,
+                &req,
+                ApprovalDecision::DenyAndBlock,
+                NOW + 1,
+            )
+            .unwrap()
+            .created_rule
+            .unwrap();
+        assert!(block.match_device_exact);
+        assert!(block.match_resources_exact);
+
+        let mut with_device = req.clone();
+        with_device.device_id = Some(DeviceId::parse("phone").unwrap());
+        assert!(matches!(
+            engine.evaluate(&with_device, NOW + 2),
+            PolicyDecision::ApprovalRequired { .. }
+        ));
+        let mut with_resource = req;
+        with_resource.resources = vec![ResourceClass::WorkspaceRead];
+        assert!(matches!(
+            engine.evaluate(&with_resource, NOW + 2),
+            PolicyDecision::ApprovalRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn verified_managed_bundle_is_the_only_high_risk_bypass() {
+        let rule = managed_rule();
+        let bundle = VerifiedManagedPolicyBundle::new(vec![rule.clone()]);
+        let engine = PolicyEngine::with_verified_managed_rules(bundle).unwrap();
+        let mut req = request(vec![ResourceClass::Debugger]);
+        req.operation = OperationId::parse("debug.attach").unwrap();
+        assert_eq!(
+            engine.evaluate(&req, NOW),
+            PolicyDecision::Allowed { rule_id: rule.id }
+        );
+    }
+
+    #[test]
+    fn approval_expires_at_boundary() {
+        let req = request(vec![]);
+        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        let mut engine = PolicyEngine::new();
+        let approval = engine.create_approval(&req, NOW, 10).unwrap();
+        assert_eq!(
+            engine.decide(
+                &approval.nonce,
+                &target,
+                &req,
+                ApprovalDecision::DenyOnce,
+                NOW + 10,
+            ),
+            Err(ApprovalError::Expired)
+        );
+    }
+
+    #[test]
+    fn remembered_decision_cannot_overflow_rule_bound_or_consume_nonce() {
+        let rules = (0..MAX_POLICY_RULES)
+            .map(|index| {
+                let mut rule = managed_rule();
+                rule.id = RuleId::parse(format!("user-rule-{index}")).unwrap();
+                rule.origin = PolicyOrigin::User;
+                rule
+            })
+            .collect();
+        let mut engine = PolicyEngine::with_rules(rules).unwrap();
+        let req = request(vec![]);
+        let target = AuthenticatedTargetSession::new(req.target_host_id.clone());
+        let approval = engine.create_approval(&req, NOW, 100).unwrap();
+        assert_eq!(
+            engine.decide(
+                &approval.nonce,
+                &target,
+                &req,
+                ApprovalDecision::AllowAndRemember,
+                NOW + 1,
+            ),
+            Err(ApprovalError::RuleLimitExceeded)
+        );
+        assert!(
+            engine
+                .decide(
+                    &approval.nonce,
+                    &target,
+                    &req,
+                    ApprovalDecision::AllowOnce,
+                    NOW + 2,
+                )
+                .is_ok()
+        );
+    }
 }

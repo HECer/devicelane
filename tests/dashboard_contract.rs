@@ -174,6 +174,8 @@ fn every_representative_struct_rejects_unknown_fields() {
             require_user_presence: false,
             user_presence: None,
             physical_device: None,
+            match_device_exact: false,
+            match_resources_exact: false,
             enabled: true,
             origin: PolicyOrigin::User,
         })
@@ -249,6 +251,8 @@ fn duplicate_resources_are_rejected() {
         require_user_presence: true,
         user_presence: None,
         physical_device: None,
+        match_device_exact: false,
+        match_resources_exact: false,
         enabled: true,
         origin: PolicyOrigin::Managed,
     };
@@ -391,6 +395,8 @@ fn deserialization_cannot_bypass_semantic_validation() {
         require_user_presence: true,
         user_presence: None,
         physical_device: None,
+        match_device_exact: false,
+        match_resources_exact: false,
         enabled: true,
         origin: PolicyOrigin::User,
     })
@@ -666,6 +672,8 @@ fn invalid_in_memory_models_cannot_cross_the_serialization_boundary() {
         require_user_presence: false,
         user_presence: None,
         physical_device: None,
+        match_device_exact: false,
+        match_resources_exact: false,
         enabled: true,
         origin: PolicyOrigin::User,
     };
@@ -799,6 +807,8 @@ fn policy_rule_boolean_constraints_round_trip_and_missing_fields_are_wildcards()
         require_user_presence: false,
         user_presence: Some(false),
         physical_device: Some(true),
+        match_device_exact: true,
+        match_resources_exact: true,
         enabled: true,
         origin: PolicyOrigin::User,
     };

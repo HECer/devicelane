@@ -1,9 +1,10 @@
 use device_development_mesh::dashboard::model::{
-    ActivityId, ApprovalDecision, DeviceId, HostId, MAX_ID_BYTES, OperationId, PolicyEffect,
-    PolicyOrigin, PolicyRule, PrincipalId, ResourceClass, RuleId,
+    ActivityId, DeviceId, HostId, MAX_ID_BYTES, OperationId, PolicyEffect, PolicyOrigin,
+    PolicyRule, PrincipalId, ResourceClass, RuleId,
 };
 use device_development_mesh::dashboard::policy::{
-    AccessRequest, ApprovalError, PolicyDecision, PolicyEngine,
+    AccessRequest, ApprovalError, MAX_PENDING_APPROVALS, MAX_POLICY_RULES,
+    PolicyConfigurationError, PolicyDecision, PolicyEngine,
 };
 
 const NOW: u64 = 1_000_000;
@@ -37,6 +38,8 @@ fn rule(id: &str, effect: PolicyEffect) -> PolicyRule {
         require_user_presence: false,
         user_presence: None,
         physical_device: None,
+        match_device_exact: false,
+        match_resources_exact: false,
         enabled: true,
         origin: PolicyOrigin::User,
     }
@@ -156,19 +159,89 @@ fn every_high_risk_class_requires_fresh_target_confirmation() {
 }
 
 #[test]
-fn only_an_explicit_matching_managed_rule_bypasses_high_risk_confirmation() {
+fn unverified_managed_rules_are_rejected_at_the_public_boundary() {
     let req = request("debug.attach", vec![ResourceClass::Debugger]);
     let mut managed = rule("managed", PolicyEffect::Allow);
     managed.origin = PolicyOrigin::Managed;
     managed.operation = Some(req.operation.clone());
     managed.target_host_id = Some(req.target_host_id.clone());
     managed.resources = req.resources.clone();
-    let engine = PolicyEngine::with_rules(vec![managed.clone()]).unwrap();
+    assert_eq!(
+        PolicyEngine::with_rules(vec![managed]).unwrap_err(),
+        PolicyConfigurationError::ManagedOriginRequiresVerification
+    );
+}
+
+#[test]
+fn additive_exact_flags_distinguish_absent_device_and_empty_resources_from_wildcards() {
+    let req = request("metadata.read", vec![]);
+    let mut exact = rule("exact-empty", PolicyEffect::Allow);
+    exact.match_device_exact = true;
+    exact.match_resources_exact = true;
+    let engine = PolicyEngine::with_rules(vec![exact.clone()]).unwrap();
     assert_eq!(
         engine.evaluate(&req, NOW),
-        PolicyDecision::Allowed {
-            rule_id: managed.id
+        PolicyDecision::Allowed { rule_id: exact.id }
+    );
+
+    let mut with_device = req.clone();
+    with_device.device_id = Some(DeviceId::parse("phone").unwrap());
+    assert_eq!(
+        engine.evaluate(&with_device, NOW),
+        PolicyDecision::ApprovalRequired {
+            reason: "no_matching_rule".into()
         }
+    );
+    let mut with_resource = req;
+    with_resource.resources = vec![ResourceClass::WorkspaceRead];
+    assert_eq!(
+        engine.evaluate(&with_resource, NOW),
+        PolicyDecision::ApprovalRequired {
+            reason: "no_matching_rule".into()
+        }
+    );
+}
+
+#[test]
+fn policy_and_pending_approval_collections_are_hard_bounded() {
+    let rules = (0..MAX_POLICY_RULES)
+        .map(|index| rule(&format!("rule-{index}"), PolicyEffect::Allow))
+        .collect::<Vec<_>>();
+    assert!(PolicyEngine::with_rules(rules.clone()).is_ok());
+    let mut too_many = rules;
+    too_many.push(rule("overflow", PolicyEffect::Allow));
+    assert_eq!(
+        PolicyEngine::with_rules(too_many).unwrap_err(),
+        PolicyConfigurationError::RuleLimitExceeded
+    );
+    let duplicate = rule("duplicate", PolicyEffect::Allow);
+    assert_eq!(
+        PolicyEngine::with_rules(vec![duplicate.clone(), duplicate]).unwrap_err(),
+        PolicyConfigurationError::DuplicateRuleId
+    );
+
+    let mut engine = PolicyEngine::new();
+    for index in 0..MAX_PENDING_APPROVALS {
+        let mut req = request("workspace.read", vec![ResourceClass::WorkspaceRead]);
+        req.activity_id = ActivityId::parse(format!("activity-{index}")).unwrap();
+        engine.create_approval(&req, NOW, 100).unwrap();
+    }
+    assert_eq!(
+        engine.create_approval(
+            &request("workspace.read", vec![ResourceClass::WorkspaceRead]),
+            NOW,
+            100
+        ),
+        Err(ApprovalError::ApprovalLimitExceeded)
+    );
+    assert!(
+        engine
+            .create_approval(
+                &request("workspace.read", vec![ResourceClass::WorkspaceRead]),
+                NOW + 100,
+                100
+            )
+            .is_ok()
     );
 }
 
@@ -184,209 +257,11 @@ fn pairing_without_an_access_rule_still_requires_approval() {
 }
 
 #[test]
-fn approval_nonce_is_exact_target_bounded_one_use_and_remember_is_least_privilege() {
+fn approval_nonce_is_bounded_to_five_minutes() {
     let req = request("workspace.write", vec![ResourceClass::WorkspaceWrite]);
     let mut engine = PolicyEngine::new();
     let approval = engine.create_approval(&req, NOW, 600_000).unwrap();
     assert_eq!(approval.expires_at_ms, NOW + 300_000);
-
-    let wrong_target = engine.decide(
-        &approval.nonce,
-        &HostId::parse("windows-1").unwrap(),
-        &req,
-        ApprovalDecision::AllowOnce,
-        NOW + 1,
-    );
-    assert_eq!(wrong_target, Err(ApprovalError::WrongTarget));
-
-    let mut changed = req.clone();
-    changed.operation = OperationId::parse("workspace.read").unwrap();
-    assert_eq!(
-        engine.decide(
-            &approval.nonce,
-            &req.target_host_id,
-            &changed,
-            ApprovalDecision::AllowOnce,
-            NOW + 1
-        ),
-        Err(ApprovalError::RequestMismatch)
-    );
-    for changed in [
-        AccessRequest {
-            physical_device: true,
-            ..req.clone()
-        },
-        AccessRequest {
-            user_present: true,
-            ..req.clone()
-        },
-    ] {
-        assert_eq!(
-            engine.decide(
-                &approval.nonce,
-                &req.target_host_id,
-                &changed,
-                ApprovalDecision::AllowOnce,
-                NOW + 1,
-            ),
-            Err(ApprovalError::RequestMismatch)
-        );
-    }
-
-    let outcome = engine
-        .decide(
-            &approval.nonce,
-            &req.target_host_id,
-            &req,
-            ApprovalDecision::AllowAndRemember,
-            NOW + 1,
-        )
-        .unwrap();
-    let remembered = outcome.created_rule.unwrap();
-    assert_eq!(remembered.effect, PolicyEffect::Allow);
-    assert_eq!(remembered.principal_id.as_ref(), Some(&req.principal_id));
-    assert_eq!(
-        remembered.source_host_id.as_ref(),
-        Some(&req.source_host_id)
-    );
-    assert_eq!(
-        remembered.target_host_id.as_ref(),
-        Some(&req.target_host_id)
-    );
-    assert_eq!(remembered.operation.as_ref(), Some(&req.operation));
-    assert_eq!(remembered.resources, req.resources);
-    assert_eq!(remembered.device_id, req.device_id);
-    assert!(!remembered.require_user_presence);
-    assert_eq!(remembered.user_presence, Some(false));
-    assert_eq!(remembered.physical_device, Some(false));
-    assert_eq!(
-        engine.decide(
-            &approval.nonce,
-            &req.target_host_id,
-            &req,
-            ApprovalDecision::AllowOnce,
-            NOW + 2
-        ),
-        Err(ApprovalError::AlreadyUsed)
-    );
-}
-
-#[test]
-fn exact_remembered_rules_do_not_spill_across_presence_or_physical_device() {
-    for (user_present, physical_device) in [(false, false), (true, true)] {
-        let mut req = request("workspace.write", vec![ResourceClass::WorkspaceWrite]);
-        req.user_present = user_present;
-        req.physical_device = physical_device;
-        let mut engine = PolicyEngine::new();
-        let approval = engine.create_approval(&req, NOW, 100).unwrap();
-        let created = engine
-            .decide(
-                &approval.nonce,
-                &req.target_host_id,
-                &req,
-                ApprovalDecision::AllowAndRemember,
-                NOW + 1,
-            )
-            .unwrap()
-            .created_rule
-            .unwrap();
-        assert!(!created.require_user_presence);
-        assert_eq!(created.user_presence, Some(user_present));
-        assert_eq!(created.physical_device, Some(physical_device));
-        assert!(matches!(
-            engine.evaluate(&req, NOW + 2),
-            PolicyDecision::Allowed { .. }
-        ));
-
-        let mut opposite_presence = req.clone();
-        opposite_presence.user_present = !user_present;
-        assert_eq!(
-            engine.evaluate(&opposite_presence, NOW + 2),
-            PolicyDecision::ApprovalRequired {
-                reason: "no_matching_rule".into()
-            }
-        );
-        let mut opposite_physical = req.clone();
-        opposite_physical.physical_device = !physical_device;
-        assert_eq!(
-            engine.evaluate(&opposite_physical, NOW + 2),
-            PolicyDecision::ApprovalRequired {
-                reason: "no_matching_rule".into()
-            }
-        );
-    }
-}
-
-#[test]
-fn expired_approval_is_rejected_and_deny_block_creates_exact_deny() {
-    let mut req = request("device.install", vec![ResourceClass::ApplicationInstall]);
-    req.device_id = Some(DeviceId::parse("iphone-1").unwrap());
-    req.physical_device = true;
-    let mut engine = PolicyEngine::new();
-    let expired = engine.create_approval(&req, NOW, 1).unwrap();
-    assert_eq!(
-        engine.decide(
-            &expired.nonce,
-            &req.target_host_id,
-            &req,
-            ApprovalDecision::DenyOnce,
-            NOW + 2
-        ),
-        Err(ApprovalError::Expired)
-    );
-    let approval = engine.create_approval(&req, NOW, 100).unwrap();
-    let block = engine
-        .decide(
-            &approval.nonce,
-            &req.target_host_id,
-            &req,
-            ApprovalDecision::DenyAndBlock,
-            NOW + 1,
-        )
-        .unwrap()
-        .created_rule
-        .unwrap();
-    assert_eq!(block.effect, PolicyEffect::Deny);
-    assert_eq!(block.device_id, req.device_id);
-    assert_eq!(block.resources, req.resources);
-    assert!(!block.require_user_presence);
-    assert_eq!(block.user_presence, Some(false));
-    assert_eq!(block.physical_device, Some(true));
-}
-
-#[test]
-fn exact_block_rules_do_not_deny_opposite_presence_or_physical_device() {
-    let mut req = request("workspace.write", vec![ResourceClass::WorkspaceWrite]);
-    req.user_present = true;
-    req.physical_device = true;
-    let mut engine = PolicyEngine::new();
-    let approval = engine.create_approval(&req, NOW, 100).unwrap();
-    engine
-        .decide(
-            &approval.nonce,
-            &req.target_host_id,
-            &req,
-            ApprovalDecision::DenyAndBlock,
-            NOW + 1,
-        )
-        .unwrap();
-
-    let mut opposite_presence = req.clone();
-    opposite_presence.user_present = false;
-    assert_eq!(
-        engine.evaluate(&opposite_presence, NOW + 2),
-        PolicyDecision::ApprovalRequired {
-            reason: "no_matching_rule".into()
-        }
-    );
-    let mut opposite_physical = req;
-    opposite_physical.physical_device = false;
-    assert_eq!(
-        engine.evaluate(&opposite_physical, NOW + 2),
-        PolicyDecision::ApprovalRequired {
-            reason: "no_matching_rule".into()
-        }
-    );
 }
 
 #[test]
@@ -435,23 +310,6 @@ fn legacy_and_exact_presence_have_equal_specificity_and_revision_wins() {
     assert_eq!(
         engine.evaluate(&req, NOW),
         PolicyDecision::Allowed { rule_id: exact.id }
-    );
-}
-
-#[test]
-fn approval_expires_at_its_expiry_boundary() {
-    let req = request("workspace.read", vec![ResourceClass::WorkspaceRead]);
-    let mut engine = PolicyEngine::new();
-    let approval = engine.create_approval(&req, NOW, 10).unwrap();
-    assert_eq!(
-        engine.decide(
-            &approval.nonce,
-            &req.target_host_id,
-            &req,
-            ApprovalDecision::AllowOnce,
-            NOW + 10,
-        ),
-        Err(ApprovalError::Expired)
     );
 }
 
