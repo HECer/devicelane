@@ -250,7 +250,12 @@ fn rule_matches(rule: &PolicyRule, request: &AccessRequest, now_ms: u64) -> bool
             .as_ref()
             .is_none_or(|value| value == &request.operation)
         && (rule.resources.is_empty() || same_resources(&rule.resources, &request.resources))
-        && (!rule.require_user_presence || request.user_present)
+        && rule
+            .require_user_presence
+            .is_none_or(|value| value == request.user_present)
+        && rule
+            .physical_device
+            .is_none_or(|value| value == request.physical_device)
 }
 
 fn same_resources(left: &[ResourceClass], right: &[ResourceClass]) -> bool {
@@ -272,7 +277,8 @@ fn specificity(rule: &PolicyRule) -> u8 {
         + u8::from(rule.device_id.is_some())
         + u8::from(rule.operation.is_some())
         + u8::from(!rule.resources.is_empty())
-        + u8::from(rule.require_user_presence)
+        + u8::from(rule.require_user_presence.is_some())
+        + u8::from(rule.physical_device.is_some())
 }
 
 fn is_high_risk(request: &AccessRequest) -> bool {
@@ -316,7 +322,8 @@ fn exact_rule(
         operation: Some(request.operation.clone()),
         resources: request.resources.clone(),
         expires_at_ms: None,
-        require_user_presence: false,
+        require_user_presence: Some(request.user_present),
+        physical_device: Some(request.physical_device),
         enabled: true,
         origin: PolicyOrigin::User,
     }

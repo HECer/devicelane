@@ -171,7 +171,8 @@ fn every_representative_struct_rejects_unknown_fields() {
             operation: Some(operation_id("build-ios")),
             resources: vec![ResourceClass::WorkspaceRead],
             expires_at_ms: None,
-            require_user_presence: false,
+            require_user_presence: Some(false),
+            physical_device: None,
             enabled: true,
             origin: PolicyOrigin::User,
         })
@@ -244,7 +245,8 @@ fn duplicate_resources_are_rejected() {
         operation: None,
         resources: vec![ResourceClass::Signing, ResourceClass::Signing],
         expires_at_ms: None,
-        require_user_presence: true,
+        require_user_presence: Some(true),
+        physical_device: None,
         enabled: true,
         origin: PolicyOrigin::Managed,
     };
@@ -384,7 +386,8 @@ fn deserialization_cannot_bypass_semantic_validation() {
         operation: None,
         resources: vec![ResourceClass::Signing],
         expires_at_ms: None,
-        require_user_presence: true,
+        require_user_presence: Some(true),
+        physical_device: None,
         enabled: true,
         origin: PolicyOrigin::User,
     })
@@ -657,7 +660,8 @@ fn invalid_in_memory_models_cannot_cross_the_serialization_boundary() {
         operation: None,
         resources: vec![ResourceClass::Signing, ResourceClass::Signing],
         expires_at_ms: None,
-        require_user_presence: false,
+        require_user_presence: Some(false),
+        physical_device: None,
         enabled: true,
         origin: PolicyOrigin::User,
     };
@@ -773,4 +777,46 @@ fn arbitrary_display_payloads_are_not_vetted_messages() {
         .is_err()
     );
     assert!(SafeCode::parse("ToKeN : disguised-value").is_err());
+}
+
+#[test]
+fn policy_rule_boolean_constraints_round_trip_and_missing_fields_are_wildcards() {
+    let rule = PolicyRule {
+        id: RuleId::parse("exact-booleans").unwrap(),
+        revision: 1,
+        effect: PolicyEffect::Allow,
+        principal_id: None,
+        source_host_id: None,
+        target_host_id: None,
+        device_id: None,
+        operation: None,
+        resources: vec![],
+        expires_at_ms: None,
+        require_user_presence: Some(false),
+        physical_device: Some(true),
+        enabled: true,
+        origin: PolicyOrigin::User,
+    };
+    let encoded = serde_json::to_value(&rule).unwrap();
+    assert_eq!(encoded["require_user_presence"], false);
+    assert_eq!(encoded["physical_device"], true);
+    assert_eq!(serde_json::from_value::<PolicyRule>(encoded).unwrap(), rule);
+
+    let wildcard = serde_json::json!({
+        "id": "wildcard-booleans",
+        "revision": 1,
+        "effect": "allow",
+        "principal_id": null,
+        "source_host_id": null,
+        "target_host_id": null,
+        "device_id": null,
+        "operation": null,
+        "resources": [],
+        "expires_at_ms": null,
+        "enabled": true,
+        "origin": "user"
+    });
+    let wildcard: PolicyRule = serde_json::from_value(wildcard).unwrap();
+    assert_eq!(wildcard.require_user_presence, None);
+    assert_eq!(wildcard.physical_device, None);
 }

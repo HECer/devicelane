@@ -34,7 +34,8 @@ fn rule(id: &str, effect: PolicyEffect) -> PolicyRule {
         operation: None,
         resources: vec![],
         expires_at_ms: None,
-        require_user_presence: false,
+        require_user_presence: None,
+        physical_device: None,
         enabled: true,
         origin: PolicyOrigin::User,
     }
@@ -79,7 +80,7 @@ fn matching_covers_all_scopes_presence_expiry_and_disabled_rules() {
     exact.operation = Some(req.operation.clone());
     exact.resources = req.resources.clone();
     exact.expires_at_ms = Some(NOW + 1);
-    exact.require_user_presence = true;
+    exact.require_user_presence = Some(true);
 
     let mut expired = exact.clone();
     expired.id = RuleId::parse("expired").unwrap();
@@ -209,6 +210,27 @@ fn approval_nonce_is_exact_target_bounded_one_use_and_remember_is_least_privileg
         ),
         Err(ApprovalError::RequestMismatch)
     );
+    for changed in [
+        AccessRequest {
+            physical_device: true,
+            ..req.clone()
+        },
+        AccessRequest {
+            user_present: true,
+            ..req.clone()
+        },
+    ] {
+        assert_eq!(
+            engine.decide(
+                &approval.nonce,
+                &req.target_host_id,
+                &changed,
+                ApprovalDecision::AllowOnce,
+                NOW + 1,
+            ),
+            Err(ApprovalError::RequestMismatch)
+        );
+    }
 
     let outcome = engine
         .decide(
@@ -233,6 +255,8 @@ fn approval_nonce_is_exact_target_bounded_one_use_and_remember_is_least_privileg
     assert_eq!(remembered.operation.as_ref(), Some(&req.operation));
     assert_eq!(remembered.resources, req.resources);
     assert_eq!(remembered.device_id, req.device_id);
+    assert_eq!(remembered.require_user_presence, Some(false));
+    assert_eq!(remembered.physical_device, Some(false));
     assert_eq!(
         engine.decide(
             &approval.nonce,
@@ -243,6 +267,51 @@ fn approval_nonce_is_exact_target_bounded_one_use_and_remember_is_least_privileg
         ),
         Err(ApprovalError::AlreadyUsed)
     );
+}
+
+#[test]
+fn exact_remembered_rules_do_not_spill_across_presence_or_physical_device() {
+    for (user_present, physical_device) in [(false, false), (true, true)] {
+        let mut req = request("workspace.write", vec![ResourceClass::WorkspaceWrite]);
+        req.user_present = user_present;
+        req.physical_device = physical_device;
+        let mut engine = PolicyEngine::new();
+        let approval = engine.create_approval(&req, NOW, 100).unwrap();
+        let created = engine
+            .decide(
+                &approval.nonce,
+                &req.target_host_id,
+                &req,
+                ApprovalDecision::AllowAndRemember,
+                NOW + 1,
+            )
+            .unwrap()
+            .created_rule
+            .unwrap();
+        assert_eq!(created.require_user_presence, Some(user_present));
+        assert_eq!(created.physical_device, Some(physical_device));
+        assert!(matches!(
+            engine.evaluate(&req, NOW + 2),
+            PolicyDecision::Allowed { .. }
+        ));
+
+        let mut opposite_presence = req.clone();
+        opposite_presence.user_present = !user_present;
+        assert_eq!(
+            engine.evaluate(&opposite_presence, NOW + 2),
+            PolicyDecision::ApprovalRequired {
+                reason: "no_matching_rule".into()
+            }
+        );
+        let mut opposite_physical = req.clone();
+        opposite_physical.physical_device = !physical_device;
+        assert_eq!(
+            engine.evaluate(&opposite_physical, NOW + 2),
+            PolicyDecision::ApprovalRequired {
+                reason: "no_matching_rule".into()
+            }
+        );
+    }
 }
 
 #[test]
@@ -277,6 +346,43 @@ fn expired_approval_is_rejected_and_deny_block_creates_exact_deny() {
     assert_eq!(block.effect, PolicyEffect::Deny);
     assert_eq!(block.device_id, req.device_id);
     assert_eq!(block.resources, req.resources);
+    assert_eq!(block.require_user_presence, Some(false));
+    assert_eq!(block.physical_device, Some(true));
+}
+
+#[test]
+fn exact_block_rules_do_not_deny_opposite_presence_or_physical_device() {
+    let mut req = request("workspace.write", vec![ResourceClass::WorkspaceWrite]);
+    req.user_present = true;
+    req.physical_device = true;
+    let mut engine = PolicyEngine::new();
+    let approval = engine.create_approval(&req, NOW, 100).unwrap();
+    engine
+        .decide(
+            &approval.nonce,
+            &req.target_host_id,
+            &req,
+            ApprovalDecision::DenyAndBlock,
+            NOW + 1,
+        )
+        .unwrap();
+
+    let mut opposite_presence = req.clone();
+    opposite_presence.user_present = false;
+    assert_eq!(
+        engine.evaluate(&opposite_presence, NOW + 2),
+        PolicyDecision::ApprovalRequired {
+            reason: "no_matching_rule".into()
+        }
+    );
+    let mut opposite_physical = req;
+    opposite_physical.physical_device = false;
+    assert_eq!(
+        engine.evaluate(&opposite_physical, NOW + 2),
+        PolicyDecision::ApprovalRequired {
+            reason: "no_matching_rule".into()
+        }
+    );
 }
 
 #[test]
