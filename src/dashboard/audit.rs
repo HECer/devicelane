@@ -209,7 +209,8 @@ pub struct RawAuditRecord {
     pub artifact_metadata: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditFilter {
     pub from_ms: Option<u64>,
     pub through_ms: Option<u64>,
@@ -333,7 +334,7 @@ pub enum RetentionFault {
     AfterIndexSwap,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 enum StoredEntry {
     Record(AuditRecord),
@@ -341,7 +342,8 @@ enum StoredEntry {
         retention_tombstone: RetentionTombstoneSummary,
     },
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditExport {
     pub records: Vec<AuditRecord>,
     pub records_json: Vec<u8>,
@@ -803,6 +805,9 @@ impl AuditStore {
     }
     pub fn is_available(&self) -> bool {
         self.available
+    }
+    pub fn last_sequence(&self) -> u64 {
+        self.records.last().map_or(0, |record| record.sequence)
     }
     fn segment_path(&self, number: u64) -> PathBuf {
         self.root.join(format!("segment-{number:020}.audit"))
@@ -1268,6 +1273,12 @@ mod windows_private {
             };
         }
         let file = unsafe { File::from_raw_handle(handle as _) };
+        // The no-sharing handle pins the exact path while the post-open check rejects
+        // a reparse-point swap that occurred between the preflight and CreateFileW.
+        if let Err(error) = validate(path, false) {
+            drop(file);
+            return Err(error);
+        }
         Ok(file)
     }
 

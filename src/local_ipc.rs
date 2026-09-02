@@ -1,6 +1,12 @@
-use crate::dashboard::model::HostId;
-use crate::dashboard::model::{ApprovalDecision, PolicyRule};
+use crate::dashboard::audit::{AuditExport, AuditFilter};
+use crate::dashboard::event_log::EventRead;
+use crate::dashboard::model::{
+    ActivityId, AuditRecord, CursorPage, DashboardScope, DashboardSnapshot, EventCursor, HostId,
+    RuleId, SubscriberId,
+};
+use crate::dashboard::model::{ApprovalDecision, ApprovalRequest, PolicyRule};
 use crate::dashboard::policy::{AccessRequest, PolicyEngine};
+use crate::dashboard::service::{DashboardService, ExistingJobs};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 use std::io::{BufRead, Write};
@@ -50,7 +56,7 @@ pub struct LocalProtocolVersion {
 }
 
 impl LocalProtocolVersion {
-    pub const CURRENT: Self = Self { major: 1, minor: 0 };
+    pub const CURRENT: Self = Self { major: 1, minor: 1 };
 
     pub fn is_compatible(self) -> bool {
         self.major == Self::CURRENT.major
@@ -87,6 +93,52 @@ pub enum LocalRequest {
         access: AccessRequest,
         decision: ApprovalDecision,
     },
+    DashboardSnapshot {
+        version: LocalProtocolVersion,
+        scope: DashboardScope,
+    },
+    ActivityEvents {
+        version: LocalProtocolVersion,
+        cursor: EventCursor,
+        limit: usize,
+    },
+    AcknowledgeEvents {
+        version: LocalProtocolVersion,
+        subscriber_id: SubscriberId,
+        cursor: EventCursor,
+    },
+    PendingApprovals {
+        version: LocalProtocolVersion,
+    },
+    PolicyRules {
+        version: LocalProtocolVersion,
+    },
+    PutPolicyRule {
+        version: LocalProtocolVersion,
+        rule: PolicyRule,
+    },
+    DeletePolicyRule {
+        version: LocalProtocolVersion,
+        rule_id: RuleId,
+    },
+    AuditQuery {
+        version: LocalProtocolVersion,
+        filter: AuditFilter,
+        cursor: Option<EventCursor>,
+        limit: usize,
+    },
+    AuditExport {
+        version: LocalProtocolVersion,
+        filter: AuditFilter,
+    },
+    CancelActivity {
+        version: LocalProtocolVersion,
+        activity_id: ActivityId,
+    },
+    PauseRemoteAccessWithJobs {
+        version: LocalProtocolVersion,
+        existing_jobs: ExistingJobs,
+    },
 }
 
 impl LocalRequest {
@@ -98,7 +150,18 @@ impl LocalRequest {
             | Self::SetAutostart { version, .. }
             | Self::Diagnostics { version }
             | Self::RequestApproval { version, .. }
-            | Self::DecideApproval { version, .. } => version,
+            | Self::DecideApproval { version, .. }
+            | Self::DashboardSnapshot { version, .. }
+            | Self::ActivityEvents { version, .. }
+            | Self::AcknowledgeEvents { version, .. }
+            | Self::PendingApprovals { version }
+            | Self::PolicyRules { version }
+            | Self::PutPolicyRule { version, .. }
+            | Self::DeletePolicyRule { version, .. }
+            | Self::AuditQuery { version, .. }
+            | Self::AuditExport { version, .. }
+            | Self::CancelActivity { version, .. }
+            | Self::PauseRemoteAccessWithJobs { version, .. } => version,
         }
     }
 
@@ -106,7 +169,24 @@ impl LocalRequest {
         self.version()
             .is_compatible()
             .then_some(())
-            .ok_or(LocalProtocolError::IncompatibleVersion)
+            .ok_or(LocalProtocolError::IncompatibleVersion)?;
+        if self.requires_dashboard() && self.version().minor < 1 {
+            return Err(LocalProtocolError::FeatureUnavailable);
+        }
+        Ok(())
+    }
+
+    fn requires_dashboard(&self) -> bool {
+        !matches!(
+            self,
+            Self::Status { .. }
+                | Self::PauseRemoteAccess { .. }
+                | Self::ResumeRemoteAccess { .. }
+                | Self::SetAutostart { .. }
+                | Self::Diagnostics { .. }
+                | Self::RequestApproval { .. }
+                | Self::DecideApproval { .. }
+        )
     }
 }
 
@@ -128,6 +208,18 @@ pub enum LocalResponse {
     ApprovalDecided {
         decision: ApprovalDecision,
         created_rule: Option<PolicyRule>,
+    },
+    DashboardSnapshot(DashboardSnapshot),
+    ActivityEvents(EventRead),
+    PendingApprovals(Vec<ApprovalRequest>),
+    PolicyRules(Vec<PolicyRule>),
+    AuditRecords(CursorPage<AuditRecord>),
+    AuditExport(AuditExport),
+    Cancellation {
+        cancelled: bool,
+    },
+    RuleDeleted {
+        deleted: bool,
     },
     Error {
         code: String,
@@ -151,6 +243,8 @@ pub struct DaemonSnapshot {
     pub remote_access_paused: bool,
     pub autostart: bool,
     pub log_location: String,
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -187,6 +281,13 @@ pub enum LocalProtocolError {
     StatePathNotAbsolute,
     InvalidLocalEndpoint,
     Unauthorized,
+    FeatureUnavailable,
+    PermissionDenied,
+    ApprovalExpired,
+    AuditUnavailable,
+    CursorAhead,
+    ResyncRequired,
+    LimitExceeded,
 }
 
 impl fmt::Display for LocalProtocolError {
@@ -202,6 +303,13 @@ impl fmt::Display for LocalProtocolError {
                 Self::StatePathNotAbsolute => "daemon state paths must be absolute",
                 Self::InvalidLocalEndpoint => "invalid local IPC endpoint",
                 Self::Unauthorized => "local IPC peer is not authorized",
+                Self::FeatureUnavailable => "dashboard feature was not negotiated",
+                Self::PermissionDenied => "dashboard permission denied",
+                Self::ApprovalExpired => "dashboard approval expired",
+                Self::AuditUnavailable => "dashboard audit unavailable",
+                Self::CursorAhead => "dashboard cursor is ahead",
+                Self::ResyncRequired => "dashboard resynchronization required",
+                Self::LimitExceeded => "dashboard limit exceeded",
             }
         )
     }
@@ -312,6 +420,7 @@ pub struct DaemonState {
     diagnostics: Vec<DiagnosticItem>,
     autostart_adapter: Option<Arc<dyn AutostartAdapter>>,
     dashboard_policy: Option<DashboardPolicyRuntime>,
+    dashboard: Option<DashboardService>,
 }
 
 struct DashboardPolicyRuntime {
@@ -338,6 +447,7 @@ impl DaemonState {
             diagnostics,
             autostart_adapter: None,
             dashboard_policy: None,
+            dashboard: None,
         }
     }
 
@@ -350,6 +460,7 @@ impl DaemonState {
             diagnostics,
             autostart_adapter: Some(Arc::new(PlatformAutostartAdapter)),
             dashboard_policy: None,
+            dashboard: None,
         }
     }
 
@@ -363,6 +474,7 @@ impl DaemonState {
             diagnostics,
             autostart_adapter: Some(autostart_adapter),
             dashboard_policy: None,
+            dashboard: None,
         }
     }
 
@@ -377,10 +489,19 @@ impl DaemonState {
         });
     }
 
+    pub fn enable_dashboard(&mut self, service: DashboardService) {
+        self.dashboard = Some(service);
+    }
+
     fn local_policy_host_id(&self) -> Option<HostId> {
-        self.dashboard_policy
+        self.dashboard
             .as_ref()
-            .map(|runtime| runtime.local_host_id.clone())
+            .map(|service| service.local_host_id().clone())
+            .or_else(|| {
+                self.dashboard_policy
+                    .as_ref()
+                    .map(|runtime| runtime.local_host_id.clone())
+            })
     }
 
     pub fn handle(&mut self, request: LocalRequest) -> Result<LocalResponse, LocalProtocolError> {
@@ -405,7 +526,19 @@ impl DaemonState {
             LocalRequest::Diagnostics { .. } => {
                 Ok(LocalResponse::Diagnostics(self.diagnostics.clone()))
             }
-            LocalRequest::RequestApproval { .. } | LocalRequest::DecideApproval { .. } => {
+            LocalRequest::RequestApproval { .. }
+            | LocalRequest::DecideApproval { .. }
+            | LocalRequest::DashboardSnapshot { .. }
+            | LocalRequest::ActivityEvents { .. }
+            | LocalRequest::AcknowledgeEvents { .. }
+            | LocalRequest::PendingApprovals { .. }
+            | LocalRequest::PolicyRules { .. }
+            | LocalRequest::PutPolicyRule { .. }
+            | LocalRequest::DeletePolicyRule { .. }
+            | LocalRequest::AuditQuery { .. }
+            | LocalRequest::AuditExport { .. }
+            | LocalRequest::CancelActivity { .. }
+            | LocalRequest::PauseRemoteAccessWithJobs { .. } => {
                 Err(LocalProtocolError::Unauthorized)
             }
         }
@@ -427,6 +560,20 @@ impl DaemonState {
                 lifetime_ms,
                 ..
             } => {
+                if let Some(service) = self.dashboard.as_mut() {
+                    if session.local_host_id() != service.local_host_id()
+                        || access.target_host_id != *service.local_host_id()
+                    {
+                        return Err(LocalProtocolError::Unauthorized);
+                    }
+                    let (nonce, expires_at_ms) = service
+                        .request_approval(access, lifetime_ms, now_ms)
+                        .map_err(map_dashboard_error)?;
+                    return Ok(LocalResponse::ApprovalCreated {
+                        nonce,
+                        expires_at_ms,
+                    });
+                }
                 let runtime = self
                     .dashboard_policy
                     .as_mut()
@@ -451,6 +598,15 @@ impl DaemonState {
                 decision,
                 ..
             } => {
+                if let Some(service) = self.dashboard.as_mut() {
+                    let created_rule = service
+                        .decide_approval(&nonce, session, &access, decision, now_ms)
+                        .map_err(map_dashboard_error)?;
+                    return Ok(LocalResponse::ApprovalDecided {
+                        decision,
+                        created_rule,
+                    });
+                }
                 let runtime = self
                     .dashboard_policy
                     .as_mut()
@@ -469,8 +625,127 @@ impl DaemonState {
                     created_rule: outcome.created_rule,
                 })
             }
+            LocalRequest::DashboardSnapshot { scope, .. } => {
+                let service = self
+                    .dashboard
+                    .as_ref()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?;
+                Ok(LocalResponse::DashboardSnapshot(
+                    service.snapshot(scope, now_ms),
+                ))
+            }
+            LocalRequest::ActivityEvents { cursor, limit, .. } => {
+                let service = self
+                    .dashboard
+                    .as_ref()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?;
+                let read = service.events(cursor, limit);
+                match read {
+                    EventRead::CursorAhead { .. } => Err(LocalProtocolError::CursorAhead),
+                    EventRead::ResyncRequired { .. } => Err(LocalProtocolError::ResyncRequired),
+                    EventRead::LimitExceeded => Err(LocalProtocolError::LimitExceeded),
+                    events => Ok(LocalResponse::ActivityEvents(events)),
+                }
+            }
+            LocalRequest::AcknowledgeEvents {
+                subscriber_id,
+                cursor,
+                ..
+            } => {
+                self.dashboard
+                    .as_ref()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .acknowledge(subscriber_id, cursor, now_ms)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::Acknowledged)
+            }
+            LocalRequest::PendingApprovals { .. } => Ok(LocalResponse::PendingApprovals(
+                self.dashboard
+                    .as_ref()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .pending_approvals(now_ms),
+            )),
+            LocalRequest::PolicyRules { .. } => Ok(LocalResponse::PolicyRules(
+                self.dashboard
+                    .as_ref()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .policy_rules(),
+            )),
+            LocalRequest::PutPolicyRule { rule, .. } => {
+                self.dashboard
+                    .as_mut()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .put_policy_rule(rule, now_ms)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::Acknowledged)
+            }
+            LocalRequest::DeletePolicyRule { rule_id, .. } => {
+                let deleted = self
+                    .dashboard
+                    .as_mut()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .delete_policy_rule(&rule_id, now_ms)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::RuleDeleted { deleted })
+            }
+            LocalRequest::AuditQuery {
+                filter,
+                cursor,
+                limit,
+                ..
+            } => {
+                let page = self
+                    .dashboard
+                    .as_ref()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .audit_query(filter, cursor, limit)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::AuditRecords(page))
+            }
+            LocalRequest::AuditExport { filter, .. } => {
+                let export = self
+                    .dashboard
+                    .as_ref()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .audit_export(filter, None)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::AuditExport(export))
+            }
+            LocalRequest::CancelActivity { activity_id, .. } => {
+                let cancelled = self
+                    .dashboard
+                    .as_mut()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .cancel_activity(&activity_id, now_ms)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::Cancellation { cancelled })
+            }
+            LocalRequest::PauseRemoteAccessWithJobs { existing_jobs, .. } => {
+                self.dashboard
+                    .as_mut()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .pause(existing_jobs, now_ms)
+                    .map_err(map_dashboard_error)?;
+                self.snapshot.remote_access_paused = true;
+                Ok(LocalResponse::Acknowledged)
+            }
             legacy => self.handle(legacy),
         }
+    }
+}
+
+fn map_dashboard_error(
+    error: crate::dashboard::service::DashboardServiceError,
+) -> LocalProtocolError {
+    use crate::dashboard::service::DashboardServiceError as Error;
+    match error {
+        Error::PermissionDenied => LocalProtocolError::PermissionDenied,
+        Error::ApprovalExpired => LocalProtocolError::ApprovalExpired,
+        Error::AuditUnavailable => LocalProtocolError::AuditUnavailable,
+        Error::CursorAhead => LocalProtocolError::CursorAhead,
+        Error::ResyncRequired => LocalProtocolError::ResyncRequired,
+        Error::LimitExceeded => LocalProtocolError::LimitExceeded,
+        Error::InvalidRequest | Error::NotFound => LocalProtocolError::InvalidFrame,
     }
 }
 
@@ -645,7 +920,19 @@ fn dispatch_connection(
                 Ok(mut state) => {
                     if matches!(
                         request,
-                        LocalRequest::RequestApproval { .. } | LocalRequest::DecideApproval { .. }
+                        LocalRequest::RequestApproval { .. }
+                            | LocalRequest::DecideApproval { .. }
+                            | LocalRequest::DashboardSnapshot { .. }
+                            | LocalRequest::ActivityEvents { .. }
+                            | LocalRequest::AcknowledgeEvents { .. }
+                            | LocalRequest::PendingApprovals { .. }
+                            | LocalRequest::PolicyRules { .. }
+                            | LocalRequest::PutPolicyRule { .. }
+                            | LocalRequest::DeletePolicyRule { .. }
+                            | LocalRequest::AuditQuery { .. }
+                            | LocalRequest::AuditExport { .. }
+                            | LocalRequest::CancelActivity { .. }
+                            | LocalRequest::PauseRemoteAccessWithJobs { .. }
                     ) {
                         match state.local_policy_host_id() {
                             Some(local_host_id) => {
@@ -668,7 +955,22 @@ fn dispatch_connection(
             Err(error) => error_response(error),
         }
     };
+    let response = enforce_response_bound(response);
     let _ = write_frame(&mut writer, &response);
+}
+
+pub fn enforce_response_bound(response: LocalResponse) -> LocalResponse {
+    match serde_json::to_vec(&response) {
+        Ok(frame) if frame.len().saturating_add(1) <= MAX_FRAME_BYTES => response,
+        Ok(_) => LocalResponse::Error {
+            code: "limit_exceeded".into(),
+            message: "local IPC response exceeds 512 KiB; request a smaller page".into(),
+        },
+        Err(_) => LocalResponse::Error {
+            code: "invalid_request".into(),
+            message: "local IPC response could not be encoded".into(),
+        },
+    }
 }
 
 fn error_response(error: LocalProtocolError) -> LocalResponse {
@@ -677,6 +979,13 @@ fn error_response(error: LocalProtocolError) -> LocalResponse {
             LocalProtocolError::IncompatibleVersion => "incompatible_version",
             LocalProtocolError::FrameTooLarge => "frame_too_large",
             LocalProtocolError::Unauthorized => "unauthorized",
+            LocalProtocolError::FeatureUnavailable => "feature_unavailable",
+            LocalProtocolError::PermissionDenied => "permission_denied",
+            LocalProtocolError::ApprovalExpired => "approval_expired",
+            LocalProtocolError::AuditUnavailable => "audit_unavailable",
+            LocalProtocolError::CursorAhead => "cursor_ahead",
+            LocalProtocolError::ResyncRequired => "resync_required",
+            LocalProtocolError::LimitExceeded => "limit_exceeded",
             _ => "invalid_request",
         }
         .into(),

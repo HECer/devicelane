@@ -1,4 +1,5 @@
 use crate::dashboard::{ActivityEvent, ActivityId, EventCursor, SubscriberId};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -10,7 +11,8 @@ pub const MAX_PAGE_BYTES: usize = 256 * 1024;
 pub const MAX_SUBSCRIBERS: usize = 32;
 pub const SUBSCRIBER_IDLE_MS: u64 = 15_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadLimit {
     pub max_events: usize,
     pub max_bytes: usize,
@@ -25,7 +27,8 @@ impl Default for ReadLimit {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
 pub enum EventRead {
     Events {
         events: Vec<ActivityEvent>,

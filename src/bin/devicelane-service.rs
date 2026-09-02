@@ -1,6 +1,10 @@
+use device_development_mesh::dashboard::audit::{AuditStore, Redactor, RetentionPolicy};
+use device_development_mesh::dashboard::event_log::EventJournal;
 use device_development_mesh::dashboard::managed_policy::{
     ManagedPolicyStore, PolicyAdminTrustStore,
 };
+use device_development_mesh::dashboard::service::DashboardService;
+use device_development_mesh::dashboard::topology::TopologyProjector;
 use device_development_mesh::dashboard::{HostId, policy::PolicyEngine};
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, DiagnosticItem, LocalProtocolVersion,
@@ -102,6 +106,12 @@ fn run() -> Result<(), String> {
             remote_access_paused: false,
             autostart: platform_autostart_enabled(),
             log_location: args.log_dir.display().to_string(),
+            features: vec![
+                "dashboard_v1".into(),
+                "activity_events".into(),
+                "policy_rules".into(),
+                "audit_query_export".into(),
+            ],
         },
         vec![DiagnosticItem {
             code: "ready".into(),
@@ -122,7 +132,19 @@ fn run() -> Result<(), String> {
             .add_verified_managed_rules(managed)
             .map_err(|error| format!("invalid managed policy rules: {error:?}"))?;
     }
-    daemon_state.enable_dashboard_policy(local_host_id, policy_engine);
+    let audit = AuditStore::open(
+        args.log_dir.join("audit"),
+        RetentionPolicy::default(),
+        Redactor::default(),
+    )
+    .map_err(|error| format!("cannot open dashboard audit: {error}"))?;
+    daemon_state.enable_dashboard(DashboardService::new(
+        local_host_id,
+        TopologyProjector::new(),
+        EventJournal::new(1, 0),
+        Arc::new(Mutex::new(audit)),
+        policy_engine,
+    ));
     let state = Arc::new(Mutex::new(daemon_state));
     if args.foreground {
         eprintln!("devicelane-service: listening on {}", args.listen);

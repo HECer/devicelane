@@ -121,6 +121,7 @@ fn snapshot() -> DaemonSnapshot {
         remote_access_paused: false,
         autostart: false,
         log_location: "/logs".into(),
+        features: Vec::new(),
     }
 }
 

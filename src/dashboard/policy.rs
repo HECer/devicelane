@@ -207,6 +207,39 @@ impl PolicyEngine {
         &self.rules
     }
 
+    pub fn put_user_rule(&mut self, rule: PolicyRule) -> Result<(), PolicyConfigurationError> {
+        rule.validate()
+            .map_err(PolicyConfigurationError::InvalidRule)?;
+        if rule.origin != PolicyOrigin::User {
+            return Err(PolicyConfigurationError::ManagedOriginRequiresVerification);
+        }
+        if let Some(existing) = self.rules.iter_mut().find(|item| item.id == rule.id) {
+            if existing.origin == PolicyOrigin::Managed || rule.revision <= existing.revision {
+                return Err(PolicyConfigurationError::ManagedOriginRequiresVerification);
+            }
+            *existing = rule;
+            return Ok(());
+        }
+        if self.rules.len() >= MAX_POLICY_RULES {
+            return Err(PolicyConfigurationError::RuleLimitExceeded);
+        }
+        self.rules.push(rule);
+        Ok(())
+    }
+
+    pub fn delete_user_rule(&mut self, id: &RuleId) -> Result<bool, PolicyConfigurationError> {
+        if self
+            .rules
+            .iter()
+            .any(|rule| &rule.id == id && rule.origin == PolicyOrigin::Managed)
+        {
+            return Err(PolicyConfigurationError::ManagedOriginRequiresVerification);
+        }
+        let before = self.rules.len();
+        self.rules.retain(|rule| &rule.id != id);
+        Ok(before != self.rules.len())
+    }
+
     pub fn evaluate(
         &self,
         request: &AccessRequest,

@@ -148,6 +148,16 @@ fn text(response: &LocalResponse, acknowledged: &str) -> Result<String, String> 
         LocalResponse::ApprovalCreated { .. } | LocalResponse::ApprovalDecided { .. } => {
             Err("unexpected approval response for this command".into())
         }
+        LocalResponse::DashboardSnapshot(_)
+        | LocalResponse::ActivityEvents(_)
+        | LocalResponse::PendingApprovals(_)
+        | LocalResponse::PolicyRules(_)
+        | LocalResponse::AuditRecords(_)
+        | LocalResponse::AuditExport(_)
+        | LocalResponse::Cancellation { .. }
+        | LocalResponse::RuleDeleted { .. } => {
+            Err("unexpected dashboard response for this command".into())
+        }
         LocalResponse::Error { code, message } => Err(format!("daemon error ({code}): {message}")),
     }
 }
