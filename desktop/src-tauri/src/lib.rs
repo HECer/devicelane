@@ -1,7 +1,9 @@
 use command_group::CommandGroup;
+use device_development_mesh::dashboard::audit::{AuditDeletionScope, AuditExport, AuditFilter};
 use device_development_mesh::dashboard::event_log::EventRead;
 use device_development_mesh::dashboard::{
-    DashboardScope, DashboardSnapshot, EventCursor, SubscriberId,
+    ApprovalDecision, ApprovalId, ApprovalRequest, AuditRecord, CursorPage, DashboardScope,
+    DashboardSnapshot, EventCursor, PolicyRule, RuleId, SubscriberId,
 };
 use device_development_mesh::local_ipc::{
     DaemonSnapshot, DiagnosticItem, LocalProtocolVersion, LocalRequest, LocalResponse,
@@ -18,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::ShellExt;
 
@@ -68,6 +70,14 @@ impl TryFrom<WireEventCursor> for EventCursor {
             sequence: parse("cursor.sequence", value.sequence)?,
         })
     }
+}
+
+fn parse_u64_decimal(name: &str, raw: String) -> Result<u64, String> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{name} must be an unsigned decimal string"));
+    }
+    raw.parse::<u64>()
+        .map_err(|_| format!("{name} exceeds u64"))
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +195,109 @@ impl<T: DaemonTransport> DesktopBridge<T> {
             subscriber_id,
             cursor,
         })
+    }
+
+    pub fn pending_approvals(&self) -> Result<Vec<ApprovalRequest>, String> {
+        match self.transport.send(LocalRequest::PendingApprovals {
+            version: LocalProtocolVersion::CURRENT,
+        })? {
+            LocalResponse::PendingApprovals(approvals) => Ok(approvals),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn decide_pending_approval(
+        &self,
+        approval_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<Option<PolicyRule>, String> {
+        let approval_id = ApprovalId::parse(approval_id)
+            .map_err(|error| format!("invalid approval_id: {error}"))?;
+        match self.transport.send(LocalRequest::DecidePendingApproval {
+            version: LocalProtocolVersion::CURRENT,
+            approval_id,
+            decision,
+        })? {
+            LocalResponse::ApprovalDecided { created_rule, .. } => Ok(created_rule),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn policy_rules(&self) -> Result<Vec<PolicyRule>, String> {
+        match self.transport.send(LocalRequest::PolicyRules {
+            version: LocalProtocolVersion::CURRENT,
+        })? {
+            LocalResponse::PolicyRules(rules) => Ok(rules),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn put_policy_rule(&self, rule: PolicyRule) -> Result<(), String> {
+        self.acknowledge(LocalRequest::PutPolicyRule {
+            version: LocalProtocolVersion::CURRENT,
+            rule,
+        })
+    }
+
+    pub fn delete_policy_rule(
+        &self,
+        rule_id: &str,
+        expected_revision: u64,
+    ) -> Result<bool, String> {
+        let rule_id =
+            RuleId::parse(rule_id).map_err(|error| format!("invalid rule_id: {error}"))?;
+        match self
+            .transport
+            .send(LocalRequest::DeletePolicyRuleIfRevision {
+                version: LocalProtocolVersion::CURRENT,
+                rule_id,
+                expected_revision,
+            })? {
+            LocalResponse::RuleDeleted { deleted } => Ok(deleted),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn audit_query(
+        &self,
+        filter: AuditFilter,
+        cursor: Option<EventCursor>,
+        limit: usize,
+    ) -> Result<CursorPage<AuditRecord>, String> {
+        match self.transport.send(LocalRequest::AuditQuery {
+            version: LocalProtocolVersion::CURRENT,
+            filter,
+            cursor,
+            limit,
+        })? {
+            LocalResponse::AuditRecords(page) => Ok(page),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn audit_export(&self, filter: AuditFilter) -> Result<AuditExport, String> {
+        match self.transport.send(LocalRequest::AuditExport {
+            version: LocalProtocolVersion::CURRENT,
+            filter,
+        })? {
+            LocalResponse::AuditExport(export) => Ok(export),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn delete_audit(
+        &self,
+        scope: AuditDeletionScope,
+        filter: AuditFilter,
+    ) -> Result<usize, String> {
+        match self.transport.send(LocalRequest::AuditDelete {
+            version: LocalProtocolVersion::CURRENT,
+            scope,
+            filter,
+        })? {
+            LocalResponse::AuditDeleted { deleted } => Ok(deleted),
+            response => Err(unexpected_response(response)),
+        }
     }
 
     fn acknowledge(&self, request: LocalRequest) -> Result<(), String> {
@@ -596,6 +709,133 @@ fn acknowledge_events(
 }
 
 #[tauri::command]
+fn pending_approvals(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+) -> Result<JavaScriptWire<Vec<ApprovalRequest>>, String> {
+    report(&app, bridge.pending_approvals().map(JavaScriptWire))
+}
+
+#[tauri::command]
+fn decide_approval(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    approval_id: String,
+    decision: ApprovalDecision,
+) -> Result<(), String> {
+    report(
+        &app,
+        bridge
+            .decide_pending_approval(&approval_id, decision)
+            .map(|_| ()),
+    )
+}
+
+#[tauri::command]
+fn policy_rules(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+) -> Result<JavaScriptWire<Vec<PolicyRule>>, String> {
+    report(&app, bridge.policy_rules().map(JavaScriptWire))
+}
+
+#[tauri::command]
+fn put_policy_rule(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    rule: PolicyRule,
+) -> Result<(), String> {
+    report(&app, bridge.put_policy_rule(rule))
+}
+
+#[tauri::command]
+fn delete_policy_rule(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    rule_id: String,
+    expected_revision: String,
+) -> Result<(), String> {
+    let result = parse_u64_decimal("expected_revision", expected_revision)
+        .and_then(|revision| bridge.delete_policy_rule(&rule_id, revision).map(|_| ()));
+    report(&app, result)
+}
+
+#[tauri::command]
+fn audit_query(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    filter: AuditFilter,
+    cursor: Option<WireEventCursor>,
+    limit: usize,
+) -> Result<JavaScriptWire<CursorPage<AuditRecord>>, String> {
+    let cursor = cursor.map(EventCursor::try_from).transpose();
+    report(
+        &app,
+        cursor
+            .and_then(|cursor| bridge.audit_query(filter, cursor, limit))
+            .map(JavaScriptWire),
+    )
+}
+
+#[tauri::command]
+fn audit_export(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    filter: AuditFilter,
+) -> Result<JavaScriptWire<AuditExport>, String> {
+    report(&app, bridge.audit_export(filter).map(JavaScriptWire))
+}
+
+#[tauri::command]
+fn delete_audit(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    scope: AuditDeletionScope,
+    filter: AuditFilter,
+) -> Result<(), String> {
+    report(&app, bridge.delete_audit(scope, filter).map(|_| ()))
+}
+
+#[tauri::command]
+fn notify_pending_approval(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+    approval: ApprovalRequest,
+) -> Result<(), String> {
+    let result = bridge.status().and_then(|status| {
+        if approval.target_host_id.as_str() != status.public_identity {
+            return Err("notification target is not the local host".into());
+        }
+        let approval_id = approval.id.as_str().to_owned();
+        let mut notification = notify_rust::Notification::new();
+        notification
+            .summary("DeviceLane Freigabe")
+            .body(&format!(
+                "{} möchte {} verwenden. Freigabe {}",
+                approval.principal_id.as_str(),
+                approval.operation.as_str(),
+                approval_id
+            ))
+            .action("open_approval", "In DeviceLane öffnen");
+        #[cfg(windows)]
+        notification.app_id(&app.config().identifier);
+        let handle = notification.show().map_err(|error| error.to_string())?;
+        let app_for_action = app.clone();
+        thread::spawn(move || {
+            handle.wait_for_action(|action| {
+                if action == "__closed" {
+                    return;
+                }
+                show_main_window(&app_for_action);
+                let _ = app_for_action.emit("open-approval", approval_id);
+            });
+        });
+        Ok(())
+    });
+    report(&app, result)
+}
+
+#[tauri::command]
 async fn repair_daemon(app: AppHandle) -> Result<(), String> {
     let service_binary = locate_service_sidecar(&app).await;
     let prepared = app
@@ -665,6 +905,15 @@ pub fn run() {
             dashboard_snapshot,
             activity_events,
             acknowledge_events,
+            pending_approvals,
+            decide_approval,
+            policy_rules,
+            put_policy_rule,
+            delete_policy_rule,
+            audit_query,
+            audit_export,
+            delete_audit,
+            notify_pending_approval,
             repair_daemon
         ])
         .run(tauri::generate_context!())

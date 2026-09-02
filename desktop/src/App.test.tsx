@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import type { ActivityEvent, DaemonClient, DaemonSnapshot, DashboardSnapshot } from "./api";
+import type { ActivityEvent, ApprovalRequest, DaemonClient, DaemonSnapshot, DashboardSnapshot, PolicyRule } from "./api";
 
 const connected: DaemonSnapshot = {
   public_identity: "mac-agent",
@@ -86,6 +86,16 @@ function fakeClient(overrides: Partial<DaemonClient> = {}): DaemonClient {
       next_cursor: { epoch: "1", sequence: "0" }
     }),
     acknowledgeEvents: vi.fn().mockResolvedValue(undefined),
+    pendingApprovals: vi.fn().mockResolvedValue([]),
+    decideApproval: vi.fn().mockResolvedValue(undefined),
+    policyRules: vi.fn().mockResolvedValue([]),
+    putPolicyRule: vi.fn().mockResolvedValue(undefined),
+    deletePolicyRule: vi.fn().mockResolvedValue(undefined),
+    auditQuery: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+    auditExport: vi.fn().mockResolvedValue({ records: [], records_json: [], manifest: { format_version: "1", record_count: "0", records_sha256: "empty", signature: { signature_status: "unavailable" } } }),
+    deleteAudit: vi.fn().mockResolvedValue(undefined),
+    notifyPendingApproval: vi.fn().mockResolvedValue(undefined),
+    onOpenApproval: vi.fn().mockResolvedValue(() => undefined),
     ...overrides
   };
   return client;
@@ -471,5 +481,55 @@ describe("DeviceLane desktop foundation", () => {
     const occupancy = screen.getByRole("region", { name: "Verwendete Ressourcen" });
     expect(within(occupancy).getByText(/agent-codex → mac-agent/)).toBeVisible();
     expect(within(occupancy).getByText("Arbeitsbereich lesen")).toBeVisible();
+  });
+
+  it("loads approvals and policies from daemon truth and wires management actions", async () => {
+    const user = userEvent.setup();
+    const approval: ApprovalRequest = {
+      id: "approval-ui", activity_id: "job-ui", principal_id: "agent-ui", source_host_id: "windows", target_host_id: "mac-agent", device_id: null,
+      operation: "xcode.build", resources: ["workspace_read"], requested_at_ms: "1725000000000", expires_at_ms: "9725000000000", risk: "target_confirmation"
+    };
+    const rule: PolicyRule = {
+      id: "rule-ui", revision: "2", effect: "allow", principal_id: "agent-ui", source_host_id: "windows", target_host_id: "mac-agent", device_id: null,
+      operation: "xcode.build", resources: ["workspace_read"], expires_at_ms: null, require_user_presence: true, user_presence: null, physical_device: null,
+      match_device_exact: false, match_resources_exact: true, enabled: true, origin: "user"
+    };
+    const pendingApprovals = vi.fn().mockResolvedValue([approval]);
+    const policyRules = vi.fn().mockResolvedValue([rule]);
+    const decideApproval = vi.fn().mockResolvedValue(undefined);
+    const client = fakeClient({ pendingApprovals, policyRules, decideApproval });
+    render(<App client={client} />);
+
+    expect(await screen.findByRole("heading", { name: "Ausstehende Freigaben" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Richtlinien" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Audit-Verlauf" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Einmal erlauben" }));
+    await waitFor(() => expect(decideApproval).toHaveBeenCalledWith("approval-ui", "allow_once"));
+    await waitFor(() => expect(pendingApprovals).toHaveBeenCalledTimes(2));
+  });
+
+  it("opens the exact approval from a native notification without approving it", async () => {
+    const approval: ApprovalRequest = {
+      id: "approval-notification", activity_id: "job-notification", principal_id: "agent-ui", source_host_id: "windows", target_host_id: "mac-agent", device_id: null,
+      operation: "xcode.build", resources: ["workspace_read"], requested_at_ms: "1725000000000", expires_at_ms: "9725000000000", risk: "target_confirmation"
+    };
+    let openApproval: ((approvalId: string) => void) | undefined;
+    const onOpenApproval = vi.fn((listener: (approvalId: string) => void) => {
+      openApproval = listener;
+      return Promise.resolve(() => undefined);
+    });
+    const decideApproval = vi.fn().mockResolvedValue(undefined);
+    const client = fakeClient({
+      pendingApprovals: vi.fn().mockResolvedValue([approval]),
+      decideApproval,
+      onOpenApproval
+    } as Partial<DaemonClient>);
+    render(<App client={client} />);
+
+    const card = await screen.findByRole("article", { name: "Freigabe approval-notification" });
+    await waitFor(() => expect(onOpenApproval).toHaveBeenCalledOnce());
+    act(() => openApproval?.("approval-notification"));
+    expect(card).toHaveFocus();
+    expect(decideApproval).not.toHaveBeenCalled();
   });
 });

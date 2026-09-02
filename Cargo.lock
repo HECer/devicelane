@@ -887,6 +887,7 @@ version = "0.1.0"
 dependencies = [
  "command-group",
  "devicelane",
+ "notify-rust",
  "serde",
  "serde_json",
  "sha2",

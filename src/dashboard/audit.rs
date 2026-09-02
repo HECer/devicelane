@@ -225,6 +225,13 @@ pub struct AuditFilter {
     pub result: Option<AuditResult>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDeletionScope {
+    CurrentFilter,
+    AllRetained,
+}
+
 impl AuditFilter {
     fn matches(&self, value: &AuditRecord) -> bool {
         self.from_ms.is_none_or(|v| value.occurred_at_ms >= v)
@@ -588,6 +595,109 @@ impl AuditStore {
             sequence: record.sequence,
         });
         Ok(CursorPage { items, next_cursor })
+    }
+
+    pub fn delete(&mut self, filter: AuditFilter, now_ms: u64) -> Result<usize, AuditError> {
+        if !self.available {
+            return Err(AuditError::AuditUnavailable);
+        }
+        let deleted_count = self
+            .records
+            .iter()
+            .filter(|record| filter.matches(record))
+            .count();
+        if deleted_count == 0 {
+            return Ok(0);
+        }
+        let next_sequence = self
+            .records
+            .last()
+            .map_or(1, |record| record.sequence.saturating_add(1));
+        if next_sequence == u64::MAX
+            && self
+                .records
+                .last()
+                .is_some_and(|record| record.sequence == u64::MAX)
+        {
+            return Err(AuditError::InvalidSequence);
+        }
+        let mut retained = self
+            .records
+            .iter()
+            .filter(|record| !filter.matches(record))
+            .cloned()
+            .collect::<Vec<_>>();
+        let deletion_record = AuditRecord {
+            sequence: next_sequence,
+            occurred_at_ms: now_ms,
+            activity_id: None,
+            principal_id: PrincipalId::parse("local-user").map_err(validation_error)?,
+            source_host_id: HostId::parse("local-host").map_err(validation_error)?,
+            target_host_id: HostId::parse("local-host").map_err(validation_error)?,
+            device_id: None,
+            operation: OperationId::parse("audit-delete").map_err(validation_error)?,
+            resources: Vec::new(),
+            decision: PolicyEffect::Allow,
+            result: AuditResult::Deleted,
+            redacted_message: Some(
+                DisplayMessage::new(MessageCode::Redacted, Vec::new()).map_err(validation_error)?,
+            ),
+        };
+        retained.push(deletion_record);
+
+        let mut next_number = segment_paths(&self.root)?
+            .iter()
+            .filter_map(|path| segment_number(path))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let mut new_active = Vec::new();
+        self.create_segment(next_number)?;
+        new_active.push(next_number);
+        for entry in retained.iter().cloned().map(StoredEntry::Record).chain(
+            self.tombstones.iter().cloned().map(|retention_tombstone| {
+                StoredEntry::RetentionTombstone {
+                    retention_tombstone,
+                }
+            }),
+        ) {
+            let payload = serde_json::to_vec(&entry)?;
+            let length = frame_len(&payload)?;
+            if length > self.max_segment_bytes {
+                return Err(AuditError::FrameTooLarge);
+            }
+            let current_path = self.segment_path(next_number);
+            if fs::metadata(&current_path)?.len().saturating_add(length) > self.max_segment_bytes {
+                next_number = next_number.saturating_add(1);
+                self.create_segment(next_number)?;
+                new_active.push(next_number);
+            }
+            append_frame(&self.segment_path(next_number), &payload)?;
+        }
+        sync_directory(&self.root)?;
+
+        let previous_current = self.current;
+        let previous_day = self.current_day;
+        let previous_active = self.active_segments.clone();
+        let previous_records = std::mem::replace(&mut self.records, retained);
+        self.current = next_number;
+        self.current_day = Some(now_ms / DAY_MS);
+        self.active_segments = new_active.clone();
+        if let Err(error) = self.write_index() {
+            self.current = previous_current;
+            self.current_day = previous_day;
+            self.active_segments = previous_active;
+            self.records = previous_records;
+            return Err(error);
+        }
+        for number in previous_active {
+            let path = self.segment_path(number);
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+        sync_directory(&self.root)?;
+        Ok(deleted_count)
     }
 
     pub fn enforce_retention(&mut self, now_ms: u64) -> Result<(), AuditError> {

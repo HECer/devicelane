@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { ActivityEvent, DaemonClient, DaemonSnapshot, DashboardScope, DashboardSnapshot, EventCursor } from "./api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ActivityEvent, ApprovalRequest, DaemonClient, DaemonSnapshot, DashboardScope, DashboardSnapshot, EventCursor, PolicyRule } from "./api";
 import { tauriDaemonClient } from "./api";
 import { ActivityFeed } from "./components/ActivityFeed";
+import { ApprovalPanel } from "./components/ApprovalPanel";
+import { AuditHistory } from "./components/AuditHistory";
+import { PolicyRules } from "./components/PolicyRules";
 import { ResourceOccupancy } from "./components/ResourceOccupancy";
 import { ScopeSwitcher } from "./components/ScopeSwitcher";
 import { TopologyView } from "./components/TopologyView";
@@ -33,6 +36,11 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   const [selectedHostId, setSelectedHostId] = useState<string>();
   const [streamReconnecting, setStreamReconnecting] = useState(false);
   const [meshAvailable, setMeshAvailable] = useState(false);
+  const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
+  const [rules, setRules] = useState<PolicyRule[]>([]);
+  const [nowMs, setNowMs] = useState(Date.now());
+  const [focusApprovalId, setFocusApprovalId] = useState<string>();
+  const notifiedApprovals = useRef(new Set<string>());
   const dashboardRevision = useRef<{ epoch: string; revision: string } | undefined>(undefined);
   const dashboardEpoch = useRef("0");
   const subscriberId = useRef(`desktop-${globalThis.crypto?.randomUUID?.() ?? Date.now().toString(36)}`);
@@ -41,6 +49,54 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   const activeJobCount = dashboard?.activities.filter(({ state }) =>
     state === "awaiting_approval" || state === "queued" || state === "running" || state === "reconnecting"
   ).length ?? 0;
+
+  const refreshApprovals = useCallback(async () => setApprovals(await client.pendingApprovals()), [client]);
+  const refreshRules = useCallback(async () => setRules(await client.policyRules()), [client]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    let unlisten: (() => void) | undefined;
+    void client.onOpenApproval((approvalId) => {
+      if (!stopped) setFocusApprovalId(approvalId);
+    }).then((cleanup) => {
+      if (stopped) cleanup(); else unlisten = cleanup;
+    }).catch((error) => {
+      if (!stopped) setErrorMessage(error instanceof Error ? error.message : String(error));
+    });
+    return () => { stopped = true; unlisten?.(); };
+  }, [client]);
+
+  useEffect(() => {
+    let stopped = false;
+    let running = false;
+    const update = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const [nextApprovals, nextRules] = await Promise.all([client.pendingApprovals(), client.policyRules()]);
+        if (!stopped) { setApprovals(nextApprovals); setRules(nextRules); }
+      } catch (error) {
+        if (!stopped) setErrorMessage(error instanceof Error ? error.message : String(error));
+      } finally { running = false; }
+    };
+    void update();
+    const timer = window.setInterval(() => void update(), 5_000);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [client]);
+
+  useEffect(() => {
+    if (!snapshot) return;
+    for (const approval of approvals) {
+      if (approval.target_host_id !== snapshot.public_identity || notifiedApprovals.current.has(approval.id)) continue;
+      notifiedApprovals.current.add(approval.id);
+      void client.notifyPendingApproval(approval).catch(() => notifiedApprovals.current.delete(approval.id));
+    }
+  }, [approvals, client, snapshot]);
 
   const applyDashboard = (next: DashboardSnapshot, epoch = dashboardEpoch.current, epochChanged = false) => {
     const current = dashboardRevision.current;
@@ -320,6 +376,12 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
             <button onClick={() => void run(client.diagnostics, (result) => { setDiagnosticsPath(result.path); setDiagnostics(result.items); })} disabled={busy}>Diagnosepaket erstellen</button>
           </article>
         </section>
+
+        <div className="management-layout">
+          <ApprovalPanel approvals={approvals} nowMs={nowMs} focusApprovalId={focusApprovalId} onDecide={(approvalId, decision) => client.decideApproval(approvalId, decision)} onRefresh={refreshApprovals} />
+          <PolicyRules rules={rules} onPut={(rule) => client.putPolicyRule(rule)} onDelete={(ruleId, revision) => client.deletePolicyRule(ruleId, revision)} onRefresh={refreshRules} />
+          <AuditHistory onQuery={(filter, cursor, limit) => client.auditQuery(filter, cursor, limit)} onExport={(filter) => client.auditExport(filter)} onDelete={(deletionScope, filter) => client.deleteAudit(deletionScope, filter)} />
+        </div>
       </main>
     </div>
   );

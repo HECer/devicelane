@@ -1,6 +1,6 @@
 use device_development_mesh::dashboard::event_log::EventRead;
 use device_development_mesh::dashboard::{
-    DashboardScope, DashboardSnapshot, EventCursor, SubscriberId,
+    ApprovalDecision, DashboardScope, DashboardSnapshot, EventCursor, SubscriberId,
 };
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, LocalProtocolVersion, LocalRequest, LocalResponse,
@@ -201,6 +201,44 @@ fn dashboard_snapshot_bridge_uses_the_typed_scope_and_response() {
             version: LocalProtocolVersion::CURRENT,
             scope: DashboardScope::Mesh,
         }]
+    );
+}
+
+#[test]
+fn management_bridge_uses_approval_ids_without_exposing_nonces_or_access_credentials() {
+    let requests = Arc::new(Mutex::new(vec![]));
+    let bridge = DesktopBridge::new(FakeTransport {
+        requests: Arc::clone(&requests),
+        response: LocalResponse::ApprovalDecided {
+            decision: ApprovalDecision::AllowOnce,
+            created_rule: None,
+        },
+    });
+
+    bridge
+        .decide_pending_approval("approval-42", ApprovalDecision::AllowOnce)
+        .unwrap();
+
+    let encoded = serde_json::to_string(&requests.lock().unwrap()[0]).unwrap();
+    assert!(encoded.contains("approval-42"));
+    assert!(!encoded.contains("nonce"));
+    assert!(!encoded.contains("principal_id"));
+    assert!(!encoded.contains("identity"));
+}
+
+#[test]
+fn management_bridge_preserves_daemon_error_codes() {
+    let bridge = DesktopBridge::new(FakeTransport {
+        requests: Arc::new(Mutex::new(vec![])),
+        response: LocalResponse::Error {
+            code: "revision_conflict".into(),
+            message: "rule changed".into(),
+        },
+    });
+
+    assert_eq!(
+        bridge.delete_policy_rule("rule-1", 7).unwrap_err(),
+        "daemon error (revision_conflict): rule changed"
     );
 }
 

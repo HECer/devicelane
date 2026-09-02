@@ -35,6 +35,7 @@ pub enum DashboardServiceError {
     LimitExceeded,
     InvalidRequest,
     NotFound,
+    RevisionConflict,
 }
 
 impl DashboardServiceError {
@@ -48,6 +49,7 @@ impl DashboardServiceError {
             Self::LimitExceeded => "limit_exceeded",
             Self::InvalidRequest => "invalid_request",
             Self::NotFound => "not_found",
+            Self::RevisionConflict => "revision_conflict",
         }
     }
 }
@@ -506,6 +508,21 @@ impl DashboardService {
         Ok(outcome.created_rule)
     }
 
+    pub fn decide_pending_approval(
+        &mut self,
+        approval_id: &ApprovalId,
+        session: &crate::local_ipc::AuthenticatedTargetSession,
+        decision: ApprovalDecision,
+        now_ms: u64,
+    ) -> Result<Option<PolicyRule>, DashboardServiceError> {
+        let pending = self
+            .pending
+            .get(approval_id)
+            .cloned()
+            .ok_or(DashboardServiceError::NotFound)?;
+        self.decide_approval(&pending.nonce, session, &pending.access, decision, now_ms)
+    }
+
     pub fn policy_rules(&self) -> Vec<PolicyRule> {
         self.policy.rules().to_vec()
     }
@@ -563,6 +580,24 @@ impl DashboardService {
         Ok(deleted)
     }
 
+    pub fn delete_policy_rule_if_revision(
+        &mut self,
+        id: &RuleId,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> Result<bool, DashboardServiceError> {
+        let current = self
+            .policy
+            .rules()
+            .iter()
+            .find(|rule| &rule.id == id)
+            .ok_or(DashboardServiceError::NotFound)?;
+        if current.revision != expected_revision {
+            return Err(DashboardServiceError::RevisionConflict);
+        }
+        self.delete_policy_rule(id, now_ms)
+    }
+
     pub fn audit_query(
         &self,
         filter: AuditFilter,
@@ -585,6 +620,23 @@ impl DashboardService {
             .lock()
             .map_err(|_| DashboardServiceError::AuditUnavailable)?
             .export(filter, signer)
+            .map_err(map_audit_error)
+    }
+
+    pub fn delete_audit(
+        &mut self,
+        filter: AuditFilter,
+        now_ms: u64,
+    ) -> Result<usize, DashboardServiceError> {
+        self.authorize_admin(
+            "devicelane.audit.delete",
+            ResourceClass::DeviceLanePolicy,
+            now_ms,
+        )?;
+        self.audit
+            .lock()
+            .map_err(|_| DashboardServiceError::AuditUnavailable)?
+            .delete(filter, now_ms)
             .map_err(map_audit_error)
     }
 

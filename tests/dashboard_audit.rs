@@ -46,6 +46,61 @@ fn open(temp: &TempDir) -> AuditStore {
 }
 
 #[test]
+fn explicit_filtered_deletion_removes_raw_records_and_keeps_a_deletion_audit_record() {
+    let temp = TempDir::new().unwrap();
+    let mut store = open(&temp);
+    let mut deleted = raw(1, 100, "delete-me");
+    deleted.operation = OperationId::parse("delete-me").unwrap();
+    let mut kept = raw(2, 200, "keep-me");
+    kept.operation = OperationId::parse("keep-me").unwrap();
+    store.append(deleted).unwrap();
+    store.append(kept).unwrap();
+
+    let count = store
+        .delete(
+            AuditFilter {
+                operation: Some(OperationId::parse("delete-me").unwrap()),
+                ..AuditFilter::default()
+            },
+            300,
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    drop(store);
+
+    let raw_bytes = fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "audit"))
+        .flat_map(|entry| fs::read(entry.path()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        !raw_bytes
+            .windows(b"activity-1".len())
+            .any(|bytes| bytes == b"activity-1")
+    );
+
+    let reopened = open(&temp);
+    let page = reopened.query(AuditFilter::default(), None, 256).unwrap();
+    assert!(
+        page.items
+            .iter()
+            .any(|record| record.operation.as_str() == "keep-me")
+    );
+    assert!(
+        page.items
+            .iter()
+            .any(|record| record.result == AuditResult::Deleted)
+    );
+    assert!(
+        !page
+            .items
+            .iter()
+            .any(|record| record.operation.as_str() == "delete-me")
+    );
+}
+
+#[test]
 fn redacts_before_any_bytes_reach_disk() {
     let temp = TempDir::new().unwrap();
     let mut store = open(&temp);

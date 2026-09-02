@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "degraded";
 export type DaemonRole = "workstation" | "agent" | "registry";
@@ -56,6 +57,8 @@ export type ResourceClass =
 export type ActivityState = "awaiting_approval" | "queued" | "running" | "reconnecting" | "succeeded" | "failed" | "denied" | "cancelled";
 export type PolicyEffect = "allow" | "deny";
 export type ApprovalDecision = "allow_once" | "allow_and_remember" | "deny_once" | "deny_and_block";
+export type PolicyOrigin = "user" | "managed";
+export type AuditResult = "attempted" | "succeeded" | "failed" | "denied" | "cancelled" | "deleted";
 export type MessageCode = "activity_started" | "registry_stale" | "observer_unavailable" | "operation_succeeded" | "operation_failed" | "access_denied" | "target_confirmation_required" | "redacted";
 export type MessageParam = "local" | "remote" | "allowed" | "denied" | "unavailable";
 
@@ -158,6 +161,76 @@ export interface ApprovalRequest {
   risk: string;
 }
 
+export interface PolicyRule {
+  id: string;
+  revision: U64Decimal;
+  effect: PolicyEffect;
+  principal_id: string | null;
+  source_host_id: string | null;
+  target_host_id: string | null;
+  device_id: string | null;
+  operation: string | null;
+  resources: ResourceClass[];
+  expires_at_ms: U64Decimal | null;
+  require_user_presence: boolean;
+  user_presence: boolean | null;
+  physical_device: boolean | null;
+  match_device_exact: boolean;
+  match_resources_exact: boolean;
+  enabled: boolean;
+  origin: PolicyOrigin;
+}
+
+export interface AuditFilter {
+  from_ms: U64Decimal | null;
+  through_ms: U64Decimal | null;
+  principal_id: string | null;
+  source_host_id: string | null;
+  target_host_id: string | null;
+  device_id: string | null;
+  operation: string | null;
+  resource: ResourceClass | null;
+  decision: PolicyEffect | null;
+  result: AuditResult | null;
+}
+
+export interface AuditRecord {
+  sequence: U64Decimal;
+  occurred_at_ms: U64Decimal;
+  activity_id: string | null;
+  principal_id: string;
+  source_host_id: string;
+  target_host_id: string;
+  device_id: string | null;
+  operation: string;
+  resources: ResourceClass[];
+  decision: PolicyEffect;
+  result: AuditResult;
+  redacted_message: DisplayMessage | null;
+}
+
+export interface AuditPage {
+  items: AuditRecord[];
+  next_cursor: EventCursor | null;
+}
+
+export type ExportSignature =
+  | { signature_status: "signed"; key_id: string; signature_hex: string }
+  | { signature_status: "unavailable" };
+
+export interface AuditExport {
+  records: AuditRecord[];
+  records_json: U64Decimal[];
+  manifest: {
+    format_version: U64Decimal;
+    record_count: U64Decimal;
+    records_sha256: string;
+    signature: ExportSignature;
+  };
+}
+
+export type AuditDeletionScope = "current_filter" | "all_retained";
+
 export interface DashboardWarning {
   code: string;
   message: DisplayMessage;
@@ -205,6 +278,16 @@ export interface DaemonClient {
   dashboardSnapshot(scope: DashboardScope, signal?: AbortSignal): Promise<DashboardSnapshot>;
   activityEvents(scope: DashboardScope, cursor: EventCursor, limit: number, signal?: AbortSignal): Promise<EventRead>;
   acknowledgeEvents(subscriberId: string, cursor: EventCursor, signal?: AbortSignal): Promise<void>;
+  pendingApprovals(signal?: AbortSignal): Promise<ApprovalRequest[]>;
+  decideApproval(approvalId: string, decision: ApprovalDecision, signal?: AbortSignal): Promise<void>;
+  policyRules(signal?: AbortSignal): Promise<PolicyRule[]>;
+  putPolicyRule(rule: PolicyRule, signal?: AbortSignal): Promise<void>;
+  deletePolicyRule(ruleId: string, expectedRevision: U64Decimal, signal?: AbortSignal): Promise<void>;
+  auditQuery(filter: AuditFilter, cursor: EventCursor | null, limit: number, signal?: AbortSignal): Promise<AuditPage>;
+  auditExport(filter: AuditFilter, signal?: AbortSignal): Promise<AuditExport>;
+  deleteAudit(scope: AuditDeletionScope, filter: AuditFilter, signal?: AbortSignal): Promise<void>;
+  notifyPendingApproval(approval: ApprovalRequest, signal?: AbortSignal): Promise<void>;
+  onOpenApproval(listener: (approvalId: string) => void): Promise<() => void>;
 }
 
 async function invokeWithSignal<T>(command: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
@@ -223,5 +306,15 @@ export const tauriDaemonClient: DaemonClient = {
   repair: () => invoke("repair_daemon"),
   dashboardSnapshot: (scope, signal) => invokeWithSignal("dashboard_snapshot", { scope }, signal),
   activityEvents: (scope, cursor, limit, signal) => invokeWithSignal("activity_events", { scope, cursor, limit }, signal),
-  acknowledgeEvents: (subscriberId, cursor, signal) => invokeWithSignal("acknowledge_events", { subscriberId, cursor }, signal)
+  acknowledgeEvents: (subscriberId, cursor, signal) => invokeWithSignal("acknowledge_events", { subscriberId, cursor }, signal),
+  pendingApprovals: (signal) => invokeWithSignal("pending_approvals", {}, signal),
+  decideApproval: (approvalId, decision, signal) => invokeWithSignal("decide_approval", { approvalId, decision }, signal),
+  policyRules: (signal) => invokeWithSignal("policy_rules", {}, signal),
+  putPolicyRule: (rule, signal) => invokeWithSignal("put_policy_rule", { rule }, signal),
+  deletePolicyRule: (ruleId, expectedRevision, signal) => invokeWithSignal("delete_policy_rule", { ruleId, expectedRevision }, signal),
+  auditQuery: (filter, cursor, limit, signal) => invokeWithSignal("audit_query", { filter, cursor, limit }, signal),
+  auditExport: (filter, signal) => invokeWithSignal("audit_export", { filter }, signal),
+  deleteAudit: (scope, filter, signal) => invokeWithSignal("delete_audit", { scope, filter }, signal),
+  notifyPendingApproval: (approval, signal) => invokeWithSignal("notify_pending_approval", { approval }, signal),
+  onOpenApproval: (listener) => listen<string>("open-approval", (event) => listener(event.payload))
 };

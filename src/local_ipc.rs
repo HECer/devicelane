@@ -1,4 +1,4 @@
-use crate::dashboard::audit::{AuditExport, AuditFilter};
+use crate::dashboard::audit::{AuditDeletionScope, AuditExport, AuditFilter};
 use crate::dashboard::event_log::EventRead;
 use crate::dashboard::model::{
     ActivityId, AuditRecord, CursorPage, DashboardScope, DashboardSnapshot, EventCursor, HostId,
@@ -93,6 +93,11 @@ pub enum LocalRequest {
         access: AccessRequest,
         decision: ApprovalDecision,
     },
+    DecidePendingApproval {
+        version: LocalProtocolVersion,
+        approval_id: crate::dashboard::ApprovalId,
+        decision: ApprovalDecision,
+    },
     DashboardSnapshot {
         version: LocalProtocolVersion,
         scope: DashboardScope,
@@ -123,6 +128,11 @@ pub enum LocalRequest {
         version: LocalProtocolVersion,
         rule_id: RuleId,
     },
+    DeletePolicyRuleIfRevision {
+        version: LocalProtocolVersion,
+        rule_id: RuleId,
+        expected_revision: u64,
+    },
     AuditQuery {
         version: LocalProtocolVersion,
         filter: AuditFilter,
@@ -131,6 +141,11 @@ pub enum LocalRequest {
     },
     AuditExport {
         version: LocalProtocolVersion,
+        filter: AuditFilter,
+    },
+    AuditDelete {
+        version: LocalProtocolVersion,
+        scope: AuditDeletionScope,
         filter: AuditFilter,
     },
     CancelActivity {
@@ -153,6 +168,7 @@ impl LocalRequest {
             | Self::Diagnostics { version }
             | Self::RequestApproval { version, .. }
             | Self::DecideApproval { version, .. }
+            | Self::DecidePendingApproval { version, .. }
             | Self::DashboardSnapshot { version, .. }
             | Self::ActivityEvents { version, .. }
             | Self::AcknowledgeEvents { version, .. }
@@ -160,8 +176,10 @@ impl LocalRequest {
             | Self::PolicyRules { version }
             | Self::PutPolicyRule { version, .. }
             | Self::DeletePolicyRule { version, .. }
+            | Self::DeletePolicyRuleIfRevision { version, .. }
             | Self::AuditQuery { version, .. }
             | Self::AuditExport { version, .. }
+            | Self::AuditDelete { version, .. }
             | Self::CancelActivity { version, .. }
             | Self::PauseRemoteAccessWithJobs { version, .. } => version,
         }
@@ -217,6 +235,9 @@ pub enum LocalResponse {
     PolicyRules(Vec<PolicyRule>),
     AuditRecords(CursorPage<AuditRecord>),
     AuditExport(AuditExport),
+    AuditDeleted {
+        deleted: usize,
+    },
     Cancellation {
         cancelled: bool,
     },
@@ -290,6 +311,7 @@ pub enum LocalProtocolError {
     CursorAhead,
     ResyncRequired,
     LimitExceeded,
+    RevisionConflict,
 }
 
 impl fmt::Display for LocalProtocolError {
@@ -312,6 +334,7 @@ impl fmt::Display for LocalProtocolError {
                 Self::CursorAhead => "dashboard cursor is ahead",
                 Self::ResyncRequired => "dashboard resynchronization required",
                 Self::LimitExceeded => "dashboard limit exceeded",
+                Self::RevisionConflict => "dashboard revision conflict",
             }
         )
     }
@@ -537,6 +560,7 @@ impl DaemonState {
             }
             LocalRequest::RequestApproval { .. }
             | LocalRequest::DecideApproval { .. }
+            | LocalRequest::DecidePendingApproval { .. }
             | LocalRequest::DashboardSnapshot { .. }
             | LocalRequest::ActivityEvents { .. }
             | LocalRequest::AcknowledgeEvents { .. }
@@ -544,8 +568,10 @@ impl DaemonState {
             | LocalRequest::PolicyRules { .. }
             | LocalRequest::PutPolicyRule { .. }
             | LocalRequest::DeletePolicyRule { .. }
+            | LocalRequest::DeletePolicyRuleIfRevision { .. }
             | LocalRequest::AuditQuery { .. }
             | LocalRequest::AuditExport { .. }
+            | LocalRequest::AuditDelete { .. }
             | LocalRequest::CancelActivity { .. }
             | LocalRequest::PauseRemoteAccessWithJobs { .. } => {
                 Err(LocalProtocolError::Unauthorized)
@@ -634,6 +660,22 @@ impl DaemonState {
                     created_rule: outcome.created_rule,
                 })
             }
+            LocalRequest::DecidePendingApproval {
+                approval_id,
+                decision,
+                ..
+            } => {
+                let created_rule = self
+                    .dashboard
+                    .as_mut()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .decide_pending_approval(&approval_id, session, decision, now_ms)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::ApprovalDecided {
+                    decision,
+                    created_rule,
+                })
+            }
             LocalRequest::DashboardSnapshot { scope, .. } => {
                 let service = self
                     .dashboard
@@ -698,6 +740,19 @@ impl DaemonState {
                     .map_err(map_dashboard_error)?;
                 Ok(LocalResponse::RuleDeleted { deleted })
             }
+            LocalRequest::DeletePolicyRuleIfRevision {
+                rule_id,
+                expected_revision,
+                ..
+            } => {
+                let deleted = self
+                    .dashboard
+                    .as_mut()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .delete_policy_rule_if_revision(&rule_id, expected_revision, now_ms)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::RuleDeleted { deleted })
+            }
             LocalRequest::AuditQuery {
                 filter,
                 cursor,
@@ -720,6 +775,19 @@ impl DaemonState {
                     .audit_export(filter, None)
                     .map_err(map_dashboard_error)?;
                 Ok(LocalResponse::AuditExport(export))
+            }
+            LocalRequest::AuditDelete { scope, filter, .. } => {
+                let effective_filter = match scope {
+                    AuditDeletionScope::CurrentFilter => filter,
+                    AuditDeletionScope::AllRetained => AuditFilter::default(),
+                };
+                let deleted = self
+                    .dashboard
+                    .as_mut()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .delete_audit(effective_filter, now_ms)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::AuditDeleted { deleted })
             }
             LocalRequest::CancelActivity { activity_id, .. } => {
                 let cancelled = self
@@ -759,6 +827,7 @@ fn map_dashboard_error(
         Error::CursorAhead => LocalProtocolError::CursorAhead,
         Error::ResyncRequired => LocalProtocolError::ResyncRequired,
         Error::LimitExceeded => LocalProtocolError::LimitExceeded,
+        Error::RevisionConflict => LocalProtocolError::RevisionConflict,
         Error::InvalidRequest | Error::NotFound => LocalProtocolError::InvalidFrame,
     }
 }
@@ -936,6 +1005,7 @@ fn dispatch_connection(
                         request,
                         LocalRequest::RequestApproval { .. }
                             | LocalRequest::DecideApproval { .. }
+                            | LocalRequest::DecidePendingApproval { .. }
                             | LocalRequest::DashboardSnapshot { .. }
                             | LocalRequest::ActivityEvents { .. }
                             | LocalRequest::AcknowledgeEvents { .. }
@@ -943,8 +1013,10 @@ fn dispatch_connection(
                             | LocalRequest::PolicyRules { .. }
                             | LocalRequest::PutPolicyRule { .. }
                             | LocalRequest::DeletePolicyRule { .. }
+                            | LocalRequest::DeletePolicyRuleIfRevision { .. }
                             | LocalRequest::AuditQuery { .. }
                             | LocalRequest::AuditExport { .. }
+                            | LocalRequest::AuditDelete { .. }
                             | LocalRequest::CancelActivity { .. }
                             | LocalRequest::PauseRemoteAccessWithJobs { .. }
                     ) {
@@ -1000,6 +1072,7 @@ fn error_response(error: LocalProtocolError) -> LocalResponse {
             LocalProtocolError::CursorAhead => "cursor_ahead",
             LocalProtocolError::ResyncRequired => "resync_required",
             LocalProtocolError::LimitExceeded => "limit_exceeded",
+            LocalProtocolError::RevisionConflict => "revision_conflict",
             _ => "invalid_request",
         }
         .into(),
