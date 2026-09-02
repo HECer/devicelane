@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 
 const styles = readFileSync("src/styles.css", "utf8");
+const tauriConfig = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8")) as {
+  app: { windows: Array<{ minWidth: number }> };
+};
 
 function luminance(hex: string): number {
   const channels = hex.match(/[0-9a-f]{2}/gi)?.map((channel) => Number.parseInt(channel, 16) / 255) ?? [];
@@ -57,6 +60,21 @@ describe("responsive and contrast contracts", () => {
     expect(styles).toMatch(/presence--offline[\s\S]*var\(--dark-status-error\)/);
     expect(styles).toMatch(/presence--connecting[\s\S]*var\(--dark-status-connecting\)/);
     expect(styles).toMatch(/occupancy-list strong[\s\S]*var\(--dark-occupancy\)/);
+  });
+
+  it("keeps the dark scope hint at WCAG AA contrast", () => {
+    expect(contrast(cssVariable("--dark-scope-hint"), "#1b2528")).toBeGreaterThanOrEqual(4.5);
+    expect(styles).toMatch(/scope-hint[\s\S]*var\(--dark-scope-hint\)/);
+  });
+
+  it("allows the native window and document to reflow to 280 CSS pixels", () => {
+    expect(tauriConfig.app.windows[0].minWidth).toBe(280);
+    expect(styles).toMatch(/body\s*\{[^}]*min-width:\s*0(?:px)?\s*;/s);
+    const style = document.createElement("style");
+    style.textContent = styles;
+    document.head.append(style);
+    expect(["0", "0px"]).toContain(getComputedStyle(document.body).minWidth);
+    style.remove();
   });
 
   it.each([

@@ -11,7 +11,7 @@
   },
   "app": {
     "withGlobalTauri": false,
-    "windows": [{ "label": "main", "title": "DeviceLane", "width": 1120, "height": 760, "minWidth": 375, "minHeight": 620 }],
+    "windows": [{ "label": "main", "title": "DeviceLane", "width": 1120, "height": 760, "minWidth": 280, "minHeight": 620 }],
     "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost" }
   },
   "bundle": {

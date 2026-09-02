@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { ActivityEvent } from "../api";
 import { reconnectDelayMs } from "../dashboard-model";
@@ -87,5 +87,17 @@ describe("ActivityFeed", () => {
     expect(liveRegions).toHaveLength(1);
     expect(liveRegions[0]).toHaveTextContent("100 neue Aktivitätsereignisse");
     expect(screen.queryAllByText(/neues Aktivitätsereignis$/)).toHaveLength(0);
+  });
+
+  it("changes the live-region node for consecutive batches of the same size", async () => {
+    const { rerender } = render(<ActivityFeed events={[event(1)]} />);
+    const status = screen.getByRole("status");
+    await waitFor(() => expect(status.textContent).not.toBe(""));
+    const firstAnnouncement = status.textContent;
+
+    rerender(<ActivityFeed events={[event(2)]} />);
+
+    await waitFor(() => expect(status.textContent).not.toBe(firstAnnouncement));
+    expect(status).toHaveTextContent("1 neues Aktivitätsereignis");
   });
 });

@@ -21,14 +21,15 @@ export interface ActivityFeedProps {
 export function ActivityFeed({ events, reconnecting = false }: ActivityFeedProps) {
   const visibleEvents = useMemo(() => mergeActivityEvents([], events), [events]);
   const previousKeys = useRef(new Set<string>());
-  const [announcement, setAnnouncement] = useState("");
+  const [announcement, setAnnouncement] = useState({ text: "", sequence: 0 });
 
   useEffect(() => {
     const keys = new Set(visibleEvents.map(eventKey));
     const newCount = [...keys].filter((key) => !previousKeys.current.has(key)).length;
     previousKeys.current = keys;
     if (newCount > 0) {
-      setAnnouncement(newCount === 1 ? "1 neues Aktivitätsereignis" : `${newCount} neue Aktivitätsereignisse`);
+      const text = newCount === 1 ? "1 neues Aktivitätsereignis" : `${newCount} neue Aktivitätsereignisse`;
+      setAnnouncement((current) => ({ text, sequence: current.sequence + 1 }));
     }
   }, [visibleEvents]);
 
@@ -38,7 +39,9 @@ export function ActivityFeed({ events, reconnecting = false }: ActivityFeedProps
         <div><p className="eyebrow">Live</p><h2 id="activity-title">Live-Aktivitäten</h2></div>
         <span>{reconnecting ? "Stream verbindet erneut" : `${visibleEvents.length} Ereignisse`}</span>
       </div>
-      <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">{announcement}</p>
+      <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {announcement.text && `${announcement.text} · Aktualisierung ${announcement.sequence}`}
+      </p>
       {visibleEvents.length === 0 ? <p className="section-empty">Noch keine Ressourcenaktivität erfasst.</p> : (
         <ol className="activity-list" aria-label="Aktivitätsereignisse">
           {visibleEvents.map((event) => {
