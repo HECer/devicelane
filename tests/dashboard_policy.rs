@@ -34,7 +34,8 @@ fn rule(id: &str, effect: PolicyEffect) -> PolicyRule {
         operation: None,
         resources: vec![],
         expires_at_ms: None,
-        require_user_presence: None,
+        require_user_presence: false,
+        user_presence: None,
         physical_device: None,
         enabled: true,
         origin: PolicyOrigin::User,
@@ -80,7 +81,7 @@ fn matching_covers_all_scopes_presence_expiry_and_disabled_rules() {
     exact.operation = Some(req.operation.clone());
     exact.resources = req.resources.clone();
     exact.expires_at_ms = Some(NOW + 1);
-    exact.require_user_presence = Some(true);
+    exact.require_user_presence = true;
 
     let mut expired = exact.clone();
     expired.id = RuleId::parse("expired").unwrap();
@@ -255,7 +256,8 @@ fn approval_nonce_is_exact_target_bounded_one_use_and_remember_is_least_privileg
     assert_eq!(remembered.operation.as_ref(), Some(&req.operation));
     assert_eq!(remembered.resources, req.resources);
     assert_eq!(remembered.device_id, req.device_id);
-    assert_eq!(remembered.require_user_presence, Some(false));
+    assert!(!remembered.require_user_presence);
+    assert_eq!(remembered.user_presence, Some(false));
     assert_eq!(remembered.physical_device, Some(false));
     assert_eq!(
         engine.decide(
@@ -288,7 +290,8 @@ fn exact_remembered_rules_do_not_spill_across_presence_or_physical_device() {
             .unwrap()
             .created_rule
             .unwrap();
-        assert_eq!(created.require_user_presence, Some(user_present));
+        assert!(!created.require_user_presence);
+        assert_eq!(created.user_presence, Some(user_present));
         assert_eq!(created.physical_device, Some(physical_device));
         assert!(matches!(
             engine.evaluate(&req, NOW + 2),
@@ -346,7 +349,8 @@ fn expired_approval_is_rejected_and_deny_block_creates_exact_deny() {
     assert_eq!(block.effect, PolicyEffect::Deny);
     assert_eq!(block.device_id, req.device_id);
     assert_eq!(block.resources, req.resources);
-    assert_eq!(block.require_user_presence, Some(false));
+    assert!(!block.require_user_presence);
+    assert_eq!(block.user_presence, Some(false));
     assert_eq!(block.physical_device, Some(true));
 }
 
@@ -383,6 +387,38 @@ fn exact_block_rules_do_not_deny_opposite_presence_or_physical_device() {
             reason: "no_matching_rule".into()
         }
     );
+}
+
+#[test]
+fn legacy_presence_false_is_wildcard_and_true_requires_presence() {
+    let mut req = request("workspace.read", vec![ResourceClass::WorkspaceRead]);
+    let mut legacy = rule("legacy", PolicyEffect::Allow);
+    legacy.require_user_presence = false;
+    let wildcard = PolicyEngine::with_rules(vec![legacy.clone()]).unwrap();
+    assert!(matches!(
+        wildcard.evaluate(&req, NOW),
+        PolicyDecision::Allowed { .. }
+    ));
+    req.user_present = true;
+    assert!(matches!(
+        wildcard.evaluate(&req, NOW),
+        PolicyDecision::Allowed { .. }
+    ));
+
+    legacy.require_user_presence = true;
+    let required = PolicyEngine::with_rules(vec![legacy]).unwrap();
+    req.user_present = false;
+    assert_eq!(
+        required.evaluate(&req, NOW),
+        PolicyDecision::ApprovalRequired {
+            reason: "no_matching_rule".into()
+        }
+    );
+    req.user_present = true;
+    assert!(matches!(
+        required.evaluate(&req, NOW),
+        PolicyDecision::Allowed { .. }
+    ));
 }
 
 #[test]

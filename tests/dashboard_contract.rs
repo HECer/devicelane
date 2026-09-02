@@ -171,7 +171,8 @@ fn every_representative_struct_rejects_unknown_fields() {
             operation: Some(operation_id("build-ios")),
             resources: vec![ResourceClass::WorkspaceRead],
             expires_at_ms: None,
-            require_user_presence: Some(false),
+            require_user_presence: false,
+            user_presence: None,
             physical_device: None,
             enabled: true,
             origin: PolicyOrigin::User,
@@ -245,7 +246,8 @@ fn duplicate_resources_are_rejected() {
         operation: None,
         resources: vec![ResourceClass::Signing, ResourceClass::Signing],
         expires_at_ms: None,
-        require_user_presence: Some(true),
+        require_user_presence: true,
+        user_presence: None,
         physical_device: None,
         enabled: true,
         origin: PolicyOrigin::Managed,
@@ -386,7 +388,8 @@ fn deserialization_cannot_bypass_semantic_validation() {
         operation: None,
         resources: vec![ResourceClass::Signing],
         expires_at_ms: None,
-        require_user_presence: Some(true),
+        require_user_presence: true,
+        user_presence: None,
         physical_device: None,
         enabled: true,
         origin: PolicyOrigin::User,
@@ -660,7 +663,8 @@ fn invalid_in_memory_models_cannot_cross_the_serialization_boundary() {
         operation: None,
         resources: vec![ResourceClass::Signing, ResourceClass::Signing],
         expires_at_ms: None,
-        require_user_presence: Some(false),
+        require_user_presence: false,
+        user_presence: None,
         physical_device: None,
         enabled: true,
         origin: PolicyOrigin::User,
@@ -792,13 +796,15 @@ fn policy_rule_boolean_constraints_round_trip_and_missing_fields_are_wildcards()
         operation: None,
         resources: vec![],
         expires_at_ms: None,
-        require_user_presence: Some(false),
+        require_user_presence: false,
+        user_presence: Some(false),
         physical_device: Some(true),
         enabled: true,
         origin: PolicyOrigin::User,
     };
     let encoded = serde_json::to_value(&rule).unwrap();
     assert_eq!(encoded["require_user_presence"], false);
+    assert_eq!(encoded["user_presence"], false);
     assert_eq!(encoded["physical_device"], true);
     assert_eq!(serde_json::from_value::<PolicyRule>(encoded).unwrap(), rule);
 
@@ -813,10 +819,21 @@ fn policy_rule_boolean_constraints_round_trip_and_missing_fields_are_wildcards()
         "operation": null,
         "resources": [],
         "expires_at_ms": null,
+        "require_user_presence": false,
         "enabled": true,
         "origin": "user"
     });
     let wildcard: PolicyRule = serde_json::from_value(wildcard).unwrap();
-    assert_eq!(wildcard.require_user_presence, None);
+    assert!(!wildcard.require_user_presence);
+    assert_eq!(wildcard.user_presence, None);
     assert_eq!(wildcard.physical_device, None);
+
+    let mut contradictory = rule;
+    contradictory.require_user_presence = true;
+    contradictory.user_presence = Some(false);
+    assert!(serde_json::to_value(&contradictory).is_err());
+    let mut encoded = serde_json::to_value(&wildcard).unwrap();
+    encoded["require_user_presence"] = json!(true);
+    encoded["user_presence"] = json!(false);
+    assert!(serde_json::from_value::<PolicyRule>(encoded).is_err());
 }

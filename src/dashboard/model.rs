@@ -571,7 +571,8 @@ pub struct PolicyRule {
     pub operation: Option<OperationId>,
     pub resources: Vec<ResourceClass>,
     pub expires_at_ms: Option<u64>,
-    pub require_user_presence: Option<bool>,
+    pub require_user_presence: bool,
+    pub user_presence: Option<bool>,
     pub physical_device: Option<bool>,
     pub enabled: bool,
     pub origin: PolicyOrigin,
@@ -579,7 +580,14 @@ pub struct PolicyRule {
 
 impl PolicyRule {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        validate_unique_resources(&self.resources)
+        validate_unique_resources(&self.resources)?;
+        if self.require_user_presence && self.user_presence == Some(false) {
+            return Err(ValidationError::at(
+                "conflicting_presence_constraints",
+                "user_presence",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1002,8 +1010,9 @@ struct PolicyRuleWire {
     operation: Option<OperationId>,
     resources: Vec<ResourceClass>,
     expires_at_ms: Option<u64>,
+    require_user_presence: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    require_user_presence: Option<bool>,
+    user_presence: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     physical_device: Option<bool>,
     enabled: bool,
@@ -1023,6 +1032,7 @@ validate_wire!(PolicyRuleWire, PolicyRule, |wire: PolicyRuleWire| {
         resources: wire.resources,
         expires_at_ms: wire.expires_at_ms,
         require_user_presence: wire.require_user_presence,
+        user_presence: wire.user_presence,
         physical_device: wire.physical_device,
         enabled: wire.enabled,
         origin: wire.origin,
@@ -1041,6 +1051,7 @@ validated_serialize!(PolicyRule, PolicyRuleWire, |value: &PolicyRule| {
         resources: value.resources.clone(),
         expires_at_ms: value.expires_at_ms,
         require_user_presence: value.require_user_presence,
+        user_presence: value.user_presence,
         physical_device: value.physical_device,
         enabled: value.enabled,
         origin: value.origin,
