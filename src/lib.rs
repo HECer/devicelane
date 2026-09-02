@@ -3184,7 +3184,7 @@ pub mod network_processes {
         }
     }
 
-    #[derive(Deserialize, Serialize)]
+    #[derive(Clone, Deserialize, Serialize)]
     #[serde(tag = "request", rename_all = "snake_case")]
     pub enum Request {
         Heartbeat {

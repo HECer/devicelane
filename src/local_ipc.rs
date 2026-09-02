@@ -12,11 +12,12 @@ use crate::network_processes::{LeaseRequest, Request as MeshRequest, Response as
 use crate::remote_apple_protocol::{AppleOperation, AppleRequest, RemoteProtocolVersion};
 use crate::secure_transport::SecureTransport;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -348,6 +349,7 @@ pub enum LocalProtocolError {
     ResyncRequired,
     LimitExceeded,
     RevisionConflict,
+    TargetOffline,
     RemoteUnavailable,
 }
 
@@ -372,6 +374,9 @@ impl fmt::Display for LocalProtocolError {
                 Self::ResyncRequired => "dashboard resynchronization required",
                 Self::LimitExceeded => "dashboard limit exceeded",
                 Self::RevisionConflict => "dashboard revision conflict",
+                Self::TargetOffline => {
+                    "target is offline; reconnect the paired target before requesting approval"
+                }
                 Self::RemoteUnavailable => {
                     "remote execution unavailable; verify paired registry and agent connectivity"
                 }
@@ -489,7 +494,7 @@ pub struct DaemonState {
     remote_execution: Option<RemoteExecutionConfig>,
     remote_execution_boundary: Option<Arc<dyn MeshRpcBoundary>>,
     remote_execution_timeout: Duration,
-    inflight_executions: HashSet<ActivityId>,
+    inflight_executions: HashMap<ActivityId, Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -565,6 +570,7 @@ struct RemoteExecutionJob {
     workspace_path: String,
     request_id: String,
     app_path: String,
+    cancelled: Arc<AtomicBool>,
 }
 
 struct DashboardPolicyRuntime {
@@ -595,7 +601,7 @@ impl DaemonState {
             remote_execution: None,
             remote_execution_boundary: None,
             remote_execution_timeout: Duration::from_secs(30),
-            inflight_executions: HashSet::new(),
+            inflight_executions: HashMap::new(),
         }
     }
 
@@ -612,7 +618,7 @@ impl DaemonState {
             remote_execution: None,
             remote_execution_boundary: None,
             remote_execution_timeout: Duration::from_secs(30),
-            inflight_executions: HashSet::new(),
+            inflight_executions: HashMap::new(),
         }
     }
 
@@ -630,7 +636,7 @@ impl DaemonState {
             remote_execution: None,
             remote_execution_boundary: None,
             remote_execution_timeout: Duration::from_secs(30),
-            inflight_executions: HashSet::new(),
+            inflight_executions: HashMap::new(),
         }
     }
 
@@ -700,9 +706,12 @@ impl DaemonState {
         {
             return Err(LocalProtocolError::PermissionDenied);
         }
-        if !self.inflight_executions.insert(activity_id) {
+        if self.inflight_executions.contains_key(&activity_id) {
             return Err(LocalProtocolError::RevisionConflict);
         }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.inflight_executions
+            .insert(activity_id.clone(), Arc::clone(&cancelled));
         Ok(RemoteExecutionJob {
             config,
             boundary: self
@@ -714,6 +723,7 @@ impl DaemonState {
             workspace_path,
             request_id,
             app_path,
+            cancelled,
         })
     }
 
@@ -798,6 +808,39 @@ impl DaemonState {
                 lifetime_ms,
                 ..
             } => {
+                let requires_remote_target =
+                    access.resources.contains(&ResourceClass::WorkspaceRead)
+                        && access.resources.contains(&ResourceClass::DeviceLease);
+                if requires_remote_target {
+                    let online = self
+                        .remote_execution
+                        .as_ref()
+                        .zip(self.remote_execution_boundary.as_ref())
+                        .and_then(|(config, boundary)| {
+                            boundary.call(config, &MeshRequest::List).ok()
+                        })
+                        .is_some_and(|response| {
+                            response.accepted
+                                && response.hosts.iter().any(|host| {
+                                    host.id == access.target_host_id.as_str()
+                                        && host.status == "online"
+                                        && access.device_id.as_ref().is_none_or(|device_id| {
+                                            host.devices.iter().any(|device| {
+                                                device.id == device_id.as_str()
+                                                    && device.state == "connected"
+                                            })
+                                        })
+                                })
+                        });
+                    if !online {
+                        self.dashboard
+                            .as_mut()
+                            .ok_or(LocalProtocolError::FeatureUnavailable)?
+                            .record_preapproval_target_offline(&access, now_ms)
+                            .map_err(map_dashboard_error)?;
+                        return Err(LocalProtocolError::TargetOffline);
+                    }
+                }
                 if let Some(service) = self.dashboard.as_mut() {
                     if session.local_host_id() != service.local_host_id()
                         || access.target_host_id != *service.local_host_id()
@@ -1029,6 +1072,11 @@ impl DaemonState {
                     .ok_or(LocalProtocolError::FeatureUnavailable)?
                     .cancel_activity(&activity_id, now_ms)
                     .map_err(map_dashboard_error)?;
+                if cancelled {
+                    if let Some(token) = self.inflight_executions.get(&activity_id) {
+                        token.store(true, Ordering::Release);
+                    }
+                }
                 Ok(LocalResponse::Cancellation { cancelled })
             }
             LocalRequest::PauseRemoteAccessWithJobs { existing_jobs, .. } => {
@@ -1173,6 +1221,57 @@ fn classify_remote_rejection(value: Option<&str>) -> RemoteExecutionFailure {
     }
 }
 
+fn interruptible_rpc(
+    job: &RemoteExecutionJob,
+    request: MeshRequest,
+) -> Result<MeshResponse, RemoteExecutionFailure> {
+    let boundary = Arc::clone(&job.boundary);
+    let config = job.config.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(boundary.call(&config, &request));
+    });
+    loop {
+        if job.cancelled.load(Ordering::Acquire) {
+            return Err(RemoteExecutionFailure::Cancelled);
+        }
+        match receiver.recv_timeout(Duration::from_millis(20)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(RemoteExecutionFailure::RegistryDisconnected);
+            }
+        }
+    }
+}
+
+fn bounded_cleanup_rpc(job: &RemoteExecutionJob, request: MeshRequest) {
+    let boundary = Arc::clone(&job.boundary);
+    let config = job.config.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(boundary.call(&config, &request));
+    });
+    let _ = receiver.recv_timeout(Duration::from_millis(500));
+}
+
+fn cancel_remote_job(job: &RemoteExecutionJob, job_id: &str, lease_id: &str) {
+    bounded_cleanup_rpc(
+        job,
+        MeshRequest::AppleCancel {
+            job_id: job_id.to_owned(),
+        },
+    );
+    bounded_cleanup_rpc(
+        job,
+        MeshRequest::Lease {
+            operation: LeaseRequest::Release {
+                lease_id: lease_id.to_owned(),
+            },
+        },
+    );
+}
+
 fn execute_remote_job(
     state: &Arc<Mutex<DaemonState>>,
     job: &RemoteExecutionJob,
@@ -1205,6 +1304,17 @@ fn execute_remote_job(
     let grant = lease
         .lease_grant
         .ok_or_else(|| classify_remote_rejection(lease.error.as_deref()))?;
+    if job.cancelled.load(Ordering::Acquire) {
+        bounded_cleanup_rpc(
+            job,
+            MeshRequest::Lease {
+                operation: LeaseRequest::Release {
+                    lease_id: grant.lease_id,
+                },
+            },
+        );
+        return Err(RemoteExecutionFailure::Cancelled);
+    }
     {
         let mut daemon = state
             .lock()
@@ -1243,6 +1353,10 @@ fn execute_remote_job(
         return Err(classify_remote_rejection(accepted.error.as_deref()));
     }
     .ok_or(RemoteExecutionFailure::AgentIncompatible)?;
+    if job.cancelled.load(Ordering::Acquire) {
+        cancel_remote_job(job, &job_id, &grant.lease_id);
+        return Err(RemoteExecutionFailure::Cancelled);
+    }
     transition_execution(
         state,
         &job.activity.activity_id,
@@ -1259,9 +1373,9 @@ fn execute_remote_job(
         if Instant::now() >= deadline {
             return Err(last_failure);
         }
-        match job.boundary.call(
-            &job.config,
-            &MeshRequest::Events {
+        match interruptible_rpc(
+            job,
+            MeshRequest::Events {
                 job_id: job_id.clone(),
                 after,
             },
@@ -1310,6 +1424,10 @@ fn execute_remote_job(
                     );
                     return Ok(());
                 }
+            }
+            Err(RemoteExecutionFailure::Cancelled) => {
+                cancel_remote_job(job, &job_id, &grant.lease_id);
+                return Err(RemoteExecutionFailure::Cancelled);
             }
             Err(failure) if !reconnecting => {
                 last_failure = failure;
@@ -1674,6 +1792,7 @@ fn error_response(error: LocalProtocolError) -> LocalResponse {
             LocalProtocolError::ResyncRequired => "resync_required",
             LocalProtocolError::LimitExceeded => "limit_exceeded",
             LocalProtocolError::RevisionConflict => "revision_conflict",
+            LocalProtocolError::TargetOffline => "target_offline",
             LocalProtocolError::RemoteUnavailable => "remote_unavailable",
             _ => "invalid_request",
         }

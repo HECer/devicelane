@@ -358,6 +358,51 @@ impl DashboardService {
         self.activities.get(id)
     }
 
+    pub fn record_preapproval_target_offline(
+        &mut self,
+        access: &AccessRequest,
+        now_ms: u64,
+    ) -> Result<(), DashboardServiceError> {
+        self.audit_access_with_message(
+            access,
+            PolicyEffect::Deny,
+            AuditResult::Failed,
+            Some(super::MessageCode::TargetOffline),
+            now_ms,
+        )?;
+        let sequence = self
+            .activities
+            .get(&access.activity_id)
+            .map_or(1, |event| event.sequence.saturating_add(1));
+        self.record_activity(
+            ActivityEvent {
+                activity_id: access.activity_id.clone(),
+                sequence,
+                occurred_at_ms: now_ms,
+                principal_id: access.principal_id.clone(),
+                source_host_id: access.source_host_id.clone(),
+                target_host_id: access.target_host_id.clone(),
+                device_id: access.device_id.clone(),
+                operation: access.operation.clone(),
+                resources: access.resources.clone(),
+                authorization: Authorization {
+                    effect: PolicyEffect::Deny,
+                    rule_id: None,
+                    approval_id: None,
+                },
+                state: ActivityState::Failed,
+                message: Some(
+                    super::DisplayMessage::new(super::MessageCode::TargetOffline, Vec::new())
+                        .expect("constant message"),
+                ),
+                metrics: unavailable_metrics(),
+                started_at_ms: Some(now_ms),
+                finished_at_ms: Some(now_ms),
+            },
+            &format!("target-offline-preapproval:{}", access.activity_id.as_str()),
+        )
+    }
+
     /// Projects only a controller identity that has already completed the mTLS handshake. A TCP
     /// connection alone never calls this boundary.
     pub fn observe_authenticated_controller(

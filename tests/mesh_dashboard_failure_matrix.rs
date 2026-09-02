@@ -16,7 +16,8 @@ use device_development_mesh::local_ipc::{
     local_endpoint, send_local_request, serve_local,
 };
 use device_development_mesh::network_processes::{
-    LeaseGrant, LeaseRequest, NetworkEvent, Request as MeshRequest, Response as MeshResponse,
+    DeviceSnapshot, HostSnapshot, LeaseGrant, LeaseRequest, NetworkEvent, Request as MeshRequest,
+    Response as MeshResponse,
 };
 use std::fs;
 use std::sync::{Arc, Mutex};
@@ -32,6 +33,7 @@ enum ExternalFailureCase {
     StaleLease,
     OldAgentOptionalMessage,
     CancellationRace,
+    AuditDiskFailure,
 }
 
 impl ExternalFailureCase {
@@ -44,12 +46,14 @@ impl ExternalFailureCase {
             Self::StaleLease => MessageCode::LeaseStale,
             Self::OldAgentOptionalMessage => MessageCode::AgentIncompatible,
             Self::CancellationRace => MessageCode::OperationCancelled,
+            Self::AuditDiskFailure => MessageCode::AuditUnavailable,
         }
     }
 }
 
 struct ScriptedMeshBoundary {
     case: ExternalFailureCase,
+    calls: Arc<Mutex<Vec<String>>>,
 }
 
 impl MeshRpcBoundary for ScriptedMeshBoundary {
@@ -58,7 +62,29 @@ impl MeshRpcBoundary for ScriptedMeshBoundary {
         _config: &RemoteExecutionConfig,
         request: &MeshRequest,
     ) -> Result<MeshResponse, RemoteExecutionFailure> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(request_name(request).into());
         match request {
+            MeshRequest::List => {
+                if matches!(self.case, ExternalFailureCase::TargetOfflinePreapproval) {
+                    Ok(response().accepted_hosts(vec![]))
+                } else {
+                    Ok(response().accepted_hosts(vec![HostSnapshot {
+                        id: "mac-agent".into(),
+                        operating_system: "macos".into(),
+                        architecture: "arm64".into(),
+                        status: "online".into(),
+                        capabilities: vec!["apple.simulator@1".into()],
+                        devices: vec![DeviceSnapshot {
+                            id: "simulator-1".into(),
+                            platform: "ios".into(),
+                            state: "connected".into(),
+                        }],
+                    }]))
+                }
+            }
             MeshRequest::Lease {
                 operation: LeaseRequest::Acquire { device_id, .. },
             } => {
@@ -90,7 +116,15 @@ impl MeshRpcBoundary for ScriptedMeshBoundary {
                     Ok(response().rejected(Some("event_resync_required")))
                 }
                 ExternalFailureCase::CancellationRace => {
-                    thread::sleep(Duration::from_millis(250));
+                    thread::sleep(Duration::from_secs(5));
+                    Ok(response().events(vec![NetworkEvent {
+                        sequence: 1,
+                        kind: "completed".into(),
+                        payload: String::new(),
+                    }]))
+                }
+                ExternalFailureCase::AuditDiskFailure => {
+                    thread::sleep(Duration::from_millis(200));
                     Ok(response().events(vec![NetworkEvent {
                         sequence: 1,
                         kind: "completed".into(),
@@ -106,6 +140,7 @@ impl MeshRpcBoundary for ScriptedMeshBoundary {
             MeshRequest::Lease {
                 operation: LeaseRequest::Release { .. },
             } => Ok(response()),
+            MeshRequest::AppleCancel { .. } => Ok(response().accepted_hosts(vec![])),
             other => panic!("unexpected production request: {}", request_name(other)),
         }
     }
@@ -113,8 +148,14 @@ impl MeshRpcBoundary for ScriptedMeshBoundary {
 
 fn request_name(request: &MeshRequest) -> &'static str {
     match request {
-        MeshRequest::Lease { .. } => "lease",
+        MeshRequest::Lease {
+            operation: LeaseRequest::Acquire { .. },
+        } => "lease_acquire",
+        MeshRequest::Lease {
+            operation: LeaseRequest::Release { .. },
+        } => "lease_release",
         MeshRequest::AppleRun { .. } => "apple_run",
+        MeshRequest::AppleCancel { .. } => "apple_cancel",
         MeshRequest::Events { .. } => "events",
         _ => "other",
     }
@@ -145,6 +186,7 @@ trait ResponseBuilder {
     fn accepted_job(self, job_id: &str) -> Self;
     fn events(self, events: Vec<NetworkEvent>) -> Self;
     fn rejected(self, error: Option<&str>) -> Self;
+    fn accepted_hosts(self, hosts: Vec<HostSnapshot>) -> Self;
 }
 
 impl ResponseBuilder for MeshResponse {
@@ -171,11 +213,18 @@ impl ResponseBuilder for MeshResponse {
         self.error = error.map(str::to_owned);
         self
     }
+
+    fn accepted_hosts(mut self, hosts: Vec<HostSnapshot>) -> Self {
+        self.accepted = true;
+        self.hosts = hosts;
+        self
+    }
 }
 
 struct Fixture {
     _root: tempfile::TempDir,
     endpoint: LocalEndpoint,
+    mesh_calls: Arc<Mutex<Vec<String>>>,
 }
 
 fn fixture(case: ExternalFailureCase) -> Fixture {
@@ -233,6 +282,7 @@ fn fixture_with_policy(case: ExternalFailureCase, policy: PolicyEngine) -> Fixtu
         Arc::new(Mutex::new(audit)),
         policy,
     ));
+    let mesh_calls = Arc::new(Mutex::new(Vec::new()));
     state.enable_remote_execution_with_boundary(
         RemoteExecutionConfig {
             registry_address: "unused.invalid:1".into(),
@@ -240,7 +290,10 @@ fn fixture_with_policy(case: ExternalFailureCase, policy: PolicyEngine) -> Fixtu
             identity_path: root.path().join("identity"),
             client_id: "windows-client".into(),
         },
-        Arc::new(ScriptedMeshBoundary { case }),
+        Arc::new(ScriptedMeshBoundary {
+            case,
+            calls: Arc::clone(&mesh_calls),
+        }),
         Duration::from_secs(1),
     );
     let server_endpoint = endpoint.clone();
@@ -262,6 +315,7 @@ fn fixture_with_policy(case: ExternalFailureCase, policy: PolicyEngine) -> Fixtu
     Fixture {
         _root: root,
         endpoint,
+        mesh_calls,
     }
 }
 
@@ -354,7 +408,6 @@ fn approved_access(endpoint: &LocalEndpoint, id: &str) -> AccessRequest {
 #[test]
 fn external_failure_matrix_terminates_the_real_worker_with_stable_identity_and_audit() {
     for case in [
-        ExternalFailureCase::TargetOfflinePreapproval,
         ExternalFailureCase::DisconnectPostauth,
         ExternalFailureCase::ObserverUnavailable,
         ExternalFailureCase::OverflowResync,
@@ -449,8 +502,59 @@ fn external_failure_matrix_terminates_the_real_worker_with_stable_identity_and_a
 }
 
 #[test]
-fn expired_approval_terminates_the_same_activity_with_actionable_audit() {
+fn offline_target_terminates_before_approval_with_the_requested_activity_id() {
     let fixture = fixture(ExternalFailureCase::TargetOfflinePreapproval);
+    let access = AccessRequest {
+        activity_id: ActivityId::parse("failure-target-offline-preapproval").unwrap(),
+        principal_id: PrincipalId::parse("windows-agent").unwrap(),
+        source_host_id: HostId::parse("windows-client").unwrap(),
+        target_host_id: HostId::parse("mac-agent").unwrap(),
+        device_id: Some(DeviceId::parse("simulator-1").unwrap()),
+        operation: OperationId::parse("apple.install-app").unwrap(),
+        resources: vec![ResourceClass::WorkspaceRead, ResourceClass::DeviceLease],
+        physical_device: false,
+        user_present: true,
+    };
+    assert!(matches!(
+        send_local_request(
+            &fixture.endpoint,
+            &LocalRequest::RequestApproval {
+                version: LocalProtocolVersion::CURRENT,
+                access: access.clone(),
+                lifetime_ms: 30_000,
+            }
+        )
+        .unwrap(),
+        LocalResponse::Error { code, .. } if code == "target_offline"
+    ));
+    assert!(matches!(
+        send_local_request(
+            &fixture.endpoint,
+            &LocalRequest::PendingApprovals {
+                version: LocalProtocolVersion::CURRENT,
+            }
+        )
+        .unwrap(),
+        LocalResponse::PendingApprovals(items) if items.is_empty()
+    ));
+    let terminal = activity_events(&fixture.endpoint)
+        .into_iter()
+        .find(|event| event.activity_id == access.activity_id)
+        .expect("offline activity missing");
+    assert_eq!(terminal.state, ActivityState::Failed);
+    assert_eq!(terminal.message.unwrap().code, MessageCode::TargetOffline);
+    assert_eq!(
+        terminal_audit(&fixture.endpoint, &access.activity_id, AuditResult::Failed)
+            .redacted_message
+            .unwrap()
+            .code,
+        MessageCode::TargetOffline
+    );
+}
+
+#[test]
+fn expired_approval_terminates_the_same_activity_with_actionable_audit() {
+    let fixture = fixture(ExternalFailureCase::CancellationRace);
     let access = AccessRequest {
         activity_id: ActivityId::parse("failure-expired-approval").unwrap(),
         principal_id: PrincipalId::parse("windows-agent").unwrap(),
@@ -525,7 +629,7 @@ fn deny_override_records_a_terminal_activity_in_the_production_approval_path() {
         origin: PolicyOrigin::User,
     };
     let fixture = fixture_with_policy(
-        ExternalFailureCase::TargetOfflinePreapproval,
+        ExternalFailureCase::CancellationRace,
         PolicyEngine::with_rules(vec![deny]).unwrap(),
     );
     let access = AccessRequest {
@@ -617,7 +721,21 @@ fn cancellation_race_has_one_terminal_winner_and_preserves_activity_id() {
         .unwrap(),
         LocalResponse::Cancellation { cancelled: true }
     ));
-    thread::sleep(Duration::from_millis(350));
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let calls = fixture.mesh_calls.lock().unwrap().clone();
+        if calls
+            .windows(2)
+            .any(|calls| calls == ["apple_cancel".to_owned(), "lease_release".to_owned()])
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "remote cancellation did not send AppleCancel followed by LeaseRelease: {calls:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     let events: Vec<_> = activity_events(&fixture.endpoint)
         .into_iter()
         .filter(|event| event.activity_id == access.activity_id)
@@ -655,7 +773,7 @@ fn cancellation_race_has_one_terminal_winner_and_preserves_activity_id() {
 
 #[test]
 fn audit_disk_failure_fails_closed_and_surfaces_a_stable_terminal_error() {
-    let fixture = fixture(ExternalFailureCase::CancellationRace);
+    let fixture = fixture(ExternalFailureCase::AuditDiskFailure);
     let access = approved_access(&fixture.endpoint, "failure-audit-disk");
     assert!(matches!(
         send_local_request(
