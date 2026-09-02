@@ -41,6 +41,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
       - name: Locked desktop dependencies
         run: npm ci --prefix desktop
+      - name: Stage native sidecars for workspace build
+        run: npm run stage:sidecar --prefix desktop -- --debug
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
       - run: cargo test --test desktop_distribution --locked
