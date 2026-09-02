@@ -914,7 +914,7 @@ fn pair_process_optional(
             break;
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let transient_refusal = connection_refused(&stderr);
+        let transient_refusal = connection_unavailable(&stderr);
         assert!(
             transient_refusal,
             "pairing failed with {}; stderr={stderr}",
@@ -963,7 +963,7 @@ fn wait_for_mesh_host(address: &str, identity: &Path, host: &str) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
             assert!(
-                connection_refused(&stderr),
+                connection_unavailable(&stderr),
                 "mesh host lookup failed with {}; stderr={stderr}",
                 output.status
             );
@@ -991,9 +991,9 @@ fn wait_for_mesh_host(address: &str, identity: &Path, host: &str) {
     }
 }
 
-fn connection_refused(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    lower.contains("connection refused") || lower.contains("actively refused")
+fn connection_unavailable(stderr: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(stderr.trim())
+        .is_ok_and(|error| error["error"] == "connection_unavailable")
 }
 
 fn wait_for_daemon(endpoint: &LocalEndpoint) {

@@ -1,7 +1,10 @@
+use device_development_mesh::secure_transport::SecureTransport;
 use serde_json::Value;
 use std::{
     net::TcpListener,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 #[test]
@@ -56,6 +59,52 @@ fn client_receives_registry_agent_timeout_instead_of_timing_out_first() {
     );
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(response["error"], "agent_timeout");
+}
+
+#[test]
+fn pair_reports_a_stable_machine_readable_connection_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let identity = root.path().join("cli");
+    SecureTransport::load_or_create(&identity, "cli").unwrap();
+    let address = free_address();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mesh-cli"));
+    command.args([
+        "pair",
+        "--address",
+        &address,
+        "--identity",
+        identity.to_str().unwrap(),
+    ]);
+    let output = bounded_output(command, Duration::from_secs(15));
+
+    assert!(!output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).unwrap(),
+        serde_json::json!({"error": "connection_unavailable"})
+    );
+}
+
+fn bounded_output(mut command: Command, timeout: Duration) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "command did not terminate within {timeout:?}; stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn pair(registry_identity: &std::path::Path, cli_identity: &std::path::Path) {

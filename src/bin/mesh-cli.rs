@@ -11,7 +11,7 @@ use std::{
     collections::HashSet,
     fs,
     io::{BufRead, BufReader, Write},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
     path::{Component, Path},
     process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -64,7 +64,7 @@ fn main() {
         let peer_id = optional_value(&a, "--peer-id").unwrap_or_else(|| "cli".into());
         let mut identity =
             SecureTransport::load_or_create(value(&a, "--identity"), peer_id).unwrap();
-        let mut reader = BufReader::new(connect(&value(&a, "--address")));
+        let mut reader = BufReader::new(connect_or_exit(&value(&a, "--address")));
         let mut challenge = String::new();
         reader.read_line(&mut challenge).unwrap();
         let challenge: serde_json::Value = serde_json::from_str(&challenge).unwrap();
@@ -137,7 +137,7 @@ fn main() {
         );
         return;
     }
-    let stream = connect(&address);
+    let stream = connect_or_exit(&address);
     stream
         // A legacy Run RPC may wait up to fifteen seconds for a busy agent.
         // Keep the client deadline beyond the server deadline so
@@ -210,7 +210,9 @@ fn main() {
 }
 
 fn registry_rpc(address: &str, transport: &SecureTransport, request: Request) -> Response {
-    let mut stream = transport.connect_tls(connect(address), "registry").unwrap();
+    let mut stream = transport
+        .connect_tls(connect_or_exit(address), "registry")
+        .unwrap();
     serde_json::to_writer(&mut stream, &request).unwrap();
     stream.write_all(b"\n").unwrap();
     let mut line = String::new();
@@ -656,14 +658,48 @@ fn trusted_openssl() -> Result<std::path::PathBuf, String> {
     }
     Err("trusted system OpenSSL is unavailable".into())
 }
-fn connect(address: &str) -> TcpStream {
-    for _ in 0..100 {
-        if let Ok(stream) = TcpStream::connect(address) {
-            return stream;
+fn connect_or_exit(address: &str) -> TcpStream {
+    connect(address).unwrap_or_else(|code| exit_with_error(code))
+}
+
+fn connect(address: &str) -> Result<TcpStream, &'static str> {
+    let addresses = address
+        .to_socket_addrs()
+        .map_err(|_| "connection_invalid_address")?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err("connection_invalid_address");
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut last_code = "connection_failed";
+    loop {
+        for address in &addresses {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(last_code);
+            }
+            match TcpStream::connect_timeout(address, remaining.min(Duration::from_millis(100))) {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last_code = connection_error_code(error.kind()),
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(last_code);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    TcpStream::connect(address).unwrap()
+}
+
+fn connection_error_code(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut => {
+            "connection_unavailable"
+        }
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::InvalidInput => {
+            "connection_invalid_address"
+        }
+        _ => "connection_failed",
+    }
 }
 fn value(a: &[String], n: &str) -> String {
     a.iter()
