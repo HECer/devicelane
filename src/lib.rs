@@ -786,6 +786,26 @@ pub mod secure_transport {
             .map_err(|_| TransportError::InvalidCertificate)
         }
 
+        pub fn verify_certificate_signature(
+            signer_id: &str,
+            certificate: &[u8],
+            message: &[u8],
+            signature_bytes: &[u8],
+        ) -> Result<(), TransportError> {
+            use x509_parser::prelude::FromDer;
+            if certificate_dns_name(certificate)? != signer_id {
+                return Err(TransportError::InvalidCertificate);
+            }
+            let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate)
+                .map_err(|_| TransportError::InvalidCertificate)?;
+            signature::UnparsedPublicKey::new(
+                &signature::ECDSA_P256_SHA256_ASN1,
+                parsed.public_key().subject_public_key.data.as_ref(),
+            )
+            .verify(message, signature_bytes)
+            .map_err(|_| TransportError::InvalidCertificate)
+        }
+
         pub fn issue_pairing_code(&mut self, lifetime: Duration) -> String {
             let mut random = [0_u8; 16];
             OsRng.fill_bytes(&mut random);

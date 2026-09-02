@@ -683,3 +683,54 @@ fn unix_runtime_rejects_symlinks_and_insecure_permissions() {
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(device_development_mesh::local_ipc::local_endpoint(&target, "").is_err());
 }
+
+#[test]
+fn service_managed_policy_configuration_is_paired_and_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("identity");
+    let runtime = temp.path().join("runtime");
+    let logs = temp.path().join("logs");
+    for path in [&identity, &runtime, &logs] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let policy = temp.path().join("policy.json");
+    let trust = temp.path().join("admins.json");
+    std::fs::write(&policy, b"{}").unwrap();
+    std::fs::write(&trust, b"{}").unwrap();
+    #[cfg(windows)]
+    let listen = format!(r"\\.\pipe\devicelane-managed-config-{}", std::process::id());
+    #[cfg(unix)]
+    let listen = runtime.join("managed-config.sock").display().to_string();
+    let base = [
+        "--identity",
+        identity.to_str().unwrap(),
+        "--runtime-dir",
+        runtime.to_str().unwrap(),
+        "--role",
+        "workstation",
+        "--listen",
+        &listen,
+        "--log-dir",
+        logs.to_str().unwrap(),
+    ];
+    let missing_pair = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+        .args(base)
+        .args(["--managed-policy", policy.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!missing_pair.status.success());
+    assert!(String::from_utf8_lossy(&missing_pair.stderr).contains("configured together"));
+
+    let invalid = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+        .args(base)
+        .args([
+            "--managed-policy",
+            policy.to_str().unwrap(),
+            "--policy-admin-trust",
+            trust.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid policy admin trust store"));
+}

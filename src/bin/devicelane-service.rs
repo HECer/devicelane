@@ -1,3 +1,6 @@
+use device_development_mesh::dashboard::managed_policy::{
+    ManagedPolicyStore, PolicyAdminTrustStore,
+};
 use device_development_mesh::dashboard::{HostId, policy::PolicyEngine};
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, DiagnosticItem, LocalProtocolVersion,
@@ -16,6 +19,9 @@ struct Args {
     agent_peer: String,
     log_dir: PathBuf,
     foreground: bool,
+    managed_policy: Option<PathBuf>,
+    policy_admin_trust: Option<PathBuf>,
+    policy_admin_sids: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -37,6 +43,9 @@ fn parse_args() -> Result<Args, String> {
             "--listen" => parsed.listen = value,
             "--agent-peer" => parsed.agent_peer = value,
             "--log-dir" => parsed.log_dir = value.into(),
+            "--managed-policy" => parsed.managed_policy = Some(value.into()),
+            "--policy-admin-trust" => parsed.policy_admin_trust = Some(value.into()),
+            "--policy-admin-sid" => parsed.policy_admin_sids.push(value),
             _ => return Err(format!("unknown argument: {flag}")),
         }
     }
@@ -46,6 +55,9 @@ fn parse_args() -> Result<Args, String> {
     if parsed.role != "workstation" && (parsed.registry.is_empty() || parsed.agent_peer.is_empty())
     {
         return Err("--registry and --agent-peer are required for remote roles".into());
+    }
+    if parsed.managed_policy.is_some() != parsed.policy_admin_trust.is_some() {
+        return Err("--managed-policy and --policy-admin-trust must be configured together".into());
     }
     validate_state_paths([
         parsed.identity.as_path(),
@@ -97,7 +109,20 @@ fn run() -> Result<(), String> {
             healthy: true,
         }],
     );
-    daemon_state.enable_dashboard_policy(local_host_id, PolicyEngine::new());
+    let mut policy_engine = PolicyEngine::new();
+    if let (Some(policy_path), Some(trust_path)) = (
+        args.managed_policy.as_deref(),
+        args.policy_admin_trust.as_deref(),
+    ) {
+        let trust = PolicyAdminTrustStore::load(trust_path, args.policy_admin_sids.clone())
+            .map_err(|error| format!("invalid policy admin trust store: {error:?}"))?;
+        let managed = ManagedPolicyStore::load(policy_path, &trust)
+            .map_err(|error| format!("invalid managed policy store: {error:?}"))?;
+        policy_engine
+            .add_verified_managed_rules(managed)
+            .map_err(|error| format!("invalid managed policy rules: {error:?}"))?;
+    }
+    daemon_state.enable_dashboard_policy(local_host_id, policy_engine);
     let state = Arc::new(Mutex::new(daemon_state));
     if args.foreground {
         eprintln!("devicelane-service: listening on {}", args.listen);
