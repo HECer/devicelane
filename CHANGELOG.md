@@ -9,6 +9,9 @@
   path. The physical Mac gate now pins Darwin arm64 binaries by hash/version, requires an
   authenticated controller session, separates cursor resync from reconnect, and retains only one
   allow-listed redacted JSON record with a canonical audit digest.
+- Bound the hardware-gate controller endpoint, peer, Windows SID-derived principal, certificate-
+  derived source host, fresh Mac challenge, and expiry into a short-lived signed controller-session
+  assertion. The Mac verifies it against the paired trust store and rejects mismatched parameters.
 - Added stable fail-closed dashboard outcomes for offline targets, authenticated disconnects,
   daemon restarts, observer loss, event resync, audit-store failure, expired approvals,
   deny-overrides, stale leases, cancellation races, and incompatible older agents. Every outcome

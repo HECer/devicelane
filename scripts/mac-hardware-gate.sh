@@ -16,14 +16,15 @@ AGENT_PEER=local-mac-agent
 ARCHIVE_STDOUT=false
 MESH_CONTROLLER=
 MESH_ENDPOINT=
-WINDOWS_PRINCIPAL=
-WINDOWS_SOURCE_HOST=
 MESH_ACTIVITY_ID=
 MESH_TIMEOUT_SECONDS=300
 DEVICELANE_BINARY=
 DEVICELANE_SHA256=
 DEVICELANE_VERSION=
 CONTROLLER_PEER_ID=
+CONTROLLER_SESSION_ASSERTION=
+CONTROLLER_SESSION_CHALLENGE=
+MESH_IDENTITY=
 
 repair() {
     printf 'hardware_gate_failed=%s\nnext_step=%s\n' "$1" "$2" >&2
@@ -43,14 +44,15 @@ while [ "$#" -gt 0 ]; do
         --agent-peer) shift; AGENT_PEER=${1:-} ;;
         --mesh-controller) shift; MESH_CONTROLLER=${1:-} ;;
         --mesh-endpoint) shift; MESH_ENDPOINT=${1:-} ;;
-        --windows-principal) shift; WINDOWS_PRINCIPAL=${1:-} ;;
-        --windows-source-host) shift; WINDOWS_SOURCE_HOST=${1:-} ;;
         --mesh-activity-id) shift; MESH_ACTIVITY_ID=${1:-} ;;
         --mesh-timeout-seconds) shift; MESH_TIMEOUT_SECONDS=${1:-} ;;
         --devicelane-binary) shift; DEVICELANE_BINARY=${1:-} ;;
         --devicelane-sha256) shift; DEVICELANE_SHA256=${1:-} ;;
         --devicelane-version) shift; DEVICELANE_VERSION=${1:-} ;;
         --controller-peer-id) shift; CONTROLLER_PEER_ID=${1:-} ;;
+        --controller-session-assertion) shift; CONTROLLER_SESSION_ASSERTION=${1:-} ;;
+        --controller-session-challenge) shift; CONTROLLER_SESSION_CHALLENGE=${1:-} ;;
+        --mesh-identity) shift; MESH_IDENTITY=${1:-} ;;
         --archive-stdout) ARCHIVE_STDOUT=true ;;
         *) repair invalid_argument "Use --device UDID --team TEAM_ID --output DIRECTORY --job-id ID --agent-peer ID and the documented --mesh-* arguments." ;;
     esac
@@ -59,9 +61,12 @@ done
 
 run_mesh_gate() {
     [ "${DEVICELANE_REAL_MESH_GATE:-0}" = 1 ] || repair mesh_gate_not_authorized "Set DEVICELANE_REAL_MESH_GATE=1 only for a real paired Windows-to-Mac run."
-    for value in "$MESH_CONTROLLER" "$MESH_ENDPOINT" "$WINDOWS_PRINCIPAL" "$WINDOWS_SOURCE_HOST" "$MESH_ACTIVITY_ID" "$CONTROLLER_PEER_ID"; do
-        [ -n "$value" ] || repair mesh_gate_argument_missing "Pass the documented controller, endpoint, principal, source, activity, and controller-peer arguments."
+    for value in "$MESH_CONTROLLER" "$MESH_ENDPOINT" "$MESH_ACTIVITY_ID" "$CONTROLLER_PEER_ID" "$CONTROLLER_SESSION_ASSERTION" "$CONTROLLER_SESSION_CHALLENGE" "$MESH_IDENTITY"; do
+        [ -n "$value" ] || repair mesh_gate_argument_missing "Pass the documented controller, endpoint, activity, controller-peer, signed-session, challenge, and mesh-identity arguments."
     done
+    [ -f "$CONTROLLER_SESSION_ASSERTION" ] && [ ! -L "$CONTROLLER_SESSION_ASSERTION" ] || repair controller_session_missing "Copy the short-lived signed controller-session assertion from the paired Windows controller."
+    [ -d "$MESH_IDENTITY" ] && [ ! -L "$MESH_IDENTITY" ] || repair mesh_identity_missing "Use the paired Mac DeviceLane identity directory."
+    [ "${#CONTROLLER_SESSION_CHALLENGE}" -ge 16 ] || repair controller_session_challenge_invalid "Use the fresh Mac-generated challenge when issuing the Windows controller session."
     case "$MESH_TIMEOUT_SECONDS" in ''|*[!0-9]*) repair invalid_mesh_timeout "Use a positive integer for --mesh-timeout-seconds." ;; esac
     [ "$MESH_TIMEOUT_SECONDS" -gt 0 ] || repair invalid_mesh_timeout "Use a positive integer for --mesh-timeout-seconds."
     [ -n "$DEVICELANE_BINARY" ] && [ -n "$DEVICELANE_SHA256" ] && [ -n "$DEVICELANE_VERSION" ] || repair unpinned_devicelane "Pass --devicelane-binary, --devicelane-sha256, and --devicelane-version from the approved build manifest."
@@ -79,10 +84,10 @@ run_mesh_gate() {
     # The command spellings below are also the operator contract for the physical gate:
     # devicelane mesh status --local --json; devicelane activities watch --local --json;
     # devicelane approvals list --local --json; devicelane audit list --local --json.
-    "$PYTHON3" - "$DEVICELANE_CLI" "$MESH_ENDPOINT" "$MESH_CONTROLLER" "$CONTROLLER_PEER_ID" "$WINDOWS_PRINCIPAL" "$WINDOWS_SOURCE_HOST" "$MESH_ACTIVITY_ID" "$MESH_TIMEOUT_SECONDS" "$DEVICELANE_SHA256" "$DEVICELANE_VERSION" "$RUN_DIR/evidence/mesh-evidence.json" <<'PY'
+    "$PYTHON3" - "$DEVICELANE_CLI" "$MESH_ENDPOINT" "$MESH_CONTROLLER" "$CONTROLLER_PEER_ID" "$CONTROLLER_SESSION_ASSERTION" "$CONTROLLER_SESSION_CHALLENGE" "$MESH_IDENTITY" "$MESH_ACTIVITY_ID" "$MESH_TIMEOUT_SECONDS" "$DEVICELANE_SHA256" "$DEVICELANE_VERSION" "$RUN_DIR/evidence/mesh-evidence.json" <<'PY'
 import hashlib, json, select, subprocess, sys, time
 
-cli, endpoint, controller, controller_peer, principal, source, activity_id, timeout_raw, binary_sha256, binary_version, output = sys.argv[1:]
+cli, endpoint, controller, controller_peer, assertion, challenge, identity, activity_id, timeout_raw, binary_sha256, binary_version, output = sys.argv[1:]
 timeout = int(timeout_raw)
 
 def fail(code, message):
@@ -96,6 +101,23 @@ def run(*parts):
         fail("mesh_command_failed", f"DeviceLane command failed: {' '.join(parts)}")
     try: return json.loads(result.stdout)
     except Exception: fail("mesh_invalid_json", f"DeviceLane returned invalid JSON: {' '.join(parts)}")
+
+verified_process = subprocess.run([
+    cli, "controller-session", "verify", "--identity", identity,
+    "--assertion", assertion, "--mesh-controller", controller,
+    "--controller-peer-id", controller_peer, "--challenge", challenge, "--json",
+], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+if verified_process.returncode:
+    fail("controller_session_mismatch", "Issue a fresh assertion on the paired Windows controller for this exact endpoint, peer, and Mac challenge.")
+try: verified_session = json.loads(verified_process.stdout)
+except Exception: fail("controller_session_invalid", "The pinned DeviceLane verifier returned invalid controller-session JSON.")
+if verified_session.get("controller_endpoint") != controller or verified_session.get("controller_peer_id") != controller_peer:
+    fail("controller_session_mismatch", "The signed controller session does not match --mesh-controller and --controller-peer-id.")
+principal = verified_session.get("principal_id")
+source = verified_session.get("source_host_id")
+session_id = verified_session.get("session_id")
+if not all(isinstance(value, str) and value for value in (principal, source, session_id)):
+    fail("controller_session_provenance_missing", "Derive principal, source, and session only from the verified Windows controller assertion.")
 
 def watch_once(cursor):
     command = [cli, "activities", "watch", "--cursor", cursor, "--limit", "256", "--local", "--json", "--endpoint", endpoint]
@@ -234,6 +256,7 @@ evidence = {
     "controller_peer": pseudonym(controller_peer),
     "principal": pseudonym(principal),
     "source_host": pseudonym(source),
+    "controller_session": pseudonym(session_id),
     "activity_id": pseudonym(activity_id),
     "resources": ["workspace_read", "device_lease"],
     "decision": decision,
@@ -250,7 +273,7 @@ with open(output, "x", encoding="utf-8") as handle:
 PY
 }
 
-if [ "${DEVICELANE_REAL_MESH_GATE:-0}" = 1 ] || [ -n "$MESH_CONTROLLER$MESH_ENDPOINT$WINDOWS_PRINCIPAL$WINDOWS_SOURCE_HOST$MESH_ACTIVITY_ID" ]; then
+if [ "${DEVICELANE_REAL_MESH_GATE:-0}" = 1 ] || [ -n "$MESH_CONTROLLER$MESH_ENDPOINT$MESH_ACTIVITY_ID$CONTROLLER_SESSION_ASSERTION" ]; then
     [ "$(uname -s)" = Darwin ] || repair not_macos "Run the physical mesh gate on the paired Mac."
     [ "$(uname -m)" = arm64 ] || repair wrong_architecture "Run the physical mesh gate on the approved Darwin arm64 Mac."
     PYTHON3=/usr/bin/python3
@@ -362,7 +385,7 @@ XCODE_VERSION=$("$XCODEBUILD" -version | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 SDK_VERSION=$("$XCODEBUILD" -version -sdk iphoneos 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 DEVICECTL_VERSION=$("$DEVICECTL" --version 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 XCRESULTTOOL_VERSION=$("$XCRESULTTOOL" version 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-if [ "${DEVICELANE_REAL_MESH_GATE:-0}" = 1 ] || [ -n "$MESH_CONTROLLER$MESH_ENDPOINT$WINDOWS_PRINCIPAL$WINDOWS_SOURCE_HOST$MESH_ACTIVITY_ID" ]; then
+if [ "${DEVICELANE_REAL_MESH_GATE:-0}" = 1 ] || [ -n "$MESH_CONTROLLER$MESH_ENDPOINT$MESH_ACTIVITY_ID$CONTROLLER_SESSION_ASSERTION" ]; then
     run_mesh_gate
 fi
 $PYTHON3 - "$RUN_DIR/evidence" "$DEVICE_ID" "$DEVICE_AUDIT_ID" "${HOME:-}" <<'PY'

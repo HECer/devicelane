@@ -1,3 +1,161 @@
+pub mod controller_session {
+    use crate::secure_transport::{SecureTransport, TransportError};
+    use rand::{RngCore, rngs::OsRng};
+    use serde::{Deserialize, Serialize};
+    #[cfg(windows)]
+    use std::process::Command;
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ControllerSessionPayload {
+        pub controller_endpoint: String,
+        pub controller_peer_id: String,
+        pub principal_id: String,
+        pub source_host_id: String,
+        pub session_id: String,
+        pub challenge: String,
+        pub issued_at_ms: u64,
+        pub expires_at_ms: u64,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ControllerSessionAssertion {
+        pub payload: ControllerSessionPayload,
+        pub signature: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    pub struct VerifiedControllerSession {
+        pub controller_endpoint: String,
+        pub controller_peer_id: String,
+        pub principal_id: String,
+        pub source_host_id: String,
+        pub session_id: String,
+        pub expires_at_ms: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum ControllerSessionError {
+        InvalidInput,
+        PrincipalUnavailable,
+        InvalidSignature,
+        ControllerEndpointMismatch,
+        ControllerPeerMismatch,
+        ChallengeMismatch,
+        Expired,
+    }
+
+    fn canonical(payload: &ControllerSessionPayload) -> Result<Vec<u8>, ControllerSessionError> {
+        serde_json::to_vec(payload).map_err(|_| ControllerSessionError::InvalidInput)
+    }
+
+    fn map_signature(error: TransportError) -> ControllerSessionError {
+        let _ = error;
+        ControllerSessionError::InvalidSignature
+    }
+
+    #[cfg(windows)]
+    fn os_principal() -> Result<String, ControllerSessionError> {
+        let output = Command::new("whoami")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .map_err(|_| ControllerSessionError::PrincipalUnavailable)?;
+        if !output.status.success() {
+            return Err(ControllerSessionError::PrincipalUnavailable);
+        }
+        let sid = String::from_utf8_lossy(&output.stdout)
+            .split(',')
+            .nth(1)
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .to_ascii_lowercase();
+        (!sid.is_empty())
+            .then_some(sid)
+            .ok_or(ControllerSessionError::PrincipalUnavailable)
+    }
+
+    #[cfg(unix)]
+    fn os_principal() -> Result<String, ControllerSessionError> {
+        Ok(format!("uid-{}", unsafe { libc::geteuid() }))
+    }
+
+    pub fn issue_controller_session(
+        controller: &SecureTransport,
+        controller_endpoint: &str,
+        challenge: &str,
+        issued_at_ms: u64,
+        lifetime_ms: u64,
+    ) -> Result<ControllerSessionAssertion, ControllerSessionError> {
+        if controller_endpoint.is_empty()
+            || challenge.len() < 16
+            || lifetime_ms == 0
+            || lifetime_ms > 5 * 60 * 1_000
+        {
+            return Err(ControllerSessionError::InvalidInput);
+        }
+        let controller_peer_id = controller
+            .identity_id()
+            .map_err(|_| ControllerSessionError::InvalidInput)?;
+        let mut random = [0_u8; 32];
+        OsRng.fill_bytes(&mut random);
+        let session_id = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let payload = ControllerSessionPayload {
+            controller_endpoint: controller_endpoint.to_owned(),
+            controller_peer_id: controller_peer_id.clone(),
+            principal_id: os_principal()?,
+            source_host_id: controller_peer_id,
+            session_id,
+            challenge: challenge.to_owned(),
+            issued_at_ms,
+            expires_at_ms: issued_at_ms
+                .checked_add(lifetime_ms)
+                .ok_or(ControllerSessionError::InvalidInput)?,
+        };
+        let signature = controller
+            .sign(&canonical(&payload)?)
+            .map_err(map_signature)?;
+        Ok(ControllerSessionAssertion { payload, signature })
+    }
+
+    pub fn verify_controller_session(
+        verifier: &SecureTransport,
+        assertion: &ControllerSessionAssertion,
+        expected_endpoint: &str,
+        expected_peer_id: &str,
+        expected_challenge: &str,
+        now_ms: u64,
+    ) -> Result<VerifiedControllerSession, ControllerSessionError> {
+        let payload = &assertion.payload;
+        if payload.controller_endpoint != expected_endpoint {
+            return Err(ControllerSessionError::ControllerEndpointMismatch);
+        }
+        if payload.controller_peer_id != expected_peer_id
+            || payload.source_host_id != expected_peer_id
+        {
+            return Err(ControllerSessionError::ControllerPeerMismatch);
+        }
+        if payload.challenge != expected_challenge {
+            return Err(ControllerSessionError::ChallengeMismatch);
+        }
+        if now_ms < payload.issued_at_ms || now_ms > payload.expires_at_ms {
+            return Err(ControllerSessionError::Expired);
+        }
+        verifier
+            .verify_peer_signature(expected_peer_id, &canonical(payload)?, &assertion.signature)
+            .map_err(map_signature)?;
+        Ok(VerifiedControllerSession {
+            controller_endpoint: payload.controller_endpoint.clone(),
+            controller_peer_id: payload.controller_peer_id.clone(),
+            principal_id: payload.principal_id.clone(),
+            source_host_id: payload.source_host_id.clone(),
+            session_id: payload.session_id.clone(),
+            expires_at_ms: payload.expires_at_ms,
+        })
+    }
+}
+
 pub mod protocol {
     use prost::{Enumeration, Message};
 

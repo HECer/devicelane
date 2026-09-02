@@ -27,6 +27,11 @@ fn hardware_gate_requires_real_device_signing_and_complete_evidence() {
         "security cms -S",
         "hardware-gate.tar.gz",
         "--archive-stdout",
+        "--controller-session-assertion",
+        "--controller-session-challenge",
+        "--mesh-identity",
+        "controller-session",
+        "controller_session_mismatch",
     ] {
         assert!(
             script.contains(required),
@@ -34,7 +39,14 @@ fn hardware_gate_requires_real_device_signing_and_complete_evidence() {
         );
     }
 
-    for forbidden in ["simctl", "booted", "iPhone Simulator", "MESH_FAKE_SUCCESS"] {
+    for forbidden in [
+        "simctl",
+        "booted",
+        "iPhone Simulator",
+        "MESH_FAKE_SUCCESS",
+        "--windows-principal",
+        "--windows-source-host",
+    ] {
         assert!(
             !script.contains(forbidden),
             "hardware gate must not accept simulator/mock path: {forbidden}"

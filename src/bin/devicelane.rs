@@ -1,3 +1,6 @@
+use device_development_mesh::controller_session::{
+    ControllerSessionAssertion, issue_controller_session, verify_controller_session,
+};
 use device_development_mesh::dashboard::{
     audit::AuditFilter, event_log::EventRead, policy::AccessRequest, service::AdminMutation, *,
 };
@@ -5,11 +8,13 @@ use device_development_mesh::local_ipc::{
     LocalEndpoint, LocalProtocolVersion, LocalRequest, LocalResponse, local_endpoint,
     send_local_request,
 };
+use device_development_mesh::secure_transport::SecureTransport;
 use std::{
     collections::BTreeMap,
+    fs,
     io::{self, Write},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const HELP: &str = "DeviceLane unified client\n\nUsage:\n  devicelane status --local [--json] [--endpoint ENDPOINT]\n  devicelane remote-access <pause|resume> --local\n  devicelane diagnostics --local\n  devicelane mesh <status|watch> --local [--scope local|mesh]\n  devicelane activities <list|watch|cancel> --local [--cursor EPOCH:SEQUENCE] [--limit 1..256]\n  devicelane approvals <list|request|decide> --local [typed access options]\n  devicelane policy <list|put|delete> --local [typed rule options]\n  devicelane audit <list|export> --local [filters]\n\nGrant flow:\n  approvals request --activity-id ID --principal-id ID --source-host-id ID --target-host-id ID --operation OP --resource RESOURCE\n  approvals decide --nonce NONCE [same exact access flags] --decision allow_once|allow_and_remember|deny_once|deny_and_block\n  Exact policy mutation: approvals request --admin-mutation policy_put [same typed rule flags as policy put]\n  then approvals list, approvals decide --approval-id ID --decision allow_once, and invoke the exact policy put before expiry.\n\nAdministrative operations: devicelane.policy.put, devicelane.policy.delete, devicelane.activity.cancel.\nResources: workspace_read, workspace_write, artifact_upload, artifact_download, device_lease, application_install, application_launch, debugger, signing, microphone, screen_capture, network_endpoint, device_lane_policy, device_lane_service.";
@@ -885,8 +890,76 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 fn main() {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.first().map(String::as_str) == Some("controller-session") {
+        if let Err(error) = controller_session_command(&raw_args) {
+            eprintln!("devicelane: {error}");
+            std::process::exit(2)
+        }
+        return;
+    }
     if let Err(e) = run() {
         eprintln!("devicelane: {e}");
         std::process::exit(2)
+    }
+}
+
+fn controller_session_value<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
+    let index = args
+        .iter()
+        .position(|value| value == name)
+        .ok_or_else(|| format!("missing required {name}"))?;
+    args.get(index + 1)
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing value for {name}"))
+}
+
+fn controller_session_command(args: &[String]) -> Result<(), String> {
+    let action = args.get(1).map(String::as_str).unwrap_or_default();
+    let identity_path = PathBuf::from(controller_session_value(args, "--identity")?);
+    if !identity_path.join("certificate.der").is_file()
+        || !identity_path.join("private-key.der").is_file()
+    {
+        return Err("controller_session_identity_missing: use an existing paired identity".into());
+    }
+    let identity = SecureTransport::load_or_create(&identity_path, "controller")
+        .map_err(|_| "controller_session_identity_invalid".to_owned())?;
+    let endpoint = controller_session_value(args, "--mesh-controller")?;
+    let challenge = controller_session_value(args, "--challenge")?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "controller_session_clock_invalid".to_owned())?
+        .as_millis() as u64;
+    match action {
+        "issue" => {
+            let lifetime_ms = args
+                .iter()
+                .position(|value| value == "--lifetime-ms")
+                .and_then(|index| args.get(index + 1))
+                .map_or(Ok(60_000), |value| value.parse::<u64>())
+                .map_err(|_| "invalid --lifetime-ms".to_owned())?;
+            let assertion =
+                issue_controller_session(&identity, endpoint, challenge, now_ms, lifetime_ms)
+                    .map_err(|error| format!("controller_session_issue_failed: {error:?}"))?;
+            json(&assertion).map_err(|error| error.to_string())
+        }
+        "verify" => {
+            let assertion: ControllerSessionAssertion = serde_json::from_slice(
+                &fs::read(controller_session_value(args, "--assertion")?)
+                    .map_err(|_| "controller_session_assertion_unreadable".to_owned())?,
+            )
+            .map_err(|_| "controller_session_assertion_invalid".to_owned())?;
+            let verified = verify_controller_session(
+                &identity,
+                &assertion,
+                endpoint,
+                controller_session_value(args, "--controller-peer-id")?,
+                challenge,
+                now_ms,
+            )
+            .map_err(|error| format!("controller_session_verification_failed: {error:?}"))?;
+            json(&verified).map_err(|error| error.to_string())
+        }
+        _ => Err("controller-session requires issue or verify".into()),
     }
 }

@@ -333,13 +333,28 @@ one generated allow-listed JSON file containing only redacted metadata. Identifi
 pseudonyms; raw logs, xcresults, screenshots, audit databases, identities, and secrets are never
 copied or archived by the mesh gate.
 
+Create a fresh challenge on the Mac (`SESSION_CHALLENGE=$(openssl rand -hex 32)`). On the paired
+Windows controller, issue a short-lived assertion with the approved binary and its existing paired
+identity; DeviceLane derives the principal from the Windows SID and the source host from the
+certificate identity, so neither value is accepted as operator input:
+
+```powershell
+devicelane controller-session issue --json `
+  --identity C:\ProgramData\DeviceLane\identity `
+  --mesh-controller "<WINDOWS_CONTROLLER_HOST>:7443" `
+  --challenge "<SESSION_CHALLENGE>" > controller-session.json
+```
+
+Copy only `controller-session.json` to the Mac over the already authorized channel, then run:
+
 ```sh
 DEVICELANE_REAL_MESH_GATE=1 sh ./scripts/mac-hardware-gate.sh \
   --mesh-controller "<WINDOWS_CONTROLLER_HOST>:7443" \
   --controller-peer-id windows-controller \
   --mesh-endpoint "$TMPDIR/devicelane/devicelane.sock" \
-  --windows-principal codex-windows \
-  --windows-source-host windows-controller \
+  --mesh-identity "$HOME/Library/Application Support/DeviceLane/identity" \
+  --controller-session-assertion "$HOME/controller-session.json" \
+  --controller-session-challenge "$SESSION_CHALLENGE" \
   --mesh-activity-id release-gate-20260902 \
   --devicelane-binary /absolute/path/to/devicelane \
   --devicelane-sha256 "<APPROVED_LOWERCASE_SHA256>" \
