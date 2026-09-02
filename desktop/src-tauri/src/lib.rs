@@ -206,6 +206,28 @@ impl<T: DaemonTransport> DesktopBridge<T> {
         }
     }
 
+    pub fn with_pending_approval_for_notification<F>(
+        &self,
+        approval_id: &str,
+        notify: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(ApprovalRequest) -> Result<(), String>,
+    {
+        let approval_id = ApprovalId::parse(approval_id)
+            .map_err(|error| format!("invalid approval_id: {error}"))?;
+        let approval = match self
+            .transport
+            .send(LocalRequest::PendingApprovalForNotification {
+                version: LocalProtocolVersion::CURRENT,
+                approval_id,
+            })? {
+            LocalResponse::PendingApprovalForNotification(approval) => approval,
+            response => return Err(unexpected_response(response)),
+        };
+        notify(approval)
+    }
+
     pub fn decide_pending_approval(
         &self,
         approval_id: &str,
@@ -800,12 +822,10 @@ fn delete_audit(
 fn notify_pending_approval(
     app: AppHandle,
     bridge: State<'_, AppBridge>,
-    approval: ApprovalRequest,
+    approval_id: String,
 ) -> Result<(), String> {
-    let result = bridge.status().and_then(|status| {
-        if approval.target_host_id.as_str() != status.public_identity {
-            return Err("notification target is not the local host".into());
-        }
+    let app_for_notification = app.clone();
+    let result = bridge.with_pending_approval_for_notification(&approval_id, move |approval| {
         let approval_id = approval.id.as_str().to_owned();
         let mut notification = notify_rust::Notification::new();
         notification
@@ -818,9 +838,9 @@ fn notify_pending_approval(
             ))
             .action("open_approval", "In DeviceLane öffnen");
         #[cfg(windows)]
-        notification.app_id(&app.config().identifier);
+        notification.app_id(&app_for_notification.config().identifier);
         let handle = notification.show().map_err(|error| error.to_string())?;
-        let app_for_action = app.clone();
+        let app_for_action = app_for_notification.clone();
         thread::spawn(move || {
             handle.wait_for_action(|action| {
                 if action == "__closed" {

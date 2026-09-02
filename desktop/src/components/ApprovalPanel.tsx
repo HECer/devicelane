@@ -64,7 +64,7 @@ export function ApprovalPanel({ approvals, nowMs, focusApprovalId, onDecide, onR
                 aria-label={`Freigabe ${approval.id}`}
                 tabIndex={-1}
               >
-                <header><div><strong>{approval.operation}</strong><span className={`decision-state ${expired ? "decision-state--expired" : "decision-state--pending"}`}>{expired ? "Abgelaufen" : `Risiko: ${approval.risk}`}</span></div><time dateTime={new Date(Number(approval.expires_at_ms)).toISOString()}>Läuft ab: {new Date(Number(approval.expires_at_ms)).toLocaleString("de-DE")}</time></header>
+                <header><div><strong>{approval.operation}</strong><span className="decision-state decision-state--pending">Risiko: {approval.risk}</span>{expired && <span className="decision-state decision-state--expired">Abgelaufen</span>}</div><time dateTime={new Date(Number(approval.expires_at_ms)).toISOString()}>Läuft ab: {new Date(Number(approval.expires_at_ms)).toLocaleString("de-DE")}</time></header>
                 <dl className="attribution-grid">
                   <div><dt>Prinzipal</dt><dd>{approval.principal_id}</dd></div>
                   <div><dt>Quelle</dt><dd>{approval.source_host_id}</dd></div>

@@ -92,6 +92,11 @@ fn all_dashboard_requests_negotiate_the_minor_feature() {
             },
         },
         LocalRequest::PendingApprovals { version },
+        LocalRequest::PendingApprovalForNotification {
+            version,
+            approval_id: device_development_mesh::dashboard::ApprovalId::parse("approval-ui")
+                .unwrap(),
+        },
         LocalRequest::PolicyRules { version },
         LocalRequest::CancelActivity {
             version,
@@ -449,6 +454,41 @@ fn approval_request_is_audited_before_pending_state_and_emits_live_event() {
     );
     assert!(
         matches!(service.events(EventCursor { epoch: 1, sequence: 0 }, 10), EventRead::Events { events, .. } if events.len() == 1 && events[0].state == ActivityState::AwaitingApproval)
+    );
+}
+
+#[test]
+fn notification_lookup_returns_only_exact_live_daemon_pending_truth() {
+    let root = tempfile::tempdir().unwrap();
+    let audit = Arc::new(Mutex::new(
+        AuditStore::open(root.path(), RetentionPolicy::default(), Redactor::default()).unwrap(),
+    ));
+    let mut service = DashboardService::new(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(1, 0),
+        audit,
+        PolicyEngine::new(),
+    );
+    service
+        .request_approval(access("notification"), 100, 10)
+        .unwrap();
+    let pending = service.pending_approvals(11).remove(0);
+
+    assert_eq!(
+        service.pending_approval_for_notification(&pending.id, 11),
+        Ok(pending.clone())
+    );
+    assert_eq!(
+        service.pending_approval_for_notification(&pending.id, 110),
+        Err(DashboardServiceError::ApprovalExpired)
+    );
+    assert_eq!(
+        service.pending_approval_for_notification(
+            &device_development_mesh::dashboard::ApprovalId::parse("approval-forged").unwrap(),
+            11,
+        ),
+        Err(DashboardServiceError::NotFound)
     );
 }
 

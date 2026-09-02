@@ -227,6 +227,37 @@ fn management_bridge_uses_approval_ids_without_exposing_nonces_or_access_credent
 }
 
 #[test]
+fn invalid_notification_lookup_never_calls_the_native_notifier() {
+    let requests = Arc::new(Mutex::new(vec![]));
+    let bridge = DesktopBridge::new(FakeTransport {
+        requests: Arc::clone(&requests),
+        response: LocalResponse::Error {
+            code: "approval_expired".into(),
+            message: "approval expired".into(),
+        },
+    });
+    let mut notified = false;
+
+    let error = bridge
+        .with_pending_approval_for_notification("approval-42", |_| {
+            notified = true;
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(!notified);
+    assert!(error.contains("approval_expired"));
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![LocalRequest::PendingApprovalForNotification {
+            version: LocalProtocolVersion::CURRENT,
+            approval_id: device_development_mesh::dashboard::ApprovalId::parse("approval-42")
+                .unwrap(),
+        }]
+    );
+}
+
+#[test]
 fn management_bridge_preserves_daemon_error_codes() {
     let bridge = DesktopBridge::new(FakeTransport {
         requests: Arc::new(Mutex::new(vec![])),

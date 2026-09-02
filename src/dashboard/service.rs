@@ -305,6 +305,24 @@ impl DashboardService {
             .collect()
     }
 
+    pub fn pending_approval_for_notification(
+        &self,
+        approval_id: &ApprovalId,
+        now_ms: u64,
+    ) -> Result<ApprovalRequest, DashboardServiceError> {
+        let pending = self
+            .pending
+            .get(approval_id)
+            .ok_or(DashboardServiceError::NotFound)?;
+        if pending.request.expires_at_ms <= now_ms {
+            return Err(DashboardServiceError::ApprovalExpired);
+        }
+        if pending.request.target_host_id != self.local_host_id {
+            return Err(DashboardServiceError::PermissionDenied);
+        }
+        Ok(pending.request.clone())
+    }
+
     pub fn request_approval(
         &mut self,
         access: AccessRequest,

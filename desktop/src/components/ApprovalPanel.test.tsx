@@ -60,6 +60,7 @@ describe("ApprovalPanel", () => {
 
     rerender(<ApprovalPanel approvals={[approval]} nowMs={1725000300000} onDecide={decide} onRefresh={refresh} />);
     expect(screen.getByText("Abgelaufen")).toBeVisible();
+    expect(screen.getByText("Risiko: physical_device_install")).toBeVisible();
     for (const button of screen.getAllByRole("button")) expect(button).toBeDisabled();
   });
 

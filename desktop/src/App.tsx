@@ -94,7 +94,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
     for (const approval of approvals) {
       if (approval.target_host_id !== snapshot.public_identity || notifiedApprovals.current.has(approval.id)) continue;
       notifiedApprovals.current.add(approval.id);
-      void client.notifyPendingApproval(approval).catch(() => notifiedApprovals.current.delete(approval.id));
+      void client.notifyPendingApproval(approval.id).catch(() => notifiedApprovals.current.delete(approval.id));
     }
   }, [approvals, client, snapshot]);
 

@@ -117,6 +117,10 @@ pub enum LocalRequest {
     PendingApprovals {
         version: LocalProtocolVersion,
     },
+    PendingApprovalForNotification {
+        version: LocalProtocolVersion,
+        approval_id: crate::dashboard::ApprovalId,
+    },
     PolicyRules {
         version: LocalProtocolVersion,
     },
@@ -173,6 +177,7 @@ impl LocalRequest {
             | Self::ActivityEvents { version, .. }
             | Self::AcknowledgeEvents { version, .. }
             | Self::PendingApprovals { version }
+            | Self::PendingApprovalForNotification { version, .. }
             | Self::PolicyRules { version }
             | Self::PutPolicyRule { version, .. }
             | Self::DeletePolicyRule { version, .. }
@@ -232,6 +237,7 @@ pub enum LocalResponse {
     DashboardSnapshot(DashboardSnapshot),
     ActivityEvents(EventRead),
     PendingApprovals(Vec<ApprovalRequest>),
+    PendingApprovalForNotification(ApprovalRequest),
     PolicyRules(Vec<PolicyRule>),
     AuditRecords(CursorPage<AuditRecord>),
     AuditExport(AuditExport),
@@ -565,6 +571,7 @@ impl DaemonState {
             | LocalRequest::ActivityEvents { .. }
             | LocalRequest::AcknowledgeEvents { .. }
             | LocalRequest::PendingApprovals { .. }
+            | LocalRequest::PendingApprovalForNotification { .. }
             | LocalRequest::PolicyRules { .. }
             | LocalRequest::PutPolicyRule { .. }
             | LocalRequest::DeletePolicyRule { .. }
@@ -717,6 +724,15 @@ impl DaemonState {
                     .ok_or(LocalProtocolError::FeatureUnavailable)?
                     .pending_approvals(now_ms),
             )),
+            LocalRequest::PendingApprovalForNotification { approval_id, .. } => {
+                let approval = self
+                    .dashboard
+                    .as_ref()
+                    .ok_or(LocalProtocolError::FeatureUnavailable)?
+                    .pending_approval_for_notification(&approval_id, now_ms)
+                    .map_err(map_dashboard_error)?;
+                Ok(LocalResponse::PendingApprovalForNotification(approval))
+            }
             LocalRequest::PolicyRules { .. } => Ok(LocalResponse::PolicyRules(
                 self.dashboard
                     .as_ref()
@@ -1010,6 +1026,7 @@ fn dispatch_connection(
                             | LocalRequest::ActivityEvents { .. }
                             | LocalRequest::AcknowledgeEvents { .. }
                             | LocalRequest::PendingApprovals { .. }
+                            | LocalRequest::PendingApprovalForNotification { .. }
                             | LocalRequest::PolicyRules { .. }
                             | LocalRequest::PutPolicyRule { .. }
                             | LocalRequest::DeletePolicyRule { .. }

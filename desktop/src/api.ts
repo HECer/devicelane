@@ -286,7 +286,7 @@ export interface DaemonClient {
   auditQuery(filter: AuditFilter, cursor: EventCursor | null, limit: number, signal?: AbortSignal): Promise<AuditPage>;
   auditExport(filter: AuditFilter, signal?: AbortSignal): Promise<AuditExport>;
   deleteAudit(scope: AuditDeletionScope, filter: AuditFilter, signal?: AbortSignal): Promise<void>;
-  notifyPendingApproval(approval: ApprovalRequest, signal?: AbortSignal): Promise<void>;
+  notifyPendingApproval(approvalId: string, signal?: AbortSignal): Promise<void>;
   onOpenApproval(listener: (approvalId: string) => void): Promise<() => void>;
 }
 
@@ -315,6 +315,6 @@ export const tauriDaemonClient: DaemonClient = {
   auditQuery: (filter, cursor, limit, signal) => invokeWithSignal("audit_query", { filter, cursor, limit }, signal),
   auditExport: (filter, signal) => invokeWithSignal("audit_export", { filter }, signal),
   deleteAudit: (scope, filter, signal) => invokeWithSignal("delete_audit", { scope, filter }, signal),
-  notifyPendingApproval: (approval, signal) => invokeWithSignal("notify_pending_approval", { approval }, signal),
+  notifyPendingApproval: (approvalId, signal) => invokeWithSignal("notify_pending_approval", { approvalId }, signal),
   onOpenApproval: (listener) => listen<string>("open-approval", (event) => listener(event.payload))
 };

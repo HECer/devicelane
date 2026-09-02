@@ -497,12 +497,14 @@ describe("DeviceLane desktop foundation", () => {
     const pendingApprovals = vi.fn().mockResolvedValue([approval]);
     const policyRules = vi.fn().mockResolvedValue([rule]);
     const decideApproval = vi.fn().mockResolvedValue(undefined);
-    const client = fakeClient({ pendingApprovals, policyRules, decideApproval });
+    const notifyPendingApproval = vi.fn().mockResolvedValue(undefined);
+    const client = fakeClient({ pendingApprovals, policyRules, decideApproval, notifyPendingApproval });
     render(<App client={client} />);
 
     expect(await screen.findByRole("heading", { name: "Ausstehende Freigaben" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Richtlinien" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Audit-Verlauf" })).toBeVisible();
+    await waitFor(() => expect(notifyPendingApproval).toHaveBeenCalledWith("approval-ui"));
     await user.click(screen.getByRole("button", { name: "Einmal erlauben" }));
     await waitFor(() => expect(decideApproval).toHaveBeenCalledWith("approval-ui", "allow_once"));
     await waitFor(() => expect(pendingApprovals).toHaveBeenCalledTimes(2));
