@@ -216,10 +216,47 @@ impl PolicyEngine {
     }
 
     pub(crate) fn validate_restored(&self) -> Result<(), PolicyConfigurationError> {
-        validate_rule_set(&self.rules, true)?;
+        validate_mixed_rule_set(&self.rules)?;
         if self.approvals.len() > MAX_PENDING_APPROVALS {
             return Err(PolicyConfigurationError::RuleLimitExceeded);
         }
+        Ok(())
+    }
+
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        checkpoint: PolicyEngine,
+    ) -> Result<(), PolicyConfigurationError> {
+        checkpoint.validate_restored()?;
+        let trusted_managed: Vec<_> = self
+            .rules
+            .iter()
+            .filter(|rule| rule.origin == PolicyOrigin::Managed)
+            .cloned()
+            .collect();
+        let checkpoint_managed: Vec<_> = checkpoint
+            .rules
+            .iter()
+            .filter(|rule| rule.origin == PolicyOrigin::Managed)
+            .cloned()
+            .collect();
+        if checkpoint_managed.len() != trusted_managed.len()
+            || checkpoint_managed
+                .iter()
+                .any(|rule| !trusted_managed.contains(rule))
+        {
+            return Err(PolicyConfigurationError::ManagedOriginRequiresVerification);
+        }
+        let mut restored_rules: Vec<_> = checkpoint
+            .rules
+            .into_iter()
+            .filter(|rule| rule.origin == PolicyOrigin::User)
+            .collect();
+        validate_rule_set(&restored_rules, false)?;
+        restored_rules.extend(trusted_managed);
+        validate_mixed_rule_set(&restored_rules)?;
+        self.rules = restored_rules;
+        self.approvals = checkpoint.approvals;
         Ok(())
     }
 
@@ -436,6 +473,21 @@ fn validate_rule_set(
         }
         if (rule.origin == PolicyOrigin::Managed) != verified_managed {
             return Err(PolicyConfigurationError::ManagedOriginRequiresVerification);
+        }
+    }
+    Ok(())
+}
+
+fn validate_mixed_rule_set(rules: &[PolicyRule]) -> Result<(), PolicyConfigurationError> {
+    if rules.len() > MAX_POLICY_RULES {
+        return Err(PolicyConfigurationError::RuleLimitExceeded);
+    }
+    let mut ids = HashSet::with_capacity(rules.len());
+    for rule in rules {
+        rule.validate()
+            .map_err(PolicyConfigurationError::InvalidRule)?;
+        if !ids.insert(rule.id.clone()) {
+            return Err(PolicyConfigurationError::DuplicateRuleId);
         }
     }
     Ok(())
@@ -783,6 +835,19 @@ mod tests {
                 NOW + 10,
             ),
             Err(ApprovalError::Expired)
+        );
+    }
+
+    #[test]
+    fn checkpoint_cannot_forge_managed_origin_without_reverified_rule() {
+        let forged = PolicyEngine {
+            rules: vec![managed_rule()],
+            approvals: HashMap::new(),
+        };
+        let mut trusted = PolicyEngine::new();
+        assert_eq!(
+            trusted.restore_checkpoint(forged),
+            Err(PolicyConfigurationError::ManagedOriginRequiresVerification)
         );
     }
 

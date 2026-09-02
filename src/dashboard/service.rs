@@ -164,10 +164,6 @@ impl DashboardService {
             if checkpoint.audit_sequence > audit_sequence {
                 return Err(DashboardServiceError::AuditUnavailable);
             }
-            checkpoint
-                .policy
-                .validate_restored()
-                .map_err(|_| DashboardServiceError::AuditUnavailable)?;
             if checkpoint_digest(
                 checkpoint.audit_sequence,
                 &checkpoint.activities,
@@ -212,7 +208,10 @@ impl DashboardService {
             }
             service.pending = checkpoint.pending;
             service.admin_grants = checkpoint.admin_grants;
-            service.policy = checkpoint.policy;
+            service
+                .policy
+                .restore_checkpoint(checkpoint.policy)
+                .map_err(|_| DashboardServiceError::AuditUnavailable)?;
             service.paused = checkpoint.paused;
             service.reconcile_after_restart(now_ms())?;
         }

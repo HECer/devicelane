@@ -116,6 +116,26 @@ fn service(root: &std::path::Path, engine: PolicyEngine) -> DashboardService {
     )
 }
 
+fn persistent_service(
+    root: &std::path::Path,
+    engine: PolicyEngine,
+) -> Result<DashboardService, DashboardServiceError> {
+    DashboardService::new_persistent(
+        HostId::parse("mac").unwrap(),
+        TopologyProjector::new(),
+        EventJournal::new(1, 0),
+        Arc::new(Mutex::new(
+            AuditStore::open(
+                root.join("audit"),
+                RetentionPolicy::default(),
+                Redactor::default(),
+            )
+            .unwrap(),
+        )),
+        engine,
+    )
+}
+
 #[test]
 fn verified_managed_admin_allow_is_unattended_but_deny_still_dominates() {
     let allowed_root = tempfile::tempdir().unwrap();
@@ -162,6 +182,40 @@ fn verified_managed_admin_allow_is_unattended_but_deny_still_dominates() {
         ),
         Err(DashboardServiceError::PermissionDenied)
     );
+}
+
+#[test]
+fn mixed_managed_and_user_rules_restart_only_with_reverified_managed_provenance() {
+    let root = tempfile::tempdir().unwrap();
+    let managed = || {
+        verified_engine(
+            root.path(),
+            vec![admin_rule(
+                "managed-allow",
+                PolicyEffect::Allow,
+                PolicyOrigin::Managed,
+            )],
+        )
+    };
+    {
+        let mut first = persistent_service(root.path(), managed()).unwrap();
+        first
+            .put_policy_rule(
+                admin_rule("user-rule", PolicyEffect::Allow, PolicyOrigin::User),
+                10,
+            )
+            .unwrap();
+        assert_eq!(first.policy_rules().len(), 2);
+    }
+
+    let restored = persistent_service(root.path(), managed()).unwrap();
+    assert_eq!(restored.policy_rules().len(), 2);
+    drop(restored);
+
+    assert!(matches!(
+        persistent_service(root.path(), PolicyEngine::new()),
+        Err(DashboardServiceError::AuditUnavailable)
+    ));
 }
 
 fn write_admin_trust(
