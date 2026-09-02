@@ -216,6 +216,18 @@ fn stale_owner_makes_active_lease_uncertain_and_not_authorizable() {
         .track_active_lease("lease-1", "remote", "phone")
         .unwrap();
     assert_eq!(projector.lease_state("lease-1"), Some(LeaseState::Active));
+    assert!(!projector.lease_authorizable("lease-1"));
+    projector
+        .observe_registry(
+            2,
+            110,
+            true,
+            vec![registry_host("remote", &[("phone", "iOS", "online")])],
+        )
+        .unwrap();
+    projector
+        .track_active_lease("lease-1", "remote", "phone")
+        .unwrap();
     assert!(projector.lease_authorizable("lease-1"));
 
     projector
@@ -236,6 +248,14 @@ fn leases_require_authenticated_trusted_ownership_and_registry_disconnect_revoke
         .observe_registry(
             1,
             10,
+            true,
+            vec![registry_host("remote", &[("phone", "iOS", "online")])],
+        )
+        .unwrap();
+    projector
+        .observe_registry(
+            2,
+            11,
             true,
             vec![registry_host("remote", &[("phone", "iOS", "online")])],
         )
@@ -273,6 +293,13 @@ fn local_lease_is_authorized_only_for_projector_owned_local_host() {
         )
         .unwrap();
     projector
+        .observe_local(
+            2,
+            11,
+            host("local", "online", &[("phone", "iOS", "online")]),
+        )
+        .unwrap();
+    projector
         .track_active_lease("local-lease", "local", "phone")
         .unwrap();
     assert!(projector.lease_authorizable("local-lease"));
@@ -284,6 +311,119 @@ fn local_lease_is_authorized_only_for_projector_owned_local_host() {
         .observe_registry(1, 11, true, vec![forged])
         .unwrap_err();
     assert_eq!(error.kind(), TopologyErrorKind::InvalidTrust);
+}
+
+#[test]
+fn new_authorization_requires_online_live_host_and_device() {
+    for state in [
+        "offline",
+        "busy",
+        "connecting",
+        "attention_required",
+        "paused",
+    ] {
+        let mut projector = TopologyProjector::new();
+        connect(&mut projector, "registry-a", 1);
+        let remote = registry_host("remote", &[("phone", "iOS", state)]);
+        projector
+            .observe_registry(1, 10, true, vec![remote.clone()])
+            .unwrap();
+        projector
+            .observe_registry(2, 11, true, vec![remote])
+            .unwrap();
+        projector
+            .track_active_lease("lease", "remote", "phone")
+            .unwrap();
+        assert!(
+            !projector.lease_authorizable("lease"),
+            "device state {state}"
+        );
+    }
+
+    for state in [
+        "offline",
+        "busy",
+        "connecting",
+        "attention_required",
+        "paused",
+    ] {
+        let mut projector = TopologyProjector::new();
+        connect(&mut projector, "registry-a", 1);
+        let mut remote = registry_host("remote", &[("phone", "iOS", "online")]);
+        remote.snapshot.status = state.into();
+        projector
+            .observe_registry(1, 10, true, vec![remote.clone()])
+            .unwrap();
+        projector
+            .observe_registry(2, 11, true, vec![remote])
+            .unwrap();
+        projector
+            .track_active_lease("lease", "remote", "phone")
+            .unwrap();
+        assert!(!projector.lease_authorizable("lease"), "host state {state}");
+    }
+}
+
+#[test]
+fn registry_paths_are_explicit_and_unsafe_paths_are_rejected() {
+    for path in [ConnectionPath::Local, ConnectionPath::Unavailable] {
+        let mut projector = TopologyProjector::new();
+        connect(&mut projector, "registry-a", 1);
+        let mut remote = registry_host("remote", &[]);
+        remote.connection_path = path;
+        let before = projector.snapshot(9);
+        let error = projector
+            .observe_registry(1, 10, true, vec![remote])
+            .unwrap_err();
+        assert_eq!(error.kind(), TopologyErrorKind::InvalidConnectionPath);
+        assert_eq!(projector.snapshot(10).revision, before.revision);
+        assert_eq!(projector.snapshot(10).hosts, before.hosts);
+    }
+    for path in [ConnectionPath::Direct, ConnectionPath::Registry] {
+        let mut projector = TopologyProjector::new();
+        connect(&mut projector, "registry-a", 1);
+        let mut remote = registry_host("remote", &[("phone", "iOS", "online")]);
+        remote.connection_path = path;
+        projector
+            .observe_registry(1, 10, true, vec![remote.clone()])
+            .unwrap();
+        projector
+            .observe_registry(2, 11, true, vec![remote])
+            .unwrap();
+        projector
+            .track_active_lease("lease", "remote", "phone")
+            .unwrap();
+        assert!(projector.lease_authorizable("lease"));
+    }
+}
+
+#[test]
+fn unauthenticated_invalid_session_revokes_and_revision_exhaustion_is_atomic() {
+    let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry-a", 1);
+    projector.connect_registry("", 2, false).unwrap();
+    assert_eq!(projector.snapshot(10).scope, DashboardScope::Local);
+
+    let mut exhausted = TopologyProjector::new_at_revision(u64::MAX);
+    let before = exhausted.snapshot(1);
+    let error = exhausted
+        .observe_local(1, 2, host("local", "online", &[]))
+        .unwrap_err();
+    assert_eq!(error.kind(), TopologyErrorKind::RevisionExhausted);
+    assert_eq!(exhausted.snapshot(2).hosts, before.hosts);
+    assert_eq!(exhausted.snapshot(2).revision, before.revision);
+    let error = exhausted
+        .connect_registry("registry", 1, false)
+        .unwrap_err();
+    assert_eq!(error.kind(), TopologyErrorKind::RevisionExhausted);
+    assert_eq!(exhausted.snapshot(2).revision, before.revision);
+
+    let mut epoch = TopologyProjector::new();
+    connect(&mut epoch, "registry-a", 5);
+    let before = epoch.snapshot(1);
+    let error = epoch.connect_registry("registry-b", 5, true).unwrap_err();
+    assert_eq!(error.kind(), TopologyErrorKind::InvalidRegistryEpoch);
+    assert_eq!(epoch.snapshot(2).revision, before.revision);
 }
 
 #[test]

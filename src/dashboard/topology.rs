@@ -1,6 +1,7 @@
 use crate::dashboard::{
     ConnectionPath, DashboardDevice, DashboardHost, DashboardScope, DashboardSnapshot, DeviceId,
-    Freshness, HostId, MAX_COLLECTION_ITEMS, MAX_ID_BYTES, Presence, SafeCode, TrustState,
+    Freshness, HostId, MAX_COLLECTION_ITEMS, MAX_ID_BYTES, MAX_TEXT_BYTES, Presence, SafeCode,
+    TrustState,
 };
 use crate::network_processes::{DeviceSnapshot, HostSnapshot};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -34,6 +35,7 @@ pub enum LeaseState {
 pub enum TopologyErrorKind {
     InvalidField,
     InvalidTrust,
+    InvalidConnectionPath,
     UnauthenticatedRegistry,
     InvalidRegistryEpoch,
     LimitExceeded,
@@ -96,6 +98,13 @@ impl TopologyProjector {
         Self::default()
     }
 
+    pub fn new_at_revision(revision: u64) -> Self {
+        Self {
+            revision,
+            ..Self::default()
+        }
+    }
+
     pub fn connect_registry(
         &mut self,
         session_id: impl Into<String>,
@@ -103,13 +112,14 @@ impl TopologyProjector {
         authenticated: bool,
     ) -> Result<(), TopologyError> {
         let session_id = session_id.into();
-        validate_identifier("registry_session_id", &session_id)?;
         if !authenticated {
+            self.preflight_revision()?;
             self.registry_authenticated = false;
             self.mark_all_remote_stale();
-            self.bump_revision()?;
+            self.commit_revision();
             return Ok(());
         }
+        validate_identifier("registry_session_id", &session_id)?;
         let is_new_epoch = match &self.authenticated_registry {
             None => true,
             Some((stored_session, stored_epoch)) if stored_session == &session_id => {
@@ -134,18 +144,23 @@ impl TopologyProjector {
             }
         };
         if is_new_epoch {
+            self.preflight_revision()?;
             self.registry_revision = None;
             self.authenticated_registry = Some((session_id, epoch));
+        } else {
+            self.preflight_revision()?;
         }
         self.registry_authenticated = true;
-        self.bump_revision()?;
+        self.commit_revision();
         Ok(())
     }
 
     pub fn disconnect_registry(&mut self, _detected_at_ms: u64) -> Result<(), TopologyError> {
+        self.preflight_revision()?;
         self.registry_authenticated = false;
         self.mark_all_remote_stale();
-        self.bump_revision()
+        self.commit_revision();
+        Ok(())
     }
 
     pub fn observe_local(
@@ -173,7 +188,9 @@ impl TopologyProjector {
             ConnectionPath::Local,
             Vec::new(),
             freshness,
+            observed_at_ms,
         )?;
+        self.preflight_revision()?;
         if let Some(previous_local) = self.local_host_id.replace(host_id.clone()) {
             if previous_local != host_id {
                 self.hosts.remove(&previous_local);
@@ -188,7 +205,7 @@ impl TopologyProjector {
             },
         );
         self.local_revision = Some(source_revision);
-        self.bump_revision()?;
+        self.commit_revision();
         Ok(())
     }
 
@@ -200,10 +217,11 @@ impl TopologyProjector {
         hosts: Vec<RegistryHost>,
     ) -> Result<(), TopologyError> {
         if !authenticated || !self.registry_authenticated {
+            self.preflight_revision()?;
             self.registry_authenticated = false;
             self.mark_all_remote_stale();
+            self.commit_revision();
             if hosts.is_empty() {
-                self.bump_revision()?;
                 return Ok(());
             }
             return Err(error(
@@ -230,6 +248,16 @@ impl TopologyProjector {
                     "remote hosts cannot claim local trust".into(),
                 ));
             }
+            if !matches!(
+                host.connection_path,
+                ConnectionPath::Direct | ConnectionPath::Registry
+            ) {
+                return Err(error(
+                    TopologyErrorKind::InvalidConnectionPath,
+                    "connection_path",
+                    format!("{:?}", host.connection_path),
+                ));
+            }
             let host_id = parse_host_id(&host.snapshot.id)?;
             if self.local_host_id.as_ref() == Some(&host_id) {
                 continue;
@@ -246,9 +274,11 @@ impl TopologyProjector {
                 host.connection_path,
                 host.permissions,
                 freshness,
+                observed_at_ms,
             )?;
             projected.push((host_id, dashboard));
         }
+        self.preflight_revision()?;
         let observed_ids: HashSet<_> = projected.iter().map(|(id, _)| id.clone()).collect();
         let absent_ids: Vec<_> = self
             .hosts
@@ -272,7 +302,7 @@ impl TopologyProjector {
         self.prune_absent_hosts(&observed_ids);
         self.registry_revision = Some(source_revision);
         self.registry_authenticated = authenticated;
-        self.bump_revision()?;
+        self.commit_revision();
         Ok(())
     }
 
@@ -284,8 +314,10 @@ impl TopologyProjector {
         if !self.hosts.contains_key(host_id) {
             return Ok(());
         }
+        self.preflight_revision()?;
         self.mark_host_stale(host_id);
-        self.bump_revision()
+        self.commit_revision();
+        Ok(())
     }
 
     pub fn snapshot(&self, generated_at_ms: u64) -> DashboardSnapshot {
@@ -325,23 +357,26 @@ impl TopologyProjector {
         let owner_host_id = parse_host_id(&owner_host_id.into())?;
         let device_id = DeviceId::parse(device_id.into())
             .map_err(|error| invalid("device_id", error.to_string()))?;
-        let state = if self.host_is_live(&owner_host_id) {
+        let state = if self.host_is_connected(&owner_host_id) {
             LeaseState::Active
         } else {
             LeaseState::Uncertain
         };
-        if !self.leases.contains_key(&lease_id) && self.leases.len() >= MAX_COLLECTION_ITEMS {
-            if let Some(stale_id) = self
-                .leases
-                .iter()
-                .find(|(_, lease)| lease.state == LeaseState::Uncertain)
-                .map(|(id, _)| id.clone())
-            {
-                self.leases.remove(&stale_id);
-            }
-        }
-        if !self.leases.contains_key(&lease_id) {
+        let stale_to_remove =
+            if !self.leases.contains_key(&lease_id) && self.leases.len() >= MAX_COLLECTION_ITEMS {
+                self.leases
+                    .iter()
+                    .find(|(_, lease)| lease.state == LeaseState::Uncertain)
+                    .map(|(id, _)| id.clone())
+            } else {
+                None
+            };
+        if !self.leases.contains_key(&lease_id) && stale_to_remove.is_none() {
             ensure_limit("leases", self.leases.len() + 1)?;
+        }
+        self.preflight_revision()?;
+        if let Some(stale_id) = stale_to_remove {
+            self.leases.remove(&stale_id);
         }
         self.leases.insert(
             lease_id,
@@ -351,7 +386,7 @@ impl TopologyProjector {
                 state,
             },
         );
-        self.bump_revision()?;
+        self.commit_revision();
         Ok(())
     }
 
@@ -370,6 +405,13 @@ impl TopologyProjector {
 
     fn host_is_live(&self, host_id: &HostId) -> bool {
         self.hosts.get(host_id).is_some_and(|host| {
+            host.dashboard.freshness == Freshness::Live
+                && host.dashboard.presence == Presence::Online
+        })
+    }
+
+    fn host_is_connected(&self, host_id: &HostId) -> bool {
+        self.hosts.get(host_id).is_some_and(|host| {
             !matches!(host.dashboard.freshness, Freshness::Stale { .. })
                 && host.dashboard.presence != Presence::Offline
         })
@@ -377,10 +419,12 @@ impl TopologyProjector {
 
     fn host_owns_device(&self, host_id: &HostId, device_id: &DeviceId) -> bool {
         self.hosts.get(host_id).is_some_and(|host| {
-            host.dashboard
-                .devices
-                .iter()
-                .any(|device| device.id == *device_id && device.host_id == *host_id)
+            host.dashboard.devices.iter().any(|device| {
+                device.id == *device_id
+                    && device.host_id == *host_id
+                    && device.presence == Presence::Online
+                    && device.freshness == Freshness::Live
+            })
         })
     }
 
@@ -448,15 +492,18 @@ impl TopologyProjector {
         }
     }
 
-    fn bump_revision(&mut self) -> Result<(), TopologyError> {
-        self.revision = self.revision.checked_add(1).ok_or_else(|| {
+    fn preflight_revision(&self) -> Result<(), TopologyError> {
+        self.revision.checked_add(1).map(|_| ()).ok_or_else(|| {
             error(
                 TopologyErrorKind::RevisionExhausted,
                 "revision",
                 self.revision.to_string(),
             )
-        })?;
-        Ok(())
+        })
+    }
+
+    fn commit_revision(&mut self) {
+        self.revision += 1;
     }
 }
 
@@ -467,10 +514,26 @@ fn project_host(
     connection_path: ConnectionPath,
     permissions: Vec<String>,
     freshness: Freshness,
+    observed_at_ms: u64,
 ) -> Result<DashboardHost, TopologyError> {
     ensure_limit("devices", snapshot.devices.len())?;
+    ensure_limit("capabilities", snapshot.capabilities.len())?;
+    ensure_limit("permissions", permissions.len())?;
+    validate_code_inputs("capability", &snapshot.capabilities)?;
+    validate_code_inputs("permission", &permissions)?;
     if let Some((_, devices)) = &details {
         ensure_limit("device_details", devices.len())?;
+        for device in devices {
+            validate_identifier("device_details.id", &device.id)?;
+            validate_display("device_details.display_name", &device.display_name)?;
+            ensure_limit("device_details.capabilities", device.capabilities.len())?;
+            ensure_limit("device_details.permissions", device.permissions.len())?;
+            validate_code_inputs("device_capability", &device.capabilities)?;
+            validate_code_inputs("device_permission", &device.permissions)?;
+        }
+    }
+    if let Some((display_name, _)) = &details {
+        validate_display("display_name", display_name)?;
     }
     let host_id = parse_host_id(&snapshot.id)?;
     let (display_name, device_details) = details
@@ -481,7 +544,7 @@ fn project_host(
         .into_iter()
         .map(|device| {
             let details = device_details.get(&device.id);
-            project_device(&host_id, device, details, freshness.clone())
+            project_device(&host_id, device, details, freshness.clone(), observed_at_ms)
         })
         .collect::<Result<Vec<_>, _>>()?;
     devices.sort_by(|left, right| left.id.cmp(&right.id));
@@ -491,12 +554,14 @@ fn project_host(
     capabilities.dedup();
     permissions.sort();
     permissions.dedup();
+    let presence = parse_presence(&snapshot.status);
+    let freshness = freshness_for_presence(presence, freshness, observed_at_ms);
     let dashboard = DashboardHost {
         id: host_id,
         display_name,
         platform: parse_code(&snapshot.operating_system, "operating_system")?,
         architecture: parse_code(&snapshot.architecture, "architecture")?,
-        presence: parse_presence(&snapshot.status),
+        presence,
         freshness,
         trust,
         connection_path,
@@ -515,6 +580,7 @@ fn project_device(
     snapshot: DeviceSnapshot,
     details: Option<&DeviceDetails>,
     freshness: Freshness,
+    observed_at_ms: u64,
 ) -> Result<DashboardDevice, TopologyError> {
     let id = DeviceId::parse(snapshot.id.clone())
         .map_err(|error| invalid("device_id", error.to_string()))?;
@@ -534,13 +600,14 @@ fn project_device(
     capabilities.dedup();
     permissions.sort();
     permissions.dedup();
+    let presence = parse_presence(&snapshot.state);
     Ok(DashboardDevice {
         id,
         host_id: host_id.clone(),
         display_name,
         platform: parse_code(&snapshot.platform, "device_platform")?,
-        presence: parse_presence(&snapshot.state),
-        freshness,
+        presence,
+        freshness: freshness_for_presence(presence, freshness, observed_at_ms),
         capabilities,
         permissions,
     })
@@ -580,9 +647,37 @@ fn parse_presence(value: &str) -> Presence {
     }
 }
 
+fn freshness_for_presence(
+    presence: Presence,
+    freshness: Freshness,
+    observed_at_ms: u64,
+) -> Freshness {
+    if presence == Presence::Offline {
+        Freshness::Stale {
+            last_seen_at_ms: observed_at_ms,
+        }
+    } else {
+        freshness
+    }
+}
+
 fn validate_identifier(field: &'static str, value: &str) -> Result<(), TopologyError> {
     if value.trim().is_empty() || value.len() > MAX_ID_BYTES {
         return Err(invalid(field, value.into()));
+    }
+    Ok(())
+}
+
+fn validate_display(field: &'static str, value: &str) -> Result<(), TopologyError> {
+    if value.trim().is_empty() || value.len() > MAX_TEXT_BYTES {
+        return Err(invalid(field, value.len().to_string()));
+    }
+    Ok(())
+}
+
+fn validate_code_inputs(field: &'static str, values: &[String]) -> Result<(), TopologyError> {
+    if let Some(value) = values.iter().find(|value| value.len() > 128) {
+        return Err(invalid(field, value.len().to_string()));
     }
     Ok(())
 }
