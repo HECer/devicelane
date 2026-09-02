@@ -24,6 +24,7 @@ pub enum AuditError {
     InvalidRecord,
     FrameTooLarge,
     InsecureStorage,
+    InjectedCrash,
     LimitExceeded,
     CursorAhead,
     CommittedCorruption,
@@ -41,6 +42,7 @@ impl std::fmt::Display for AuditError {
             Self::InvalidRecord => "invalid_record",
             Self::FrameTooLarge => "frame_too_large",
             Self::InsecureStorage => "insecure_storage",
+            Self::InjectedCrash => "injected_crash",
             Self::LimitExceeded => "limit_exceeded",
             Self::CursorAhead => "cursor_ahead",
             Self::CommittedCorruption => "committed_corruption",
@@ -277,6 +279,15 @@ pub struct RetentionTombstoneSummary {
     pub first_occurred_at_ms: u64,
     pub last_occurred_at_ms: u64,
     pub segments: Vec<DeletedSegmentSummary>,
+    #[serde(default)]
+    pub replacement_segments: Vec<DeletedSegmentSummary>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetentionFault {
+    None,
+    BeforeIndexSwap,
+    AfterIndexSwap,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -303,6 +314,8 @@ pub trait AuditSigner: Send + Sync {
 struct Index {
     version: u16,
     current: u64,
+    #[serde(default)]
+    active_segments: Vec<u64>,
 }
 
 pub struct AuditStore {
@@ -316,6 +329,7 @@ pub struct AuditStore {
     recovered: bool,
     available: bool,
     max_segment_bytes: u64,
+    active_segments: Vec<u64>,
 }
 
 impl AuditStore {
@@ -339,15 +353,39 @@ impl AuditStore {
         let root = root.as_ref().to_owned();
         create_private_dir(&root)?;
         validate_private_dir(&root)?;
-        let current = read_index(&root)?.unwrap_or(1);
+        let index = read_index(&root)?;
+        let current = index.as_ref().map_or(1, |index| index.current);
+        let discovered = segment_paths(&root)?;
+        for path in &discovered {
+            validate_private_file(path)?;
+        }
+        let active_segments = index
+            .as_ref()
+            .filter(|index| !index.active_segments.is_empty())
+            .map(|index| index.active_segments.clone())
+            .unwrap_or_else(|| {
+                discovered
+                    .iter()
+                    .filter_map(|path| segment_number(path))
+                    .collect()
+            });
         let mut records = Vec::new();
         let mut tombstones = Vec::new();
         let mut recovered = false;
-        for path in segment_paths(&root)? {
-            validate_private_file(&path)?;
+        for number in &active_segments {
+            let path = root.join(format!("segment-{number:020}.audit"));
+            if !path.exists() {
+                return Err(AuditError::CommittedCorruption);
+            }
             let is_current = path == root.join(format!("segment-{current:020}.audit"));
             recovered |= read_segment(&path, &mut records, &mut tombstones, is_current)?;
         }
+        for path in &discovered {
+            if segment_number(path).is_some_and(|number| !active_segments.contains(&number)) {
+                fs::remove_file(path)?;
+            }
+        }
+        sync_directory(&root)?;
         let current_day = records.last().map(|record| record.occurred_at_ms / DAY_MS);
         let mut store = Self {
             root,
@@ -360,9 +398,11 @@ impl AuditStore {
             recovered,
             available: true,
             max_segment_bytes,
+            active_segments,
         };
         if !store.segment_path(current).exists() {
             store.create_segment(current)?;
+            store.active_segments.push(current);
         }
         validate_private_file(&store.segment_path(current))?;
         store.write_index()?;
@@ -489,24 +529,99 @@ impl AuditStore {
     }
 
     pub fn enforce_retention(&mut self, now_ms: u64) -> Result<(), AuditError> {
+        let result = self.compact_retention(now_ms, RetentionFault::None);
+        if result.is_err() {
+            self.available = false;
+        }
+        result
+    }
+
+    pub fn enforce_retention_with_fault(
+        &mut self,
+        now_ms: u64,
+        fault: RetentionFault,
+    ) -> Result<(), AuditError> {
+        self.compact_retention(now_ms, fault)
+    }
+
+    fn compact_retention(&mut self, now_ms: u64, fault: RetentionFault) -> Result<(), AuditError> {
         let cutoff = now_ms.saturating_sub(u64::from(self.retention.days()) * DAY_MS);
-        let mut deletable = Vec::new();
+        if !self
+            .records
+            .iter()
+            .any(|record| record.occurred_at_ms < cutoff)
+        {
+            return Ok(());
+        }
+
+        // Seal even an idle current segment so every candidate is immutable during compaction.
+        self.rotate()?;
+        let tombstone_segment = self.current;
+        let candidates = self
+            .active_segments
+            .iter()
+            .copied()
+            .filter(|number| *number != tombstone_segment)
+            .collect::<Vec<_>>();
+        let mut next_number = segment_paths(&self.root)?
+            .iter()
+            .filter_map(|path| segment_number(path))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut new_active = Vec::new();
+        let mut replaced_originals = Vec::new();
+        let mut replacements = Vec::new();
         let mut deleted_records = Vec::new();
-        for path in segment_paths(&self.root)? {
-            if path == self.segment_path(self.current) {
-                continue;
-            }
+
+        for number in candidates {
+            let path = self.segment_path(number);
             let mut records = Vec::new();
             let mut tombstones = Vec::new();
             read_segment(&path, &mut records, &mut tombstones, false)?;
-            if !records.is_empty() && records.iter().all(|record| record.occurred_at_ms < cutoff) {
-                deleted_records.extend(records);
-                deletable.push(path);
+            if !records.iter().any(|record| record.occurred_at_ms < cutoff) {
+                new_active.push(number);
+                continue;
+            }
+            replaced_originals.push(DeletedSegmentSummary {
+                id: segment_id(number),
+                sha256: hex(&Sha256::digest(fs::read(&path)?)),
+            });
+            deleted_records.extend(
+                records
+                    .iter()
+                    .filter(|record| record.occurred_at_ms < cutoff)
+                    .cloned(),
+            );
+            let retained = records
+                .into_iter()
+                .filter(|record| record.occurred_at_ms >= cutoff)
+                .map(StoredEntry::Record)
+                .chain(tombstones.into_iter().map(|retention_tombstone| {
+                    StoredEntry::RetentionTombstone {
+                        retention_tombstone,
+                    }
+                }))
+                .collect::<Vec<_>>();
+            if !retained.is_empty() {
+                let replacement_path = self.segment_path(next_number);
+                self.create_segment(next_number)?;
+                for entry in &retained {
+                    let payload = serde_json::to_vec(entry)?;
+                    if frame_len(&payload)? > self.max_segment_bytes {
+                        return Err(AuditError::FrameTooLarge);
+                    }
+                    append_frame(&replacement_path, &payload)?;
+                }
+                replacements.push(DeletedSegmentSummary {
+                    id: segment_id(next_number),
+                    sha256: hex(&Sha256::digest(fs::read(&replacement_path)?)),
+                });
+                new_active.push(next_number);
+                next_number += 1;
             }
         }
-        if deletable.is_empty() {
-            return Ok(());
-        }
+
         let summary = RetentionTombstoneSummary {
             deleted_record_count: deleted_records.len(),
             first_occurred_at_ms: deleted_records
@@ -519,19 +634,8 @@ impl AuditStore {
                 .map(|record| record.occurred_at_ms)
                 .max()
                 .unwrap_or(0),
-            segments: deletable
-                .iter()
-                .map(|path| {
-                    Ok(DeletedSegmentSummary {
-                        id: path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .ok_or(AuditError::InsecureStorage)?
-                            .to_owned(),
-                        sha256: hex(&Sha256::digest(fs::read(path)?)),
-                    })
-                })
-                .collect::<Result<Vec<_>, AuditError>>()?,
+            segments: replaced_originals.clone(),
+            replacement_segments: replacements,
         };
         let payload = serde_json::to_vec(&StoredEntry::RetentionTombstone {
             retention_tombstone: summary.clone(),
@@ -540,14 +644,13 @@ impl AuditStore {
         if length > self.max_segment_bytes || length > MAX_SEGMENT_BYTES {
             return Err(AuditError::FrameTooLarge);
         }
-        self.rotate()?;
-        append_frame(&self.segment_path(self.current), &payload)?;
+        append_frame(&self.segment_path(tombstone_segment), &payload)?;
         self.tombstones.push(summary);
         // Prove the durable tombstone can be read strictly before deleting referenced segments.
         let mut verified_records = Vec::new();
         let mut verified_tombstones = Vec::new();
         read_segment(
-            &self.segment_path(self.current),
+            &self.segment_path(tombstone_segment),
             &mut verified_records,
             &mut verified_tombstones,
             false,
@@ -555,16 +658,34 @@ impl AuditStore {
         if verified_tombstones.last() != self.tombstones.last() {
             return Err(AuditError::CommittedCorruption);
         }
-        for path in &deletable {
-            fs::remove_file(path)?;
+        sync_directory(&self.root)?;
+        let fresh_current = next_number;
+        self.create_segment(fresh_current)?;
+        sync_directory(&self.root)?;
+        if fault == RetentionFault::BeforeIndexSwap {
+            return Err(AuditError::InjectedCrash);
+        }
+        new_active.push(tombstone_segment);
+        new_active.push(fresh_current);
+        self.active_segments = new_active;
+        self.current = fresh_current;
+        self.current_day = None;
+        self.write_index()?;
+        if fault == RetentionFault::AfterIndexSwap {
+            return Err(AuditError::InjectedCrash);
+        }
+        for original in replaced_originals {
+            let number =
+                segment_number_from_id(&original.id).ok_or(AuditError::CommittedCorruption)?;
+            fs::remove_file(self.segment_path(number))?;
         }
         sync_directory(&self.root)?;
         self.records.clear();
         self.tombstones.clear();
-        for path in segment_paths(&self.root)? {
+        for number in &self.active_segments {
+            let path = self.segment_path(*number);
             read_segment(&path, &mut self.records, &mut self.tombstones, false)?;
         }
-        self.write_index()?;
         Ok(())
     }
 
@@ -625,6 +746,7 @@ impl AuditStore {
         sync_directory(&self.root)?;
         self.current = next;
         self.current_day = None;
+        self.active_segments.push(next);
         self.write_index()
     }
     fn write_index(&self) -> Result<(), AuditError> {
@@ -634,13 +756,13 @@ impl AuditStore {
         }
         let mut file = create_private_file(&tmp)?;
         file.write_all(&serde_json::to_vec(&Index {
-            version: 1,
+            version: 2,
             current: self.current,
+            active_segments: self.active_segments.clone(),
         })?)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(tmp, self.root.join("index.json"))?;
-        sync_directory(&self.root)
+        atomic_replace(&tmp, &self.root.join("index.json"), &self.root)
     }
 }
 
@@ -754,7 +876,7 @@ fn segment_paths(root: &Path) -> Result<Vec<PathBuf>, AuditError> {
     Ok(paths)
 }
 
-fn read_index(root: &Path) -> Result<Option<u64>, AuditError> {
+fn read_index(root: &Path) -> Result<Option<Index>, AuditError> {
     let path = root.join("index.json");
     if !path.exists() {
         return Ok(None);
@@ -762,10 +884,28 @@ fn read_index(root: &Path) -> Result<Option<u64>, AuditError> {
     validate_private_file(&path)?;
     let index: Index =
         serde_json::from_slice(&fs::read(path)?).map_err(|_| AuditError::CommittedCorruption)?;
-    if index.version != 1 || index.current == 0 {
+    if !(1..=2).contains(&index.version)
+        || index.current == 0
+        || (!index.active_segments.is_empty() && !index.active_segments.contains(&index.current))
+    {
         return Err(AuditError::CommittedCorruption);
     }
-    Ok(Some(index.current))
+    Ok(Some(index))
+}
+
+fn segment_id(number: u64) -> String {
+    format!("segment-{number:020}.audit")
+}
+
+fn segment_number(path: &Path) -> Option<u64> {
+    segment_number_from_id(path.file_name()?.to_str()?)
+}
+
+fn segment_number_from_id(id: &str) -> Option<u64> {
+    id.strip_prefix("segment-")?
+        .strip_suffix(".audit")?
+        .parse()
+        .ok()
 }
 
 #[cfg(not(windows))]
@@ -854,7 +994,10 @@ mod windows_private {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FlushFileBuffers, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -994,6 +1137,46 @@ mod windows_private {
         Ok(unsafe { File::from_raw_handle(handle as _) })
     }
 
+    pub fn sync_dir(path: &Path) -> Result<(), AuditError> {
+        let path = wide(path);
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error().into());
+        }
+        let flushed = unsafe { FlushFileBuffers(handle) };
+        unsafe { CloseHandle(handle) };
+        if flushed == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    pub fn atomic_replace(source: &Path, destination: &Path) -> Result<(), AuditError> {
+        let source = wide(source);
+        let destination = wide(destination);
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
     struct Security {
         descriptor: *mut core::ffi::c_void,
         attributes: SECURITY_ATTRIBUTES,
@@ -1084,9 +1267,21 @@ fn sync_directory(path: &Path) -> Result<(), AuditError> {
     }
     #[cfg(windows)]
     {
-        let _ = path;
+        windows_private::sync_dir(path)?;
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path, root: &Path) -> Result<(), AuditError> {
+    fs::rename(source, destination)?;
+    sync_directory(root)
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path, root: &Path) -> Result<(), AuditError> {
+    windows_private::atomic_replace(source, destination)?;
+    sync_directory(root)
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()

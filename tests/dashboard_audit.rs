@@ -1,6 +1,6 @@
 use device_development_mesh::dashboard::audit::{
     AuditError, AuditFilter, AuditGuard, AuditSigner, AuditStore, ExportSignature, RawAuditRecord,
-    Redactor, RetentionPolicy,
+    Redactor, RetentionFault, RetentionPolicy,
 };
 use device_development_mesh::dashboard::{
     ActivityId, AuditResult, HostId, OperationId, PolicyEffect, PrincipalId, ResourceClass,
@@ -292,7 +292,7 @@ fn export_is_canonical_hashed_and_has_explicit_signature_status() {
 }
 
 #[test]
-fn midday_retention_keeps_a_mixed_segment_consistent_after_reopen() {
+fn midday_retention_compacts_mixed_segments_at_the_exact_cutoff_and_reopens() {
     let temp = TempDir::new().unwrap();
     let day = 86_400_000;
     let mut store = AuditStore::open(
@@ -302,11 +302,19 @@ fn midday_retention_keeps_a_mixed_segment_consistent_after_reopen() {
     )
     .unwrap();
     store.append(raw(1, day / 4, "expired-in-mixed")).unwrap();
-    store
-        .append(raw(2, 3 * day / 4, "retained-in-mixed"))
-        .unwrap();
+    store.append(raw(2, day / 2, "exact-cutoff")).unwrap();
     store.append(raw(3, day + day / 2, "current")).unwrap();
     store.enforce_retention(day + day / 2).unwrap();
+    let summary = store.retention_tombstones().last().unwrap();
+    assert_eq!(summary.deleted_record_count, 1);
+    assert_eq!(
+        (summary.first_occurred_at_ms, summary.last_occurred_at_ms),
+        (day / 4, day / 4)
+    );
+    assert_eq!(summary.segments.len(), 1);
+    assert_eq!(summary.replacement_segments.len(), 1);
+    assert_eq!(summary.segments[0].sha256.len(), 64);
+    assert_eq!(summary.replacement_segments[0].sha256.len(), 64);
     assert_eq!(
         store
             .query(AuditFilter::default(), None, 20)
@@ -316,7 +324,7 @@ fn midday_retention_keeps_a_mixed_segment_consistent_after_reopen() {
             .filter(|record| record.result != AuditResult::Deleted)
             .map(|record| record.sequence)
             .collect::<Vec<_>>(),
-        vec![1, 2, 3]
+        vec![2, 3]
     );
     drop(store);
     let reopened = open(&temp);
@@ -329,8 +337,90 @@ fn midday_retention_keeps_a_mixed_segment_consistent_after_reopen() {
             .filter(|record| record.result != AuditResult::Deleted)
             .map(|record| record.sequence)
             .collect::<Vec<_>>(),
-        vec![1, 2, 3]
+        vec![2, 3]
     );
+}
+
+#[test]
+fn idle_current_only_segment_is_sealed_and_compacted() {
+    let temp = TempDir::new().unwrap();
+    let day = 86_400_000;
+    let mut store = AuditStore::open(
+        temp.path(),
+        RetentionPolicy::new(1).unwrap(),
+        Redactor::default(),
+    )
+    .unwrap();
+    store.append(raw(1, day / 4, "expired-current")).unwrap();
+    store.append(raw(2, day / 2, "boundary-current")).unwrap();
+    store.enforce_retention(day + day / 2).unwrap();
+    assert_eq!(
+        store
+            .query(AuditFilter::default(), None, 20)
+            .unwrap()
+            .items
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    drop(store);
+    let reopened = AuditStore::open(
+        temp.path(),
+        RetentionPolicy::new(1).unwrap(),
+        Redactor::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .query(AuditFilter::default(), None, 20)
+            .unwrap()
+            .items
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
+#[test]
+fn compaction_crash_recovery_chooses_only_the_indexed_generation() {
+    let day = 86_400_000;
+    for (fault, expected) in [
+        (RetentionFault::BeforeIndexSwap, vec![1, 2]),
+        (RetentionFault::AfterIndexSwap, vec![2]),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let mut store = AuditStore::open(
+            temp.path(),
+            RetentionPolicy::new(1).unwrap(),
+            Redactor::default(),
+        )
+        .unwrap();
+        store.append(raw(1, day / 4, "expired")).unwrap();
+        store.append(raw(2, day / 2, "boundary")).unwrap();
+        assert!(matches!(
+            store.enforce_retention_with_fault(day + day / 2, fault),
+            Err(AuditError::InjectedCrash)
+        ));
+        drop(store);
+        let reopened = AuditStore::open(
+            temp.path(),
+            RetentionPolicy::new(1).unwrap(),
+            Redactor::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .query(AuditFilter::default(), None, 20)
+                .unwrap()
+                .items
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -421,6 +511,7 @@ fn retention_tombstone_names_exact_deleted_segments_and_survives_reopen() {
     assert_eq!(summary.segments.len(), 1);
     assert_eq!(summary.segments[0].sha256.len(), 64);
     assert!(summary.segments[0].id.starts_with("segment-"));
+    assert!(summary.replacement_segments.is_empty());
     drop(store);
     let reopened = open(&temp);
     assert_eq!(reopened.retention_tombstones().len(), 1);
