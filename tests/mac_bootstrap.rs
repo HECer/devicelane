@@ -9,7 +9,7 @@ fn mac_bootstrap_defines_the_complete_user_launch_agent_lifecycle() {
     let smoke = fs::read_to_string(root.join("scripts/mac-bootstrap-smoke")).unwrap();
 
     for required in [
-        "cargo build --workspace --release",
+        "cargo build --release --locked --bin mesh-agent --bin mesh-cli",
         "\"$CLI_PATH\" doctor",
         "\"$PROGRAM_PATH\" pair",
         "launchctl bootstrap",
@@ -26,6 +26,10 @@ fn mac_bootstrap_defines_the_complete_user_launch_agent_lifecycle() {
             "missing bootstrap step: {required}"
         );
     }
+    assert!(
+        !setup.contains("cargo build --workspace --release"),
+        "the agent bootstrap must not build the Tauri workspace before its sidecar is staged"
+    );
     assert!(smoke.contains("cargo test --test mac_bootstrap"));
     assert!(smoke.contains("setup-mac.sh --dry-run"));
 }

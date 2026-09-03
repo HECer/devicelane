@@ -315,7 +315,7 @@ mkdir -p "$PROGRAM_DIR/bin" "$IDENTITY_DIR" "$AUDIT_DIR" "$WORKSPACE_DIR" "$LOG_
 chmod 700 "$PROGRAM_DIR" "$PROGRAM_DIR/bin" "$IDENTITY_DIR" "$AUDIT_DIR" "$WORKSPACE_DIR" "$LOG_DIR" "$DIAGNOSTIC_BUNDLE"
 
 cd "$ROOT"
-cargo build --workspace --release >/dev/null
+cargo build --release --locked --bin mesh-agent --bin mesh-cli >/dev/null
 install -m 700 target/release/mesh-agent "$PROGRAM_PATH"
 install -m 700 target/release/mesh-cli "$CLI_PATH"
 rm -rf "$HARDWARE_GATE_DIR.next"
