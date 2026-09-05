@@ -21,6 +21,17 @@ struct WireConfig {
     registry_peer_id: String,
 }
 
+impl<'de> Deserialize<'de> for ConnectionConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = WireConfig::deserialize(deserializer)?;
+        if wire.version != 1 {
+            return Err(serde::de::Error::custom("unsupported connection version"));
+        }
+        Self::new(&wire.registry_address, &wire.registry_peer_id)
+            .map_err(|_| serde::de::Error::custom("invalid connection settings"))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionConfigError {
     InvalidFile,
@@ -52,6 +63,32 @@ impl ConnectionConfig {
     }
     pub fn registry_peer_id(&self) -> &str {
         &self.registry_peer_id
+    }
+
+    /// Writes public settings without changing identity or trust. The caller must
+    /// authorize/audit the mutation and serialize writers for this identity.
+    /// On an error after replacement, reload before deciding the effective state.
+    pub fn save(&self, identity: &Path) -> Result<(), ConnectionConfigError> {
+        if !identity.is_absolute() {
+            return Err(ConnectionConfigError::InvalidFile);
+        }
+        let directory =
+            fs::symlink_metadata(identity).map_err(|_| ConnectionConfigError::Unavailable)?;
+        if !directory.is_dir() || !safe_metadata(&directory) {
+            return Err(ConnectionConfigError::InvalidFile);
+        }
+        let path = identity.join("connection.json");
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.is_file() || !safe_metadata(&metadata) => {
+                return Err(ConnectionConfigError::InvalidFile);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(ConnectionConfigError::Unavailable),
+        }
+        let bytes = serde_json::to_vec(self).map_err(|_| ConnectionConfigError::InvalidFormat)?;
+        crate::dashboard::audit::write_private_atomic(&path, &bytes)
+            .map_err(|_| ConnectionConfigError::Unavailable)
     }
 
     /// Reads public settings only; never creates an identity or changes peer trust.

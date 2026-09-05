@@ -33,6 +33,91 @@ fn loads_public_connection_without_changing_identity_or_trust() {
 }
 
 #[test]
+fn saves_and_replaces_only_the_public_connection_file() {
+    let root = tempfile::tempdir().unwrap();
+    let identity = root.path().join("identity");
+    let transport = device_development_mesh::secure_transport::SecureTransport::load_or_create(
+        &identity,
+        "workstation",
+    )
+    .unwrap();
+    let certificate = transport.certificate_der().to_vec();
+    fn collect_files(root: &std::path::Path, files: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                collect_files(&path, files);
+            } else {
+                files.push((path.clone(), std::fs::read(path).unwrap()));
+            }
+        }
+    }
+    let mut identity_files = Vec::new();
+    collect_files(&identity, &mut identity_files);
+    let first = ConnectionConfig::new("127.0.0.1:7443", "registry").unwrap();
+    first.save(&identity).unwrap();
+    assert_eq!(ConnectionConfig::load(&identity).unwrap(), Some(first));
+    let second = ConnectionConfig::new("macbook.local:7443", "another-registry").unwrap();
+    second.save(&identity).unwrap();
+    assert_eq!(ConnectionConfig::load(&identity).unwrap(), Some(second));
+    let reopened = device_development_mesh::secure_transport::SecureTransport::load_or_create(
+        &identity,
+        "workstation",
+    )
+    .unwrap();
+    assert_eq!(reopened.certificate_der(), certificate);
+    for (path, bytes) in identity_files {
+        assert!(
+            std::fs::read(path).unwrap() == bytes,
+            "identity material changed"
+        );
+    }
+}
+
+#[test]
+fn failed_staging_preserves_previous_connection() {
+    let root = tempfile::tempdir().unwrap();
+    let identity = root.path().join("identity");
+    device_development_mesh::secure_transport::SecureTransport::load_or_create(
+        &identity,
+        "workstation",
+    )
+    .unwrap();
+    let first = ConnectionConfig::new("127.0.0.1:7443", "registry").unwrap();
+    first.save(&identity).unwrap();
+    let before = std::fs::read(identity.join("connection.json")).unwrap();
+    let staging = identity.join(format!(
+        ".connection.json.devicelane-{}.tmp",
+        std::process::id()
+    ));
+    std::fs::create_dir(&staging).unwrap();
+    let second = ConnectionConfig::new("macbook.local:7443", "another-registry").unwrap();
+    assert!(second.save(&identity).is_err());
+    assert_eq!(
+        std::fs::read(identity.join("connection.json")).unwrap(),
+        before
+    );
+    assert!(staging.is_dir());
+}
+
+#[test]
+fn save_refuses_non_regular_destination_without_deleting_it() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("connection.json")).unwrap();
+    let config = ConnectionConfig::new("127.0.0.1:7443", "registry").unwrap();
+    assert_eq!(
+        config.save(root.path()),
+        Err(ConnectionConfigError::InvalidFile)
+    );
+    assert!(root.path().join("connection.json").is_dir());
+    assert_eq!(
+        config.save(std::path::Path::new("relative")),
+        Err(ConnectionConfigError::InvalidFile)
+    );
+}
+
+#[test]
 fn rejects_unknown_fields_versions_and_oversized_input() {
     let root = tempfile::tempdir().unwrap();
     for bytes in [
@@ -104,6 +189,24 @@ fn bounds_configuration_fields_and_rejects_duplicate_keys() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("connection.json"), br#"{"version":1,"version":1,"registry_address":"127.0.0.1:7443","registry_peer_id":"registry"}"#).unwrap();
     assert!(ConnectionConfig::load(root.path()).is_err());
+}
+
+#[test]
+fn ipc_deserialization_uses_the_same_configuration_validation() {
+    let config = ConnectionConfig::new("macbook.local:7443", "registry").unwrap();
+    let encoded = serde_json::to_vec(&config).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<ConnectionConfig>(&encoded).unwrap(),
+        config
+    );
+    for bytes in [
+        document("127.0.0.1:7443", "registry:other"),
+        document("mac:0", "registry"),
+        br#"{"version":2,"registry_address":"127.0.0.1:7443","registry_peer_id":"registry"}"#.to_vec(),
+        br#"{"version":1,"registry_address":"127.0.0.1:7443","registry_peer_id":"registry","command":"whoami"}"#.to_vec(),
+    ] {
+        assert!(serde_json::from_slice::<ConnectionConfig>(&bytes).is_err());
+    }
 }
 
 #[test]

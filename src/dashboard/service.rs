@@ -29,6 +29,9 @@ pub enum ExistingJobs {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "mutation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminMutation {
+    ConnectionSet {
+        configuration: crate::connection_config::ConnectionConfig,
+    },
     PolicyPut {
         rule: PolicyRule,
         expected_revision: u64,
@@ -55,6 +58,10 @@ impl AdminMutation {
 
     fn operation_and_resource(&self) -> (&'static str, ResourceClass) {
         match self {
+            Self::ConnectionSet { .. } => (
+                "devicelane.service.connection.set",
+                ResourceClass::DeviceLaneService,
+            ),
             Self::PolicyPut { .. } => ("devicelane.policy.put", ResourceClass::DeviceLanePolicy),
             Self::PolicyDelete { .. } => {
                 ("devicelane.policy.delete", ResourceClass::DeviceLanePolicy)
@@ -455,6 +462,34 @@ impl DashboardService {
             .map_err(|_| DashboardServiceError::InvalidRequest)?;
         self.topology = topology;
         Ok(())
+    }
+
+    /// Internal daemon transaction boundary: caller serializes writes and must
+    /// reconcile effective connection state if persistence or final audit fails.
+    pub fn apply_connection_change(
+        &mut self,
+        configuration: &crate::connection_config::ConnectionConfig,
+        persist: impl FnOnce() -> Result<(), DashboardServiceError>,
+        now_ms: u64,
+    ) -> Result<(), DashboardServiceError> {
+        let mutation = AdminMutation::ConnectionSet {
+            configuration: configuration.clone(),
+        };
+        let digest = mutation.digest()?;
+        self.authorize_admin(
+            "devicelane.service.connection.set",
+            ResourceClass::DeviceLaneService,
+            Some(&digest),
+            now_ms,
+        )?;
+        self.audit_local("connection-set", AuditResult::Attempted, now_ms)?;
+        match persist() {
+            Ok(()) => self.audit_local("connection-set", AuditResult::Succeeded, now_ms),
+            Err(error) => {
+                self.audit_local("connection-set", AuditResult::Failed, now_ms)?;
+                Err(error)
+            }
+        }
     }
 
     pub fn disconnect_inventory(&mut self, detected_at_ms: u64) {
@@ -1705,6 +1740,100 @@ mod admin_mutation_tests {
         service
             .decide_pending_approval(&id, &session, ApprovalDecision::AllowOnce, 11)
             .unwrap();
+    }
+
+    #[test]
+    fn connection_change_requires_exact_one_use_approval_before_writing() {
+        use crate::connection_config::ConnectionConfig;
+        let mut service = service();
+        let approved = ConnectionConfig::new("127.0.0.1:7443", "registry").unwrap();
+        let substituted = ConnectionConfig::new("macbook.local:7443", "other-registry").unwrap();
+        assert_eq!(
+            service.apply_connection_change(&approved, || panic!("unapproved write"), 9),
+            Err(DashboardServiceError::PermissionDenied)
+        );
+        approve(
+            &mut service,
+            AdminMutation::ConnectionSet {
+                configuration: approved.clone(),
+            },
+        );
+        assert_eq!(
+            service.apply_connection_change(&substituted, || panic!("substituted write"), 12),
+            Err(DashboardServiceError::PermissionDenied)
+        );
+        let mut writes = 0;
+        service
+            .apply_connection_change(
+                &approved,
+                || {
+                    writes += 1;
+                    Ok(())
+                },
+                12,
+            )
+            .unwrap();
+        assert_eq!(writes, 1);
+        assert_eq!(
+            service.apply_connection_change(&approved, || panic!("replayed write"), 13),
+            Err(DashboardServiceError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn connection_change_does_not_write_when_audit_is_unavailable() {
+        use crate::connection_config::ConnectionConfig;
+        let mut service = service();
+        let configuration = ConnectionConfig::new("127.0.0.1:7443", "registry").unwrap();
+        approve(
+            &mut service,
+            AdminMutation::ConnectionSet {
+                configuration: configuration.clone(),
+            },
+        );
+        service.audit_healthy = false;
+        assert_eq!(
+            service.apply_connection_change(&configuration, || panic!("unaudited write"), 12),
+            Err(DashboardServiceError::AuditUnavailable)
+        );
+    }
+
+    #[test]
+    fn connection_change_records_write_failure_and_does_not_reuse_grant() {
+        use crate::connection_config::ConnectionConfig;
+        let mut service = service();
+        let configuration = ConnectionConfig::new("127.0.0.1:7443", "registry").unwrap();
+        approve(
+            &mut service,
+            AdminMutation::ConnectionSet {
+                configuration: configuration.clone(),
+            },
+        );
+        assert_eq!(
+            service.apply_connection_change(
+                &configuration,
+                || Err(DashboardServiceError::InvalidRequest),
+                12
+            ),
+            Err(DashboardServiceError::InvalidRequest)
+        );
+        assert_eq!(
+            service.apply_connection_change(&configuration, || panic!("replayed failed write"), 13),
+            Err(DashboardServiceError::PermissionDenied)
+        );
+        let records = service
+            .audit
+            .lock()
+            .unwrap()
+            .query(AuditFilter::default(), None, 100)
+            .unwrap();
+        let results: Vec<_> = records
+            .items
+            .iter()
+            .filter(|record| record.operation.as_str() == "connection-set")
+            .map(|record| record.result)
+            .collect();
+        assert_eq!(results, vec![AuditResult::Attempted, AuditResult::Failed]);
     }
 
     #[test]
