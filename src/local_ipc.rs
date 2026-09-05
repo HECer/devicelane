@@ -86,6 +86,10 @@ pub enum LocalRequest {
     ConnectionSettings {
         version: LocalProtocolVersion,
     },
+    SetConnection {
+        version: LocalProtocolVersion,
+        configuration: crate::connection_config::ConnectionConfig,
+    },
     PauseRemoteAccess {
         version: LocalProtocolVersion,
     },
@@ -205,6 +209,7 @@ impl LocalRequest {
         match *self {
             Self::Status { version }
             | Self::ConnectionSettings { version }
+            | Self::SetConnection { version, .. }
             | Self::PauseRemoteAccess { version }
             | Self::ResumeRemoteAccess { version }
             | Self::SetAutostart { version, .. }
@@ -513,6 +518,7 @@ impl Authorizer for SameUserAuthorizer {
 }
 
 pub struct DaemonState {
+    connection_storage: Option<PathBuf>,
     snapshot: DaemonSnapshot,
     diagnostics: Vec<DiagnosticItem>,
     autostart_adapter: Option<Arc<dyn AutostartAdapter>>,
@@ -531,6 +537,31 @@ pub struct RemoteExecutionConfig {
     pub registry_peer_id: String,
     pub identity_path: PathBuf,
     pub client_id: String,
+}
+
+struct ConnectionWriteObservation {
+    before: Result<
+        Option<crate::connection_config::ConnectionConfig>,
+        crate::connection_config::ConnectionConfigError,
+    >,
+    saved: Result<(), crate::connection_config::ConnectionConfigError>,
+    after: Result<
+        Option<crate::connection_config::ConnectionConfig>,
+        crate::connection_config::ConnectionConfigError,
+    >,
+}
+
+impl ConnectionWriteObservation {
+    fn callback_result(
+        &self,
+        target: &crate::connection_config::ConnectionConfig,
+    ) -> Result<(), crate::dashboard::service::DashboardServiceError> {
+        if self.saved.is_ok() && self.after.as_ref().ok().and_then(Option::as_ref) == Some(target) {
+            Ok(())
+        } else {
+            Err(crate::dashboard::service::DashboardServiceError::ConfigurationUnavailable)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -715,6 +746,7 @@ impl AutostartAdapter for PlatformAutostartAdapter {
 impl DaemonState {
     pub fn new(snapshot: DaemonSnapshot, diagnostics: Vec<DiagnosticItem>) -> Self {
         Self {
+            connection_storage: None,
             snapshot,
             diagnostics,
             autostart_adapter: None,
@@ -733,6 +765,7 @@ impl DaemonState {
         diagnostics: Vec<DiagnosticItem>,
     ) -> Self {
         Self {
+            connection_storage: None,
             snapshot,
             diagnostics,
             autostart_adapter: Some(Arc::new(PlatformAutostartAdapter)),
@@ -752,6 +785,7 @@ impl DaemonState {
         autostart_adapter: Arc<dyn AutostartAdapter>,
     ) -> Self {
         Self {
+            connection_storage: None,
             snapshot,
             diagnostics,
             autostart_adapter: Some(autostart_adapter),
@@ -778,6 +812,105 @@ impl DaemonState {
 
     pub fn enable_dashboard(&mut self, service: DashboardService) {
         self.dashboard = Some(service);
+    }
+
+    /// Fixed by daemon startup, never accepted from an IPC client.
+    pub fn configure_connection_storage(
+        &mut self,
+        identity: PathBuf,
+    ) -> Result<(), LocalProtocolError> {
+        if !identity.is_absolute() || self.connection_storage.is_some() {
+            return Err(LocalProtocolError::InvalidFrame);
+        }
+        self.connection_storage = Some(identity);
+        Ok(())
+    }
+
+    fn set_connection(
+        &mut self,
+        configuration: crate::connection_config::ConnectionConfig,
+        now: u64,
+    ) -> Result<LocalResponse, LocalProtocolError> {
+        use crate::connection_config::ConnectionConfig;
+        let identity = self
+            .connection_storage
+            .clone()
+            .ok_or(LocalProtocolError::FeatureUnavailable)?;
+        let mut disk_observation = None;
+        let result = self
+            .dashboard
+            .as_mut()
+            .ok_or(LocalProtocolError::Unauthorized)?
+            .apply_connection_change(
+                &configuration,
+                || {
+                    let before = ConnectionConfig::load(&identity);
+                    let saved = configuration.save(&identity);
+                    let after = ConnectionConfig::load(&identity);
+                    let observation = ConnectionWriteObservation {
+                        before,
+                        saved,
+                        after,
+                    };
+                    let verified = observation.callback_result(&configuration);
+                    disk_observation = Some(observation);
+                    verified
+                },
+                now,
+            );
+        // The daemon mutex serializes writers. A failed atomic replace may have
+        // committed: inspect disk, never claim a rollback that did not happen.
+        if let Some(observation) = disk_observation {
+            self.reconcile_connection_write(&configuration, identity, observation);
+        }
+        result.map_err(map_dashboard_error)?;
+        Ok(LocalResponse::Acknowledged)
+    }
+
+    fn reconcile_connection_write(
+        &mut self,
+        target: &crate::connection_config::ConnectionConfig,
+        identity: PathBuf,
+        observation: ConnectionWriteObservation,
+    ) {
+        let target_observed =
+            observation.after.as_ref().ok().and_then(Option::as_ref) == Some(target);
+        if target_observed && (observation.saved.is_ok() || observation.after != observation.before)
+        {
+            // Independent of the final audit result: activate only the exact
+            // authorized target, never a concurrently substituted configuration.
+            self.enable_remote_execution(RemoteExecutionConfig {
+                registry_address: target.registry_address().into(),
+                registry_peer_id: target.registry_peer_id().into(),
+                identity_path: identity,
+                client_id: self.snapshot.public_identity.clone(),
+            });
+            self.snapshot
+                .warnings
+                .retain(|warning| warning != "connection_configuration_invalid");
+            self.diagnostics
+                .retain(|item| item.code != "connection_configuration_invalid");
+        } else if observation.saved.is_err()
+            && observation.after.is_ok()
+            && observation.after == observation.before
+        {
+            // A pre-replacement failure must retain any transient override.
+        } else {
+            self.invalidate_inventory_generation();
+            self.remote_execution = None;
+            self.remote_execution_boundary = None;
+            self.snapshot.connection = ConnectionState::Degraded;
+            if !self
+                .snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning == "connection_configuration_invalid")
+            {
+                self.snapshot
+                    .warnings
+                    .push("connection_configuration_invalid".into());
+            }
+        }
     }
 
     pub fn enable_remote_execution(&mut self, config: RemoteExecutionConfig) {
@@ -950,6 +1083,7 @@ impl DaemonState {
                 Ok(LocalResponse::Diagnostics(self.diagnostics.clone()))
             }
             LocalRequest::RequestApproval { .. }
+            | LocalRequest::SetConnection { .. }
             | LocalRequest::RequestAuthenticatedApproval { .. }
             | LocalRequest::DecideApproval { .. }
             | LocalRequest::DecidePendingApproval { .. }
@@ -986,6 +1120,9 @@ impl DaemonState {
             .map_err(|_| LocalProtocolError::Io)?
             .as_millis() as u64;
         match request {
+            LocalRequest::SetConnection { configuration, .. } => {
+                self.set_connection(configuration, now_ms)
+            }
             LocalRequest::RequestApproval {
                 access,
                 lifetime_ms,
@@ -1470,6 +1607,82 @@ fn now_ms() -> u64 {
 mod inventory_generation_tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn connection_write_reconciliation_only_activates_the_approved_target() {
+        use crate::connection_config::{ConnectionConfig, ConnectionConfigError};
+        let target = ConnectionConfig::new("127.0.0.1:7444", "registry").unwrap();
+        let foreign = ConnectionConfig::new("127.0.0.1:7445", "foreign").unwrap();
+        let state = state();
+        let mut daemon = state.lock().unwrap();
+        daemon.enable_remote_execution(config());
+        let old_generation = daemon.remote_execution_generation.clone();
+        let verified = ConnectionWriteObservation {
+            before: Ok(Some(target.clone())),
+            saved: Ok(()),
+            after: Ok(Some(target.clone())),
+        };
+        assert!(verified.callback_result(&target).is_ok());
+        // A final audit failure does not erase verified write evidence: disk A
+        // and transient runtime B must converge to the authorized A.
+        daemon.reconcile_connection_write(&target, PathBuf::from("unused"), verified);
+        assert_eq!(
+            daemon.remote_execution.as_ref().unwrap().registry_address,
+            target.registry_address()
+        );
+        assert!(!Arc::ptr_eq(
+            &old_generation,
+            &daemon.remote_execution_generation
+        ));
+        for after in [
+            Ok(Some(foreign.clone())),
+            Err(ConnectionConfigError::Unavailable),
+            Ok(None),
+        ] {
+            let observation = ConnectionWriteObservation {
+                before: Ok(Some(target.clone())),
+                saved: Ok(()),
+                after,
+            };
+            assert!(
+                observation.callback_result(&target).is_err(),
+                "unverified write must audit Failed"
+            );
+            daemon.reconcile_connection_write(&target, PathBuf::from("unused"), observation);
+            assert!(
+                daemon.remote_execution.is_none(),
+                "foreign or unknown configuration activated"
+            );
+            assert_eq!(daemon.snapshot.connection, ConnectionState::Degraded);
+        }
+        daemon.diagnostics.push(DiagnosticItem {
+            code: "connection_configuration_invalid".into(),
+            message: "invalid configuration".into(),
+            healthy: false,
+        });
+        daemon.reconcile_connection_write(
+            &target,
+            PathBuf::from("unused"),
+            ConnectionWriteObservation {
+                before: Err(ConnectionConfigError::InvalidFormat),
+                saved: Ok(()),
+                after: Ok(Some(target.clone())),
+            },
+        );
+        assert!(
+            !daemon
+                .snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning == "connection_configuration_invalid")
+        );
+        assert!(
+            !daemon
+                .diagnostics
+                .iter()
+                .any(|item| item.code == "connection_configuration_invalid")
+        );
+    }
 
     #[test]
     fn connection_settings_reports_only_active_public_connection_data() {
@@ -1996,6 +2209,7 @@ fn map_dashboard_error(
         Error::PermissionDenied => LocalProtocolError::PermissionDenied,
         Error::ApprovalExpired => LocalProtocolError::ApprovalExpired,
         Error::AuditUnavailable => LocalProtocolError::AuditUnavailable,
+        Error::ConfigurationUnavailable => LocalProtocolError::Io,
         Error::CursorAhead => LocalProtocolError::CursorAhead,
         Error::ResyncRequired => LocalProtocolError::ResyncRequired,
         Error::LimitExceeded => LocalProtocolError::LimitExceeded,
@@ -2209,6 +2423,7 @@ fn dispatch_connection(
                     if matches!(
                         request,
                         LocalRequest::RequestApproval { .. }
+                            | LocalRequest::SetConnection { .. }
                             | LocalRequest::RequestAuthenticatedApproval { .. }
                             | LocalRequest::RequestAdminMutationApproval { .. }
                             | LocalRequest::DecideApproval { .. }

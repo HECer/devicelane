@@ -1,6 +1,6 @@
 use device_development_mesh::local_ipc::{
-    LocalEndpoint, LocalProtocolVersion, LocalRequest, LocalResponse, local_endpoint,
-    send_local_request,
+    ConnectionState, LocalEndpoint, LocalProtocolVersion, LocalRequest, LocalResponse,
+    local_endpoint, send_local_request,
 };
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -68,13 +68,15 @@ fn start_service() -> (tempfile::TempDir, String, LocalEndpoint, Service) {
     let service = Service(child);
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if send_local_request(
+        // The unreachable registry moves the daemon from Connecting to
+        // Disconnected after startup. Compare CLI/direct snapshots only once
+        // that initial observation has completed, not across the transition.
+        if matches!(send_local_request(
             &endpoint,
             &LocalRequest::Status {
                 version: LocalProtocolVersion::CURRENT,
             },
-        )
-        .is_ok()
+        ), Ok(LocalResponse::Snapshot(snapshot)) if snapshot.connection == ConnectionState::Disconnected)
         {
             return (root, endpoint_text, endpoint, service);
         }

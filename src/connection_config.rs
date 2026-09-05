@@ -72,6 +72,11 @@ impl ConnectionConfig {
         if !identity.is_absolute() {
             return Err(ConnectionConfigError::InvalidFile);
         }
+        if matches!(fs::symlink_metadata(identity), Err(error) if error.kind() == ErrorKind::NotFound)
+        {
+            crate::dashboard::audit::create_private_dir(identity)
+                .map_err(|_| ConnectionConfigError::Unavailable)?;
+        }
         let directory =
             fs::symlink_metadata(identity).map_err(|_| ConnectionConfigError::Unavailable)?;
         if !directory.is_dir() || !safe_metadata(&directory) {

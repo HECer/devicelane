@@ -329,3 +329,279 @@ fn refuses_linked_or_group_writable_configuration() {
     .unwrap();
     assert!(ConnectionConfig::load(&identity).is_err());
 }
+#[test]
+fn local_connection_update_requires_exact_grant_and_preserves_identity() {
+    use device_development_mesh::dashboard::{ApprovalDecision, service::AdminMutation};
+    use device_development_mesh::local_ipc::{
+        LocalProtocolVersion, LocalRequest, LocalResponse, local_endpoint, send_local_request,
+    };
+    use device_development_mesh::secure_transport::SecureTransport;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+    struct Service(Child);
+    impl Drop for Service {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let identity = root.path().join("workstation");
+    SecureTransport::load_or_create(&identity, "workstation").unwrap();
+    let key = std::fs::read(identity.join("private-key.der")).unwrap();
+    let runtime = root.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    let listen = format!(r"\\.\pipe\devicelane-set-connection-{}", std::process::id());
+    #[cfg(unix)]
+    let listen = runtime
+        .canonicalize()
+        .unwrap()
+        .join("service.sock")
+        .display()
+        .to_string();
+    let endpoint = local_endpoint(&runtime, &listen).unwrap();
+    let _service = Service(
+        Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+            .args([
+                "--identity",
+                identity.to_str().unwrap(),
+                "--runtime-dir",
+                runtime.to_str().unwrap(),
+                "--role",
+                "workstation",
+                "--listen",
+                &listen,
+                "--log-dir",
+                root.path().join("logs").to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let version = LocalProtocolVersion::CURRENT;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while send_local_request(&endpoint, &LocalRequest::Status { version }).is_err() {
+        assert!(Instant::now() < deadline, "service did not start");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Reserve isolated targets: never contact an installed registry during tests.
+    let target_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let configuration = ConnectionConfig::new(
+        &target_listener.local_addr().unwrap().to_string(),
+        "registry",
+    )
+    .unwrap();
+    let update = |config: &ConnectionConfig| {
+        serde_json::from_value::<LocalRequest>(serde_json::json!({
+            "request": "set_connection", "version": version, "configuration": config
+        }))
+        .expect("connection mutation must be available through local IPC")
+    };
+    let denied = send_local_request(&endpoint, &update(&configuration)).unwrap();
+    assert!(
+        matches!(denied, LocalResponse::Error { ref code, .. } if code == "permission_denied"),
+        "{denied:?}"
+    );
+    assert!(!identity.join("connection.json").exists());
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::RequestAdminMutationApproval {
+                version,
+                mutation: AdminMutation::ConnectionSet {
+                    configuration: configuration.clone()
+                },
+                lifetime_ms: 60_000
+            }
+        )
+        .unwrap(),
+        LocalResponse::ApprovalCreated { .. }
+    ));
+    let LocalResponse::PendingApprovals(mut approvals) =
+        send_local_request(&endpoint, &LocalRequest::PendingApprovals { version }).unwrap()
+    else {
+        panic!("missing approval")
+    };
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::DecidePendingApproval {
+                version,
+                approval_id: approvals.remove(0).id,
+                decision: ApprovalDecision::AllowOnce
+            }
+        )
+        .unwrap(),
+        LocalResponse::ApprovalDecided { .. }
+    ));
+    let other = ConnectionConfig::new(
+        &other_listener.local_addr().unwrap().to_string(),
+        "registry",
+    )
+    .unwrap();
+    let denied = send_local_request(&endpoint, &update(&other)).unwrap();
+    assert!(
+        matches!(denied, LocalResponse::Error { ref code, .. } if code == "permission_denied"),
+        "{denied:?}"
+    );
+    let response = send_local_request(&endpoint, &update(&configuration)).unwrap();
+    assert!(
+        matches!(response, LocalResponse::Acknowledged),
+        "{response:?}"
+    );
+    assert_eq!(
+        ConnectionConfig::load(&identity).unwrap(),
+        Some(configuration.clone())
+    );
+    assert!(
+        key == std::fs::read(identity.join("private-key.der")).unwrap(),
+        "identity key changed"
+    );
+    let response =
+        send_local_request(&endpoint, &LocalRequest::ConnectionSettings { version }).unwrap();
+    assert!(
+        matches!(response, LocalResponse::ConnectionSettings { registry_address: Some(ref address), registry_peer_id: Some(ref peer), .. } if address == configuration.registry_address() && peer == "registry"),
+        "{response:?}"
+    );
+    let denied = send_local_request(&endpoint, &update(&configuration)).unwrap();
+    assert!(
+        matches!(denied, LocalResponse::Error { ref code, .. } if code == "permission_denied"),
+        "{denied:?}"
+    );
+    // Force a pre-replacement failure in this service's atomic staging path.
+    let obstacle = identity.join(format!(
+        ".connection.json.devicelane-{}.tmp",
+        _service.0.id()
+    ));
+    std::fs::create_dir(&obstacle).unwrap();
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::RequestAdminMutationApproval {
+                version,
+                mutation: AdminMutation::ConnectionSet {
+                    configuration: other.clone()
+                },
+                lifetime_ms: 60_000
+            }
+        )
+        .unwrap(),
+        LocalResponse::ApprovalCreated { .. }
+    ));
+    let LocalResponse::PendingApprovals(mut approvals) =
+        send_local_request(&endpoint, &LocalRequest::PendingApprovals { version }).unwrap()
+    else {
+        panic!("missing second approval")
+    };
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::DecidePendingApproval {
+                version,
+                approval_id: approvals.remove(0).id,
+                decision: ApprovalDecision::AllowOnce
+            }
+        )
+        .unwrap(),
+        LocalResponse::ApprovalDecided { .. }
+    ));
+    let failed = send_local_request(&endpoint, &update(&other)).unwrap();
+    assert!(matches!(failed, LocalResponse::Error { .. }), "{failed:?}");
+    assert_eq!(
+        ConnectionConfig::load(&identity).unwrap(),
+        Some(configuration.clone())
+    );
+    assert!(obstacle.is_dir(), "unrelated staging obstacle was removed");
+    let response =
+        send_local_request(&endpoint, &LocalRequest::ConnectionSettings { version }).unwrap();
+    assert!(
+        matches!(response, LocalResponse::ConnectionSettings { registry_address: Some(ref address), .. } if address == configuration.registry_address()),
+        "{response:?}"
+    );
+    let replay = send_local_request(&endpoint, &update(&other)).unwrap();
+    assert!(
+        matches!(replay, LocalResponse::Error { ref code, .. } if code == "permission_denied"),
+        "{replay:?}"
+    );
+    std::fs::remove_dir(&obstacle).unwrap(); // Only our empty test obstacle.
+    std::fs::write(identity.join("connection.json"), b"damaged configuration").unwrap();
+    let denied = send_local_request(&endpoint, &update(&other)).unwrap();
+    assert!(matches!(denied, LocalResponse::Error { ref code, .. } if code == "permission_denied"));
+    assert_eq!(
+        std::fs::read(identity.join("connection.json")).unwrap(),
+        b"damaged configuration"
+    );
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::RequestAdminMutationApproval {
+                version,
+                mutation: AdminMutation::ConnectionSet {
+                    configuration: other.clone()
+                },
+                lifetime_ms: 60_000
+            }
+        )
+        .unwrap(),
+        LocalResponse::ApprovalCreated { .. }
+    ));
+    let LocalResponse::PendingApprovals(mut approvals) =
+        send_local_request(&endpoint, &LocalRequest::PendingApprovals { version }).unwrap()
+    else {
+        panic!("missing repair approval")
+    };
+    assert!(matches!(
+        send_local_request(
+            &endpoint,
+            &LocalRequest::DecidePendingApproval {
+                version,
+                approval_id: approvals.remove(0).id,
+                decision: ApprovalDecision::AllowOnce
+            }
+        )
+        .unwrap(),
+        LocalResponse::ApprovalDecided { .. }
+    ));
+    let repaired = send_local_request(&endpoint, &update(&other)).unwrap();
+    assert!(
+        matches!(repaired, LocalResponse::Acknowledged),
+        "{repaired:?}"
+    );
+    assert_eq!(ConnectionConfig::load(&identity).unwrap(), Some(other));
+    assert!(
+        key == std::fs::read(identity.join("private-key.der")).unwrap(),
+        "repair changed identity key"
+    );
+}
+#[test]
+fn first_save_creates_private_settings_storage_without_identity_keys() {
+    let root = tempfile::tempdir().unwrap();
+    let identity = root.path().join("fresh-identity");
+    let configuration = ConnectionConfig::new("127.0.0.1:7443", "registry").unwrap();
+    configuration.save(&identity).unwrap();
+    assert_eq!(
+        ConnectionConfig::load(&identity).unwrap(),
+        Some(configuration)
+    );
+    let names: Vec<_> = std::fs::read_dir(&identity)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("connection.json")]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&identity).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+}

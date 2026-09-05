@@ -75,6 +75,7 @@ impl AdminMutation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DashboardServiceError {
+    ConfigurationUnavailable,
     PermissionDenied,
     ApprovalExpired,
     AuditUnavailable,
@@ -89,6 +90,7 @@ pub enum DashboardServiceError {
 impl DashboardServiceError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::ConfigurationUnavailable => "configuration_unavailable",
             Self::PermissionDenied => "permission_denied",
             Self::ApprovalExpired => "approval_expired",
             Self::AuditUnavailable => "audit_unavailable",

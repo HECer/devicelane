@@ -186,6 +186,9 @@ fn run() -> Result<(), String> {
         )
         .map_err(|error| format!("cannot restore dashboard activities: {}", error.code()))?,
     );
+    daemon_state
+        .configure_connection_storage(args.identity.clone())
+        .map_err(|error| error.to_string())?;
     if let Ok(Some(connection)) = connection {
         daemon_state.enable_remote_execution(RemoteExecutionConfig {
             registry_address: connection.registry_address().into(),

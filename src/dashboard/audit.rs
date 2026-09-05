@@ -1208,14 +1208,14 @@ fn segment_number_from_id(id: &str) -> Option<u64> {
 }
 
 #[cfg(not(windows))]
-fn create_private_dir(path: &Path) -> Result<(), AuditError> {
+pub(crate) fn create_private_dir(path: &Path) -> Result<(), AuditError> {
     if fs::symlink_metadata(path).is_err() {
         fs::create_dir_all(path)?;
     }
     validate_private_dir(path)
 }
 #[cfg(windows)]
-fn create_private_dir(path: &Path) -> Result<(), AuditError> {
+pub(crate) fn create_private_dir(path: &Path) -> Result<(), AuditError> {
     windows_private::create_dir(path)
 }
 
@@ -1335,15 +1335,32 @@ mod windows_private {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        finish_directory_creation(path, create_new_directory(path))
+    }
+
+    fn create_new_directory(path: &Path) -> Result<(), AuditError> {
         let security = Security::current_user()?;
         let wide = wide(path);
         if unsafe { CreateDirectoryW(wide.as_ptr(), &security.attributes) } == 0 {
             let code = unsafe { GetLastError() };
-            if code != ERROR_ALREADY_EXISTS {
-                return Err(io::Error::from_raw_os_error(code as i32).into());
-            }
+            return Err(io::Error::from_raw_os_error(code as i32).into());
         }
         Ok(())
+    }
+
+    fn finish_directory_creation(
+        path: &Path,
+        result: Result<(), AuditError>,
+    ) -> Result<(), AuditError> {
+        match result {
+            Ok(()) => validate(path, true),
+            Err(AuditError::Io(error))
+                if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) =>
+            {
+                tighten_existing_dir(path)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn validate(path: &Path, directory: bool) -> Result<(), AuditError> {
@@ -1623,6 +1640,60 @@ mod windows_private {
     }
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    #[cfg(test)]
+    mod directory_creation_tests {
+        use super::*;
+
+        #[test]
+        fn concurrently_created_directory_is_tightened_before_acceptance() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("identity");
+            assert!(!path.exists());
+            fs::create_dir(&path).unwrap();
+            // Give only this empty, temporary test directory a permissive
+            // DACL, so the test does not depend on the machine's inheritance.
+            let mut name = wide(&path);
+            let status = unsafe {
+                SetNamedSecurityInfoW(
+                    name.as_mut_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, 0);
+            assert!(validate(&path, true).is_err());
+            let result = create_new_directory(&path);
+            assert!(
+                matches!(&result, Err(AuditError::Io(error)) if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32))
+            );
+            finish_directory_creation(&path, result).unwrap();
+            assert!(validate(&path, true).is_ok());
+        }
+
+        #[test]
+        fn concurrently_created_file_is_not_accepted_as_private_directory() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("identity");
+            assert!(!path.exists());
+            // Deterministically insert the competing object after the initial
+            // existence check, before the real Windows creation call.
+            fs::write(&path, b"competing file").unwrap();
+            let result = create_new_directory(&path);
+            assert!(
+                matches!(&result, Err(AuditError::Io(error)) if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32))
+            );
+            assert!(matches!(
+                finish_directory_creation(&path, result),
+                Err(AuditError::InsecureStorage)
+            ));
+            assert_eq!(fs::read(path).unwrap(), b"competing file");
+        }
     }
 }
 
