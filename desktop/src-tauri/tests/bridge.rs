@@ -33,6 +33,47 @@ struct FakeTransport {
 }
 
 #[test]
+fn connection_write_uses_exact_typed_settings_and_requires_acknowledgement() {
+    use device_development_mesh::connection_config::ConnectionConfig;
+    let configuration = ConnectionConfig::new("mac.local:7443", "expected-registry").unwrap();
+    for (response, succeeds) in [
+        (LocalResponse::Acknowledged, true),
+        (
+            LocalResponse::Error {
+                code: "permission_denied".into(),
+                message: "approval required".into(),
+            },
+            false,
+        ),
+        (
+            LocalResponse::ConnectionSettings {
+                registry_address: None,
+                registry_peer_id: None,
+                connection: ConnectionState::Disconnected,
+            },
+            false,
+        ),
+    ] {
+        let requests = Arc::new(Mutex::new(vec![]));
+        let bridge = DesktopBridge::new(FakeTransport {
+            requests: requests.clone(),
+            response,
+        });
+        assert_eq!(
+            bridge.set_connection(configuration.clone()).is_ok(),
+            succeeds
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![LocalRequest::SetConnection {
+                version: LocalProtocolVersion::CURRENT,
+                configuration: configuration.clone(),
+            }]
+        );
+    }
+}
+
+#[test]
 fn connection_settings_uses_the_public_local_contract() {
     let requests = Arc::new(Mutex::new(vec![]));
     let bridge = DesktopBridge::new(FakeTransport {

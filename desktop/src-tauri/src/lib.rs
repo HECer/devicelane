@@ -168,6 +168,16 @@ impl<T: DaemonTransport> DesktopBridge<T> {
         })
     }
 
+    pub fn set_connection(
+        &self,
+        configuration: device_development_mesh::connection_config::ConnectionConfig,
+    ) -> Result<(), String> {
+        self.acknowledge(LocalRequest::SetConnection {
+            version: LocalProtocolVersion::CURRENT,
+            configuration,
+        })
+    }
+
     pub fn resume(&self) -> Result<(), String> {
         self.acknowledge(LocalRequest::ResumeRemoteAccess {
             version: LocalProtocolVersion::CURRENT,
@@ -800,6 +810,22 @@ fn connection_settings(bridge: State<'_, AppBridge>) -> Result<ConnectionSetting
 }
 
 #[tauri::command]
+fn set_connection(
+    bridge: State<'_, AppBridge>,
+    configuration: device_development_mesh::connection_config::ConnectionConfig,
+) -> Result<(), String> {
+    bridge.set_connection(configuration)
+}
+
+#[tauri::command]
+fn request_admin_connection_set(
+    bridge: State<'_, AppBridge>,
+    configuration: device_development_mesh::connection_config::ConnectionConfig,
+) -> Result<(), String> {
+    bridge.request_admin_mutation_approval(AdminMutation::ConnectionSet { configuration })
+}
+
+#[tauri::command]
 fn pause_remote_access(app: AppHandle, bridge: State<'_, AppBridge>) -> Result<(), String> {
     report(&app, bridge.pause())
 }
@@ -1125,6 +1151,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             connection_settings,
+            set_connection,
+            request_admin_connection_set,
             pause_remote_access,
             resume_remote_access,
             set_autostart,

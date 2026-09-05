@@ -2,6 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "degraded";
+export interface ConnectionConfiguration {
+  version: 1;
+  registry_address: string;
+  registry_peer_id: string;
+}
 export interface ConnectionSettings {
   registry_address: string | null;
   registry_peer_id: string | null;
@@ -276,6 +281,7 @@ export type EventRead =
 export interface DaemonClient {
   status(): Promise<DaemonSnapshot>;
   connectionSettings(signal?: AbortSignal): Promise<ConnectionSettings>;
+  setConnection(configuration: ConnectionConfiguration, signal?: AbortSignal): Promise<void>;
   pause(): Promise<void>;
   resume(): Promise<void>;
   setAutostart(enabled: boolean): Promise<void>;
@@ -328,6 +334,10 @@ function previousRevision(revision: U64Decimal) {
 export const tauriDaemonClient: DaemonClient = {
   status: () => invoke<DaemonSnapshot>("daemon_status"),
   connectionSettings: (signal) => invokeWithSignal("connection_settings", {}, signal),
+  setConnection: (configuration, signal) => {
+    const exact = { configuration: { version: configuration.version, registry_address: configuration.registry_address, registry_peer_id: configuration.registry_peer_id } };
+    return invokeAdminMutation("set_connection", exact, "request_admin_connection_set", exact, signal);
+  },
   pause: () => invoke("pause_remote_access"),
   resume: () => invoke("resume_remote_access"),
   setAutostart: (enabled) => invoke("set_autostart", { enabled }),

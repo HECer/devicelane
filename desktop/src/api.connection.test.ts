@@ -29,4 +29,30 @@ describe("connection settings native client", () => {
     await expect(tauriDaemonClient.connectionSettings(controller.signal)).rejects.toThrow();
     expect(invoke).not.toHaveBeenCalled();
   });
+
+  it("requests approval for the exact immutable settings without retrying the write", async () => {
+    let reject!: (reason: Error) => void;
+    vi.mocked(invoke).mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; })).mockResolvedValueOnce(undefined);
+    const configuration = { version: 1 as const, registry_address: "mac.local:7443", registry_peer_id: "registry" };
+    const pending = tauriDaemonClient.setConnection(configuration);
+    configuration.registry_peer_id = "substituted";
+    reject(new Error("permission_denied"));
+    await expect(pending).rejects.toThrow("Administratorfreigabe");
+    const exact = { configuration: { version: 1, registry_address: "mac.local:7443", registry_peer_id: "registry" } };
+    expect(invoke).toHaveBeenNthCalledWith(1, "set_connection", exact);
+    expect(invoke).toHaveBeenNthCalledWith(2, "request_admin_connection_set", exact);
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not request approval after storage failure or cancellation", async () => {
+    const configuration = { version: 1 as const, registry_address: "mac.local:7443", registry_peer_id: "registry" };
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("local IPC I/O failed"));
+    await expect(tauriDaemonClient.setConnection(configuration)).rejects.toThrow("I/O failed");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    vi.mocked(invoke).mockClear();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(tauriDaemonClient.setConnection(configuration, controller.signal)).rejects.toThrow();
+    expect(invoke).not.toHaveBeenCalled();
+  });
 });
