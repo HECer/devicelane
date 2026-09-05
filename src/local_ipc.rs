@@ -508,6 +508,7 @@ pub struct DaemonState {
     dashboard_policy: Option<DashboardPolicyRuntime>,
     dashboard: Option<DashboardService>,
     remote_execution: Option<RemoteExecutionConfig>,
+    remote_execution_generation: Arc<()>,
     remote_execution_boundary: Option<Arc<dyn MeshRpcBoundary>>,
     remote_execution_timeout: Duration,
     inflight_executions: HashMap<ActivityId, Arc<AtomicBool>>,
@@ -672,6 +673,7 @@ impl MeshRpcBoundary for PersistentMeshRpcBoundary {
 
 #[derive(Clone)]
 struct RemoteExecutionJob {
+    generation: Arc<()>,
     config: RemoteExecutionConfig,
     boundary: Arc<dyn MeshRpcBoundary>,
     timeout: Duration,
@@ -708,6 +710,7 @@ impl DaemonState {
             dashboard_policy: None,
             dashboard: None,
             remote_execution: None,
+            remote_execution_generation: Arc::new(()),
             remote_execution_boundary: None,
             remote_execution_timeout: Duration::from_secs(30),
             inflight_executions: HashMap::new(),
@@ -725,6 +728,7 @@ impl DaemonState {
             dashboard_policy: None,
             dashboard: None,
             remote_execution: None,
+            remote_execution_generation: Arc::new(()),
             remote_execution_boundary: None,
             remote_execution_timeout: Duration::from_secs(30),
             inflight_executions: HashMap::new(),
@@ -743,6 +747,7 @@ impl DaemonState {
             dashboard_policy: None,
             dashboard: None,
             remote_execution: None,
+            remote_execution_generation: Arc::new(()),
             remote_execution_boundary: None,
             remote_execution_timeout: Duration::from_secs(30),
             inflight_executions: HashMap::new(),
@@ -765,6 +770,7 @@ impl DaemonState {
     }
 
     pub fn enable_remote_execution(&mut self, config: RemoteExecutionConfig) {
+        self.invalidate_inventory_generation();
         self.remote_execution = Some(config);
         self.remote_execution_boundary = Some(Arc::new(PersistentMeshRpcBoundary::default()));
         self.remote_execution_timeout = Duration::from_secs(30);
@@ -776,9 +782,38 @@ impl DaemonState {
         boundary: Arc<dyn MeshRpcBoundary>,
         timeout: Duration,
     ) {
+        self.invalidate_inventory_generation();
         self.remote_execution = Some(config);
         self.remote_execution_boundary = Some(boundary);
         self.remote_execution_timeout = timeout.max(Duration::from_millis(1));
+    }
+
+    fn invalidate_inventory_generation(&mut self) {
+        // The old token remains alive in each in-flight poll: no overflow or
+        // same-address ABA can make an obsolete result current again.
+        self.remote_execution_generation = Arc::new(());
+        if let Some(dashboard) = self.dashboard.as_mut() {
+            dashboard.disconnect_inventory(now_ms());
+        }
+        self.snapshot.connection = ConnectionState::Connecting;
+    }
+
+    fn observe_job_controller(
+        &mut self,
+        generation: &Arc<()>,
+        peer_id: &str,
+    ) -> Result<(), RemoteExecutionFailure> {
+        if !Arc::ptr_eq(generation, &self.remote_execution_generation) {
+            return Ok(());
+        }
+        self.dashboard
+            .as_mut()
+            .ok_or(RemoteExecutionFailure::AuditUnavailable)?
+            .observe_authenticated_controller(peer_id, now_ms())
+            .map_err(map_dashboard_error)
+            .map_err(map_transition_failure)?;
+        self.snapshot.connection = ConnectionState::Connected;
+        Ok(())
     }
 
     fn prepare_remote_execution(
@@ -837,6 +872,7 @@ impl DaemonState {
         self.inflight_executions
             .insert(activity_id.clone(), Arc::clone(&cancelled));
         Ok(RemoteExecutionJob {
+            generation: Arc::clone(&self.remote_execution_generation),
             config,
             boundary: self
                 .remote_execution_boundary
@@ -1343,47 +1379,62 @@ fn execution_message(code: MessageCode) -> DisplayMessage {
 /// Poll using a separate transport and without holding the local IPC state lock during I/O.
 /// A weak reference lets the worker exit when its daemon state is released.
 pub fn start_registry_inventory_observer(state: &Arc<Mutex<DaemonState>>) {
-    let config = state
-        .lock()
-        .ok()
-        .and_then(|state| state.remote_execution.clone());
-    let Some(config) = config else { return };
     let state = Arc::downgrade(state);
     std::thread::spawn(move || {
         let boundary = PersistentMeshRpcBoundary::default();
-        while state.strong_count() > 0 {
-            let result = boundary.call(&config, &MeshRequest::List);
-            let Some(state) = state.upgrade() else { break };
-            if let Ok(mut state) = state.lock() {
-                let connected = if let Some(dashboard) = state.dashboard.as_mut() {
-                    match result {
-                        Ok(response) if response.accepted => dashboard
-                            .observe_authenticated_inventory(
-                                &config.registry_peer_id,
-                                now_ms(),
-                                response.hosts,
-                            )
-                            .is_ok(),
-                        _ => false,
-                    }
-                } else {
-                    false
-                };
-                if !connected {
-                    if let Some(dashboard) = state.dashboard.as_mut() {
-                        dashboard.disconnect_inventory(now_ms());
-                    }
-                }
-                state.snapshot.connection = if connected {
-                    ConnectionState::Connected
-                } else {
-                    ConnectionState::Disconnected
-                };
-            }
-            drop(state);
+        while poll_registry_inventory(&state, &boundary) {
             std::thread::sleep(Duration::from_secs(1));
         }
     });
+}
+
+fn poll_registry_inventory(
+    weak: &std::sync::Weak<Mutex<DaemonState>>,
+    boundary: &dyn MeshRpcBoundary,
+) -> bool {
+    let (config, generation) = {
+        let Some(state) = weak.upgrade() else {
+            return false;
+        };
+        let Ok(state) = state.lock() else {
+            return false;
+        };
+        let Some(config) = state.remote_execution.clone() else {
+            return true;
+        };
+        (config, Arc::clone(&state.remote_execution_generation))
+    };
+    let result = boundary.call(&config, &MeshRequest::List);
+    let Some(state) = weak.upgrade() else {
+        return false;
+    };
+    let Ok(mut state) = state.lock() else {
+        return false;
+    };
+    if !Arc::ptr_eq(&generation, &state.remote_execution_generation) {
+        return true;
+    }
+    let connected = if let Some(dashboard) = state.dashboard.as_mut() {
+        match result {
+            Ok(response) if response.accepted => dashboard
+                .observe_authenticated_inventory(&config.registry_peer_id, now_ms(), response.hosts)
+                .is_ok(),
+            _ => false,
+        }
+    } else {
+        false
+    };
+    if !connected {
+        if let Some(dashboard) = state.dashboard.as_mut() {
+            dashboard.disconnect_inventory(now_ms());
+        }
+    }
+    state.snapshot.connection = if connected {
+        ConnectionState::Connected
+    } else {
+        ConnectionState::Disconnected
+    };
+    true
 }
 
 fn now_ms() -> u64 {
@@ -1391,6 +1442,108 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod inventory_generation_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn state() -> Arc<Mutex<DaemonState>> {
+        Arc::new(Mutex::new(DaemonState::new(
+            DaemonSnapshot {
+                public_identity: "workstation".into(),
+                daemon_version: "test".into(),
+                os: "windows".into(),
+                architecture: "x86_64".into(),
+                role: DaemonRole::Workstation,
+                endpoint: "test".into(),
+                connection: ConnectionState::Disconnected,
+                local_protocol: LocalProtocolVersion::CURRENT,
+                remote_protocol: "1.0".into(),
+                warnings: vec![],
+                remote_access_paused: false,
+                autostart: false,
+                log_location: String::new(),
+                features: vec![],
+            },
+            vec![],
+        )))
+    }
+
+    fn config() -> RemoteExecutionConfig {
+        RemoteExecutionConfig {
+            registry_address: "127.0.0.1:7443".into(),
+            registry_peer_id: "registry".into(),
+            identity_path: PathBuf::from("unused"),
+            client_id: "workstation".into(),
+        }
+    }
+
+    struct Gate {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+    impl MeshRpcBoundary for Gate {
+        fn call(
+            &self,
+            _: &RemoteExecutionConfig,
+            request: &MeshRequest,
+        ) -> Result<MeshResponse, RemoteExecutionFailure> {
+            assert!(matches!(request, MeshRequest::List));
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            Err(RemoteExecutionFailure::RegistryDisconnected)
+        }
+    }
+
+    #[test]
+    fn obsolete_job_controller_response_does_not_change_new_connection_state() {
+        let state = state();
+        let mut daemon = state.lock().unwrap();
+        daemon.enable_remote_execution(config());
+        let old_generation = Arc::clone(&daemon.remote_execution_generation);
+        daemon.enable_remote_execution(config());
+        daemon
+            .observe_job_controller(&old_generation, "registry")
+            .unwrap();
+        assert_eq!(daemon.snapshot.connection, ConnectionState::Connecting);
+    }
+
+    #[test]
+    fn inventory_tick_sees_late_configuration_and_discards_same_address_old_generation() {
+        let state = state();
+        let weak = Arc::downgrade(&state);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let gate = Gate {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        };
+        // An observer started in local-only mode must remain usable after setup.
+        assert!(poll_registry_inventory(&weak, &gate));
+        assert!(entered_rx.try_recv().is_err());
+        state.lock().unwrap().enable_remote_execution(config());
+        let worker = std::thread::spawn(move || poll_registry_inventory(&weak, &gate));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Even reconnecting the same address is a new generation, not equality
+        // of strings. Acquiring this lock also proves no lock spans network I/O.
+        state.lock().unwrap().enable_remote_execution(config());
+        assert_eq!(
+            state.lock().unwrap().snapshot.connection,
+            ConnectionState::Connecting
+        );
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap());
+        assert_eq!(
+            state.lock().unwrap().snapshot.connection,
+            ConnectionState::Connecting
+        );
+    }
 }
 
 fn open_mesh_session(
@@ -1599,14 +1752,7 @@ fn execute_remote_job(
         let mut daemon = state
             .lock()
             .map_err(|_| RemoteExecutionFailure::AuditUnavailable)?;
-        daemon
-            .dashboard
-            .as_mut()
-            .ok_or(RemoteExecutionFailure::AuditUnavailable)?
-            .observe_authenticated_controller(&job.config.registry_peer_id, now_ms())
-            .map_err(map_dashboard_error)
-            .map_err(map_transition_failure)?;
-        daemon.snapshot.connection = ConnectionState::Connected;
+        daemon.observe_job_controller(&job.generation, &job.config.registry_peer_id)?;
     }
     let accepted = job.boundary.call(
         &job.config,
