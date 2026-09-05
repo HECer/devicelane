@@ -508,6 +508,9 @@ fn start_apple_job(
                         Err(RpcError::InvalidAddress) => Err(LeaseValidationError::InvalidAddress),
                         Err(RpcError::Tls) => Err(LeaseValidationError::Tls),
                         Err(RpcError::Io) => Err(LeaseValidationError::Io),
+                        Err(RpcError::ResponseTimeout) => {
+                            Err(LeaseValidationError::ResponseTimeout)
+                        }
                         Err(RpcError::Protocol) => Err(LeaseValidationError::Protocol),
                     },
                     Duration::from_millis(850),
@@ -721,6 +724,7 @@ enum RpcError {
     ConnectUnavailable,
     Tls,
     Io,
+    ResponseTimeout,
     Protocol,
 }
 
@@ -730,6 +734,7 @@ enum LeaseValidationError {
     InvalidAddress,
     Tls,
     Io,
+    ResponseTimeout,
     Protocol,
     ServerDenied(String),
 }
@@ -741,6 +746,7 @@ impl LeaseValidationError {
             Self::InvalidAddress => "lease_validation_address_invalid",
             Self::Tls => "lease_validation_tls_failed",
             Self::Io => "lease_validation_io_failed",
+            Self::ResponseTimeout => "lease_validation_response_timeout",
             Self::Protocol => "lease_validation_protocol_failed",
             Self::ServerDenied(error) if error == "lease_inactive" => "lease_inactive",
             Self::ServerDenied(error) if error == "lease_validation_access_denied" => {
@@ -808,7 +814,12 @@ fn rpc(
     let mut line = String::new();
     BufReader::new(stream)
         .read_line(&mut line)
-        .map_err(|_| RpcError::Io)?;
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                RpcError::ResponseTimeout
+            }
+            _ => RpcError::Io,
+        })?;
     serde_json::from_str(&line).map_err(|_| RpcError::Protocol)
 }
 
@@ -1216,6 +1227,7 @@ mod tests {
             LeaseValidationError::InvalidAddress,
             LeaseValidationError::Tls,
             LeaseValidationError::Io,
+            LeaseValidationError::ResponseTimeout,
             LeaseValidationError::Protocol,
             LeaseValidationError::ServerDenied("lease_inactive".into()),
             LeaseValidationError::ServerDenied("lease_validation_unavailable".into()),
@@ -1233,6 +1245,46 @@ mod tests {
             );
             assert_eq!(attempts, 1);
         }
+    }
+
+    #[test]
+    fn registry_rpc_distinguishes_an_authenticated_response_timeout() {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry =
+            SecureTransport::load_or_create(root.path().join("registry"), "registry").unwrap();
+        let mut agent =
+            SecureTransport::load_or_create(root.path().join("agent"), "agent").unwrap();
+        registry.trust("agent", agent.certificate_der()).unwrap();
+        agent.trust("registry", registry.certificate_der()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let peer = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut stream = registry.accept_tls(socket).unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream).read_line(&mut request).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).unwrap(),
+                Request::List
+            ));
+            // Keep the authenticated peer open until the client has timed out.
+            let _ = wait.recv_timeout(Duration::from_secs(3));
+        });
+        let result = rpc(&address, &agent, &Request::List);
+        let _ = release.send(());
+        peer.join().unwrap();
+        assert_eq!(result.err(), Some(RpcError::ResponseTimeout));
+        assert_eq!(
+            LeaseValidationError::ResponseTimeout.code(),
+            "lease_validation_response_timeout"
+        );
     }
 
     #[test]
