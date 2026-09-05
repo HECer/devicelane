@@ -104,6 +104,26 @@ function fakeClient(overrides: Partial<DaemonClient> = {}): DaemonClient {
 
 describe("DeviceLane desktop foundation", () => {
   afterEach(() => vi.useRealTimers());
+  it("shows effective mesh connection details in service settings", async () => {
+    const client = fakeClient({ connectionSettings: vi.fn().mockResolvedValue({
+      registry_address: "mac-registry.local:7443", registry_peer_id: "registry", connection: "connecting"
+    }) });
+    render(<App client={client} />);
+    expect(await screen.findByText("mac-registry.local:7443")).toBeVisible();
+    expect(screen.getByText("Erwartete Gegenstelle")).toBeVisible();
+    expect(screen.getByText("registry", { exact: true })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Verbindung aktualisieren" })).toBeEnabled();
+  });
+
+  it("distinguishes local-only configuration from a failed settings query", async () => {
+    const client = fakeClient();
+    const view = render(<App client={client} />);
+    expect(await screen.findByText("Keine Registry konfiguriert")).toBeVisible();
+    view.unmount();
+    render(<App client={fakeClient({ connectionSettings: vi.fn().mockRejectedValue(new Error("feature_unavailable")) })} />);
+    expect(await screen.findByText("Verbindungsdaten nicht verfügbar. Bitte Dienstversion und Verbindung prüfen.")).toBeVisible();
+    expect(screen.queryByText("Keine Registry konfiguriert")).not.toBeInTheDocument();
+  });
   it("shows daemon, host, role, warning, autostart and remote access state", async () => {
     render(<App client={fakeClient()} />);
 
@@ -180,6 +200,8 @@ describe("DeviceLane desktop foundation", () => {
     expect(screen.getByRole("tab", { name: "Dieser Computer" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("button", { name: /Hermanns MacBook Pro/ })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Verbindung aktualisieren" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("button", { name: "Remotezugriff pausieren" })).toHaveFocus();
     await user.tab();

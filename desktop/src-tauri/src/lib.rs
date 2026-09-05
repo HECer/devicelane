@@ -795,11 +795,8 @@ fn daemon_status(app: AppHandle, bridge: State<'_, AppBridge>) -> Result<DaemonS
 }
 
 #[tauri::command]
-fn connection_settings(
-    app: AppHandle,
-    bridge: State<'_, AppBridge>,
-) -> Result<ConnectionSettings, String> {
-    report(&app, bridge.connection_settings())
+fn connection_settings(bridge: State<'_, AppBridge>) -> Result<ConnectionSettings, String> {
+    bridge.connection_settings()
 }
 
 #[tauri::command]

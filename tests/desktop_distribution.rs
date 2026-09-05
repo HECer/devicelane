@@ -491,3 +491,24 @@ fn xattrs_are_root_relative_and_dpkg_is_hosted_and_non_destructive() {
     assert!(smoke.contains("GITHUB_ACTIONS"));
     assert!(smoke.contains("refusing dpkg smoke because package is already installed"));
 }
+#[test]
+fn background_connection_query_has_no_native_notification_capability() {
+    let source = include_str!("../desktop/src-tauri/src/lib.rs");
+    let command = source
+        .split("\nfn connection_settings(")
+        .nth(1)
+        .expect("registered connection query")
+        .split("\n#[tauri::command]")
+        .next()
+        .unwrap();
+    assert!(command.contains("bridge.connection_settings()"));
+    assert!(
+        !command.contains("AppHandle"),
+        "background query must not acquire notification capability"
+    );
+    assert!(
+        !command.contains("report("),
+        "poll failures must remain inline, not emit OS notifications"
+    );
+    assert!(!command.contains("notify"));
+}

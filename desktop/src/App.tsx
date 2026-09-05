@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ActivityEvent, ApprovalRequest, DaemonClient, DaemonSnapshot, DashboardScope, DashboardSnapshot, EventCursor, PolicyRule } from "./api";
 import { tauriDaemonClient } from "./api";
 import { ActivityFeed } from "./components/ActivityFeed";
+import { ConnectionSettingsCard } from "./components/ConnectionSettingsCard";
 import { ApprovalPanel } from "./components/ApprovalPanel";
 import { AuditHistory } from "./components/AuditHistory";
 import { PolicyRules } from "./components/PolicyRules";
@@ -359,6 +360,7 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
         </section>}
 
         <section className="control-grid" aria-label="Diensteinstellungen">
+          <ConnectionSettingsCard client={client} />
           <article className="control-card">
             <div><h2>Remotezugriff</h2><p data-pretext>{snapshot.remote_access_paused ? "Neue Zugriffe sind pausiert." : "Autorisierte Geräte können Ressourcen anfragen."}</p></div>
             <button onClick={() => void run(toggleRemoteAccess)} disabled={busy}>
