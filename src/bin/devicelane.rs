@@ -265,8 +265,21 @@ fn rule(p: &P) -> Result<PolicyRule, String> {
     Ok(x)
 }
 
+fn connection_configuration(
+    p: &P,
+) -> Result<device_development_mesh::connection_config::ConnectionConfig, String> {
+    device_development_mesh::connection_config::ConnectionConfig::new(
+        req(p, "--registry")?,
+        req(p, "--registry-peer")?,
+    )
+    .map_err(|_| "invalid --registry or --registry-peer".into())
+}
+
 fn admin_mutation(p: &P) -> Result<AdminMutation, String> {
     match req(p, "--admin-mutation")? {
+        "connection_set" => Ok(AdminMutation::ConnectionSet {
+            configuration: connection_configuration(p)?,
+        }),
         "policy_put" => {
             let rule = rule(p)?;
             Ok(AdminMutation::PolicyPut {
@@ -284,6 +297,13 @@ fn admin_mutation(p: &P) -> Result<AdminMutation, String> {
 
 fn reject_foreign_flags(p: &P, command: &[&str]) -> Result<(), String> {
     let allowed: &[&str] = match command {
+        ["connection", "set"] => &["--registry", "--registry-peer"],
+        ["approvals", "request"] if one(p, "--admin-mutation")? == Some("connection_set") => &[
+            "--admin-mutation",
+            "--lifetime-ms",
+            "--registry",
+            "--registry-peer",
+        ],
         ["mesh", _] => &["--scope"],
         ["activities", "list" | "watch"] => &["--cursor", "--limit"],
         ["activities", "cancel"] => &["--activity-id"],
@@ -386,7 +406,7 @@ fn parse() -> Result<Option<Args>, String> {
     let v: Vec<_> = std::env::args().skip(1).collect();
     if v.iter().any(|x| x == "--help" || x == "-h") {
         println!(
-            "{HELP}\n\nConnection:\n  devicelane connection status --local [--json] [--endpoint ENDPOINT]\n  Shows effective runtime settings, including transient overrides.\n\n{ADMIN_HELP}\n\nAll commands use authenticated local IPC and require --local. No raw JSON or shell input is accepted."
+            "{HELP}\n\nConnection:\n  devicelane connection status --local [--json] [--endpoint ENDPOINT]\n  Shows effective runtime settings, including transient overrides.\n  devicelane connection set --local --registry ADDRESS --registry-peer PEER\n  Saves the connection and selects it now; this does not pair or trust a peer.\n  First: approvals request --local --admin-mutation connection_set --registry ADDRESS --registry-peer PEER\n  Then: approvals list --local; approvals decide --local --approval-id ID --decision allow_once\n  Finally: connection set with the same exact address and peer before expiry.\n\n{ADMIN_HELP}\n\nAll commands use authenticated local IPC and require --local. No raw JSON or shell input is accepted."
         );
         return Ok(None);
     }
@@ -410,6 +430,14 @@ fn parse() -> Result<Option<Args>, String> {
         ["connection", "status"] => (
             LocalRequest::ConnectionSettings { version: z },
             "connection settings received",
+            Watch::No,
+        ),
+        ["connection", "set"] => (
+            LocalRequest::SetConnection {
+                version: z,
+                configuration: connection_configuration(&p)?,
+            },
+            "connection settings saved; peer trust is unchanged",
             Watch::No,
         ),
         ["diagnostics"] => (
