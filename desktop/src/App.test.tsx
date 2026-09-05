@@ -204,6 +204,8 @@ describe("DeviceLane desktop foundation", () => {
     await user.tab();
     expect(screen.getByRole("button", { name: "Verbindung aktualisieren" })).toHaveFocus();
     await user.tab();
+    expect(screen.getByRole("button", { name: "Verbindung bearbeiten" })).toHaveFocus();
+    await user.tab();
     expect(screen.getByRole("button", { name: "Remotezugriff pausieren" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("switch", { name: "Beim Anmelden starten" })).toHaveFocus();
