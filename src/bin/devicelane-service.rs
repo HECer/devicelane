@@ -13,6 +13,7 @@ use device_development_mesh::local_ipc::{
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Default)]
 struct Args {
@@ -139,10 +140,30 @@ fn run() -> Result<(), String> {
         Redactor::default(),
     )
     .map_err(|error| format!("cannot open dashboard audit: {error}"))?;
+    let mut topology = TopologyProjector::new();
+    let observed_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock predates Unix epoch".to_owned())?
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    topology
+        .observe_local(
+            1,
+            observed_at_ms,
+            device_development_mesh::network_processes::HostSnapshot {
+                id: public_identity.clone(),
+                operating_system: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+                status: "online".into(),
+                capabilities: Vec::new(),
+                devices: Vec::new(),
+            },
+        )
+        .map_err(|error| format!("cannot initialize local host: {error}"))?;
     daemon_state.enable_dashboard(
         DashboardService::new_persistent(
             local_host_id,
-            TopologyProjector::new(),
+            topology,
             EventJournal::new(1, 0),
             Arc::new(Mutex::new(audit)),
             policy_engine,

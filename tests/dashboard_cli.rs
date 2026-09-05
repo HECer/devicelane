@@ -484,10 +484,28 @@ fn real_daemon_queries_match_direct_ipc_and_exact_grant_enables_mutation() {
         &["mesh", "status", "--local", "--json", "--scope", "local"],
     );
     assert!(mesh.status.success());
-    assert!(matches!(
-        serde_json::from_slice::<LocalResponse>(&mesh.stdout).unwrap(),
-        LocalResponse::DashboardSnapshot(_)
-    ));
+    let LocalResponse::DashboardSnapshot(snapshot) =
+        serde_json::from_slice::<LocalResponse>(&mesh.stdout).unwrap()
+    else {
+        panic!("mesh status did not return a dashboard snapshot");
+    };
+    assert_eq!(
+        snapshot.hosts.len(),
+        1,
+        "the local host must exist without a reachable registry"
+    );
+    let host = &snapshot.hosts[0];
+    assert_eq!(host.id.as_str(), "identity.json");
+    assert_eq!(host.platform.as_str(), std::env::consts::OS);
+    assert_eq!(host.architecture.as_str(), std::env::consts::ARCH);
+    assert_eq!(
+        host.trust,
+        device_development_mesh::dashboard::TrustState::Local
+    );
+    assert_eq!(
+        host.connection_path,
+        device_development_mesh::dashboard::ConnectionPath::Local
+    );
 
     let mut mesh_watch = Command::new(env!("CARGO_BIN_EXE_devicelane"))
         .args([
