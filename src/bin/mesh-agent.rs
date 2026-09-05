@@ -647,31 +647,39 @@ fn start_apple_job(
                     &artifact_bytes,
                 )
             })
-            .flatten()
-            .unwrap_or_default();
-        let terminal_payload = if cancellation.is_cancelled() {
-            "cancelled"
-        } else if succeeded {
-            artifact_id.as_str()
-        } else {
-            rejection_code.as_deref().unwrap_or("tool_failed")
-        };
-        events.push(network_event(
+            .flatten();
+        events.push(job_terminal_event(
             events.len() as u64 + 2,
-            if cancellation.is_cancelled() {
-                "cancelled"
-            } else if succeeded {
-                "completed"
-            } else {
-                "rejected"
-            },
-            terminal_payload,
+            cancellation.is_cancelled(),
+            succeeded,
+            artifact_id.as_deref(),
+            rejection_code.as_deref(),
         ));
         while !send_apple_progress(&registry, &transport, &job_id, events.clone(), true) {
             thread::sleep(Duration::from_millis(100));
         }
         running.lock().unwrap().remove(&job_id);
     });
+}
+
+fn job_terminal_event(
+    sequence: u64,
+    cancelled: bool,
+    tool_succeeded: bool,
+    artifact_id: Option<&str>,
+    rejection_code: Option<&str>,
+) -> device_development_mesh::network_processes::NetworkEvent {
+    let (kind, payload) = if cancelled {
+        ("cancelled", "cancelled")
+    } else if tool_succeeded {
+        match artifact_id.filter(|id| !id.is_empty()) {
+            Some(id) => ("completed", id),
+            None => ("rejected", "artifact_publish_failed"),
+        }
+    } else {
+        ("rejected", rejection_code.unwrap_or("tool_failed"))
+    };
+    network_event(sequence, kind, payload)
 }
 
 fn validate_lease_grant(
@@ -1001,6 +1009,25 @@ fn metadata(a: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_tool_without_published_artifact_cannot_report_completion() {
+        for artifact in [None, Some("")] {
+            let event = job_terminal_event(7, false, true, artifact, None);
+            assert_eq!(event.sequence, 7);
+            assert_eq!(event.kind, "rejected");
+            assert_eq!(event.payload, "artifact_publish_failed");
+        }
+        let completed = job_terminal_event(8, false, true, Some("artifact-1"), None);
+        assert_eq!(completed.kind, "completed");
+        assert_eq!(completed.payload, "artifact-1");
+        let cancelled = job_terminal_event(9, true, true, None, None);
+        assert_eq!(cancelled.kind, "cancelled");
+        assert_eq!(cancelled.payload, "cancelled");
+        let rejected = job_terminal_event(10, false, false, None, Some("lease_inactive"));
+        assert_eq!(rejected.kind, "rejected");
+        assert_eq!(rejected.payload, "lease_inactive");
+    }
 
     #[test]
     fn progress_ack_requires_an_accepted_registry_response() {
