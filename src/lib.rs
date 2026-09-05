@@ -1385,8 +1385,7 @@ pub mod secure_transport {
                 .with_root_certificates(self.roots()?)
                 .with_client_auth_cert(self.cert_chain(), self.key()?)
                 .map_err(|_| TransportError::InvalidCertificate)?;
-            let name = ServerName::try_from(server_name.to_owned())
-                .map_err(|_| TransportError::InvalidCertificate)?;
+            let name = peer_server_name(server_name)?;
             let mut connection =
                 ClientConnection::new(Arc::new(config), name).map_err(|_| TransportError::Tls)?;
             connection.complete_io(&mut stream).map_err(|_| {
@@ -1547,6 +1546,17 @@ pub mod secure_transport {
             Ok(())
         } else {
             Err(TransportError::Io)
+        }
+    }
+
+    /// Peer certificates identify machines with DNS SANs, not IP SANs.
+    pub fn peer_server_name(id: &str) -> Result<ServerName<'static>, TransportError> {
+        if !valid_machine_id(id) {
+            return Err(TransportError::InvalidCertificate);
+        }
+        match ServerName::try_from(id.to_owned()) {
+            Ok(name @ ServerName::DnsName(_)) => Ok(name),
+            _ => Err(TransportError::InvalidCertificate),
         }
     }
 
@@ -6548,6 +6558,7 @@ mod tests {
         assert_eq!(env!("CARGO_PKG_NAME"), "devicelane");
     }
 }
+pub mod connection_config;
 pub mod dashboard;
 pub mod local_ipc;
 pub mod mac_bootstrap;

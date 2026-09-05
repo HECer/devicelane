@@ -240,7 +240,7 @@ fn actual_service_observes_registry_inventory_and_recovers_after_disconnect() {
         .display()
         .to_string();
     let endpoint = local_endpoint(&runtime, &listen).unwrap();
-    let _service = spawn(
+    let mut service = spawn(
         env!("CARGO_BIN_EXE_devicelane-service"),
         &[
             "--identity",
@@ -324,6 +324,37 @@ fn actual_service_observes_registry_inventory_and_recovers_after_disconnect() {
         }
     };
     wait_for(true);
+    // An installed service has no transient --registry argument after repair
+    // or logon. Its previously selected, paired connection must survive that.
+    service.0.kill().unwrap();
+    service.0.wait().unwrap();
+    std::fs::write(
+        client_path.join("connection.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "registry_address": address,
+            "registry_peer_id": "registry"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    service = spawn(
+        env!("CARGO_BIN_EXE_devicelane-service"),
+        &[
+            "--identity",
+            client_path.to_str().unwrap(),
+            "--runtime-dir",
+            runtime.to_str().unwrap(),
+            "--role",
+            "workstation",
+            "--listen",
+            &listen,
+            "--log-dir",
+            logs.to_str().unwrap(),
+        ],
+    );
+    wait_for(true);
+    assert!(service.0.try_wait().unwrap().is_none());
     let LocalResponse::DashboardSnapshot(local) = send_local_request(
         &endpoint,
         &LocalRequest::DashboardSnapshot {

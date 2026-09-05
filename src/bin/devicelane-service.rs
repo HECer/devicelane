@@ -1,3 +1,4 @@
+use device_development_mesh::connection_config::ConnectionConfig;
 use device_development_mesh::dashboard::audit::{AuditStore, Redactor, RetentionPolicy};
 use device_development_mesh::dashboard::event_log::EventJournal;
 use device_development_mesh::dashboard::managed_policy::{
@@ -93,6 +94,25 @@ fn run() -> Result<(), String> {
         .to_owned();
     let local_host_id =
         HostId::parse(public_identity.clone()).map_err(|error| error.to_string())?;
+    let connection = if args.registry.is_empty() {
+        ConnectionConfig::load(&args.identity)
+    } else {
+        ConnectionConfig::new(&args.registry, "registry").map(Some)
+    };
+    let mut diagnostics = vec![DiagnosticItem {
+        code: "ready".into(),
+        message: "local daemon is ready".into(),
+        healthy: true,
+    }];
+    let mut warnings = Vec::new();
+    if connection.is_err() {
+        warnings.push("connection_configuration_invalid".into());
+        diagnostics.push(DiagnosticItem {
+            code: "connection_configuration_invalid".into(),
+            message: "Mesh connection settings could not be loaded. Local service remains available; repair connection settings.".into(),
+            healthy: false,
+        });
+    }
     let mut daemon_state = DaemonState::new_with_platform_lifecycle(
         DaemonSnapshot {
             public_identity: public_identity.clone(),
@@ -104,7 +124,7 @@ fn run() -> Result<(), String> {
             connection: ConnectionState::Disconnected,
             local_protocol: LocalProtocolVersion::CURRENT,
             remote_protocol: "1.0".into(),
-            warnings: Vec::new(),
+            warnings,
             remote_access_paused: false,
             autostart: platform_autostart_enabled(),
             log_location: args.log_dir.display().to_string(),
@@ -115,11 +135,7 @@ fn run() -> Result<(), String> {
                 "audit_query_export".into(),
             ],
         },
-        vec![DiagnosticItem {
-            code: "ready".into(),
-            message: "local daemon is ready".into(),
-            healthy: true,
-        }],
+        diagnostics,
     );
     let mut policy_engine = PolicyEngine::new();
     if let (Some(policy_path), Some(trust_path)) = (
@@ -170,10 +186,10 @@ fn run() -> Result<(), String> {
         )
         .map_err(|error| format!("cannot restore dashboard activities: {}", error.code()))?,
     );
-    if !args.registry.is_empty() {
+    if let Ok(Some(connection)) = connection {
         daemon_state.enable_remote_execution(RemoteExecutionConfig {
-            registry_address: args.registry,
-            registry_peer_id: "registry".into(),
+            registry_address: connection.registry_address().into(),
+            registry_peer_id: connection.registry_peer_id().into(),
             identity_path: args.identity,
             client_id: public_identity,
         });
