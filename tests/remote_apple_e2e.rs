@@ -341,6 +341,20 @@ fn dashboard_job_preserves_live_inventory_during_real_mesh_execution() {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut gate_entered = None;
     let mut released = false;
+    let event_diagnostics = || {
+        send_local_request(
+            &endpoint,
+            &LocalRequest::ActivityEvents {
+                version: LocalProtocolVersion::CURRENT,
+                scope: DashboardScope::Mesh,
+                cursor: device_development_mesh::dashboard::EventCursor {
+                    epoch: 1,
+                    sequence: 0,
+                },
+                limit: 128,
+            },
+        )
+    };
     loop {
         let LocalResponse::DashboardSnapshot(current) = snapshot().unwrap() else {
             panic!("snapshot missing")
@@ -391,13 +405,18 @@ fn dashboard_job_preserves_live_inventory_during_real_mesh_execution() {
                 state,
                 ActivityState::Failed | ActivityState::Denied | ActivityState::Cancelled
             ),
-            "remote job failed: {:?}",
-            current.activities
+            "remote job failed: {:?}; events={:?}; tools={}",
+            current.activities,
+            event_diagnostics(),
+            std::fs::read_to_string(&marker).unwrap_or_default()
         );
         assert!(
             Instant::now() < deadline,
-            "remote job did not terminate: activities={:?}; tools={}",
+            "remote job did not terminate: activities={:?}; events={:?}; gate={:?}; released={released}; revision={}; tools={}",
             current.activities,
+            event_diagnostics(),
+            gate_entered,
+            current.revision,
             std::fs::read_to_string(&marker).unwrap_or_default()
         );
         thread::sleep(Duration::from_millis(10));
