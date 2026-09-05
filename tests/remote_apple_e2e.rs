@@ -932,15 +932,11 @@ fn spawn(path: &str, args: &[&str]) -> ChildGuard {
 }
 
 fn spawn_command(command: &mut Command) -> ChildGuard {
-    ChildGuard(
-        command
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .group()
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap(),
-    )
+    command.stdout(Stdio::null()).stderr(Stdio::inherit());
+    let mut group = command.group();
+    #[cfg(windows)]
+    group.kill_on_drop(true);
+    ChildGuard(group.spawn().unwrap())
 }
 
 struct ChildGuard(GroupChild);
