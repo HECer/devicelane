@@ -104,6 +104,30 @@ fn unified_cli_round_trips_typed_local_requests() {
         direct_status
     );
 
+    let connection = run_cli(
+        &endpoint_text,
+        &["connection", "status", "--local", "--json"],
+    );
+    assert!(
+        connection.status.success(),
+        "{}",
+        String::from_utf8_lossy(&connection.stderr)
+    );
+    let public: serde_json::Value = serde_json::from_slice(&connection.stdout).unwrap();
+    assert_eq!(public["type"], "connection_settings");
+    assert_eq!(
+        public["payload"]["registry_address"],
+        "registry.example:443"
+    );
+    assert_eq!(public["payload"]["registry_peer_id"], "registry");
+    assert_eq!(public["payload"].as_object().unwrap().len(), 3);
+    let human = run_cli(&endpoint_text, &["connection", "status", "--local"]);
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("registry.example:443"));
+    assert!(human.contains("Expected peer: registry"));
+    assert!(human.contains("Connection:"));
+
     let pause = run_cli(&endpoint_text, &["remote-access", "pause", "--local"]);
     assert!(
         pause.status.success(),
@@ -168,14 +192,19 @@ fn json_protocol_errors_are_structured_and_fail_the_process() {
     let endpoint = format!(r"\\.\pipe\devicelane-missing-{}", std::process::id());
     #[cfg(unix)]
     let endpoint = "/definitely/missing/devicelane.sock".to_owned();
-    let output = run_cli(&endpoint, &["status", "--local", "--json"]);
-    assert!(!output.status.success());
-    let response: LocalResponse = serde_json::from_slice(&output.stdout).unwrap();
-    let LocalResponse::Error { code, message } = response else {
-        panic!("expected structured daemon error")
-    };
-    assert_eq!(code, "local_ipc_error");
-    assert!(!message.is_empty());
+    for args in [
+        &["status", "--local", "--json"][..],
+        &["connection", "status", "--local", "--json"][..],
+    ] {
+        let output = run_cli(&endpoint, args);
+        assert!(!output.status.success());
+        let response: LocalResponse = serde_json::from_slice(&output.stdout).unwrap();
+        let LocalResponse::Error { code, message } = response else {
+            panic!("expected structured daemon error")
+        };
+        assert_eq!(code, "local_ipc_error");
+        assert!(!message.is_empty());
+    }
 }
 
 #[test]
@@ -186,6 +215,7 @@ fn subcommand_help_succeeds_and_endpoint_does_not_consume_another_flag() {
         .unwrap();
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("devicelane status"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("devicelane connection status --local"));
 
     let missing = Command::new(env!("CARGO_BIN_EXE_devicelane"))
         .args(["status", "--local", "--endpoint", "--json"])

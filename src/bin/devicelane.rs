@@ -290,6 +290,7 @@ fn reject_foreign_flags(p: &P, command: &[&str]) -> Result<(), String> {
         ["approvals", "list"]
         | ["policy", "list"]
         | ["status"]
+        | ["connection", "status"]
         | ["diagnostics"]
         | ["remote-access", _] => &[],
         ["approvals", "request"] => &[
@@ -385,7 +386,7 @@ fn parse() -> Result<Option<Args>, String> {
     let v: Vec<_> = std::env::args().skip(1).collect();
     if v.iter().any(|x| x == "--help" || x == "-h") {
         println!(
-            "{HELP}\n\n{ADMIN_HELP}\n\nAll commands use authenticated local IPC and require --local. No raw JSON or shell input is accepted."
+            "{HELP}\n\nConnection:\n  devicelane connection status --local [--json] [--endpoint ENDPOINT]\n  Shows effective runtime settings, including transient overrides.\n\n{ADMIN_HELP}\n\nAll commands use authenticated local IPC and require --local. No raw JSON or shell input is accepted."
         );
         return Ok(None);
     }
@@ -404,6 +405,11 @@ fn parse() -> Result<Option<Args>, String> {
         ["status"] => (
             LocalRequest::Status { version: z },
             "status received",
+            Watch::No,
+        ),
+        ["connection", "status"] => (
+            LocalRequest::ConnectionSettings { version: z },
+            "connection settings received",
             Watch::No,
         ),
         ["diagnostics"] => (
@@ -616,6 +622,15 @@ fn json(x: &impl serde::Serialize) -> io::Result<()> {
 }
 fn human(r: &LocalResponse, m: &str) -> Result<String, String> {
     match r {
+        LocalResponse::ConnectionSettings {
+            registry_address,
+            registry_peer_id,
+            connection,
+        } => Ok(format!(
+            "Registry: {}\nExpected peer: {}\nConnection: {connection:?}",
+            registry_address.as_deref().unwrap_or("not configured"),
+            registry_peer_id.as_deref().unwrap_or("not configured"),
+        )),
         LocalResponse::Snapshot(s) => Ok(format!(
             "{} - role {:?}, connection {:?}, remote access {}",
             s.public_identity,
