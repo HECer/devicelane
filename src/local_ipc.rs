@@ -83,6 +83,9 @@ pub enum LocalRequest {
     Status {
         version: LocalProtocolVersion,
     },
+    ConnectionSettings {
+        version: LocalProtocolVersion,
+    },
     PauseRemoteAccess {
         version: LocalProtocolVersion,
     },
@@ -201,6 +204,7 @@ impl LocalRequest {
     pub fn version(&self) -> LocalProtocolVersion {
         match *self {
             Self::Status { version }
+            | Self::ConnectionSettings { version }
             | Self::PauseRemoteAccess { version }
             | Self::ResumeRemoteAccess { version }
             | Self::SetAutostart { version, .. }
@@ -263,6 +267,13 @@ impl LocalRequest {
 )]
 pub enum LocalResponse {
     Snapshot(DaemonSnapshot),
+    /// Effective runtime configuration, including transient CLI overrides.
+    /// Never exposes credential storage paths or private identity material.
+    ConnectionSettings {
+        registry_address: Option<String>,
+        registry_peer_id: Option<String>,
+        connection: ConnectionState,
+    },
     Acknowledged,
     Diagnostics(Vec<DiagnosticItem>),
     ApprovalCreated {
@@ -902,6 +913,17 @@ impl DaemonState {
         request.validate()?;
         match request {
             LocalRequest::Status { .. } => Ok(LocalResponse::Snapshot(self.snapshot.clone())),
+            LocalRequest::ConnectionSettings { .. } => Ok(LocalResponse::ConnectionSettings {
+                registry_address: self
+                    .remote_execution
+                    .as_ref()
+                    .map(|config| config.registry_address.clone()),
+                registry_peer_id: self
+                    .remote_execution
+                    .as_ref()
+                    .map(|config| config.registry_peer_id.clone()),
+                connection: self.snapshot.connection,
+            }),
             LocalRequest::PauseRemoteAccess { .. } => {
                 self.snapshot.remote_access_paused = true;
                 Ok(LocalResponse::Acknowledged)
@@ -1448,6 +1470,56 @@ fn now_ms() -> u64 {
 mod inventory_generation_tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn connection_settings_reports_only_active_public_connection_data() {
+        let state = state();
+        let mut daemon = state.lock().unwrap();
+        let request = || {
+            serde_json::from_value::<LocalRequest>(serde_json::json!({
+                "request": "connection_settings",
+                "version": { "major": 1, "minor": 1 }
+            }))
+            .expect("connection settings must be part of the local protocol")
+        };
+        assert_eq!(
+            serde_json::to_value(daemon.handle(request()).unwrap()).unwrap(),
+            serde_json::json!({
+                "type": "connection_settings",
+                "payload": {
+                    "registry_address": null,
+                    "registry_peer_id": null,
+                    "connection": "disconnected"
+                }
+            })
+        );
+        daemon.enable_remote_execution(config());
+        assert_eq!(
+            serde_json::to_value(daemon.handle(request()).unwrap()).unwrap(),
+            serde_json::json!({
+                "type": "connection_settings",
+                "payload": {
+                    "registry_address": "127.0.0.1:7443",
+                    "registry_peer_id": "registry",
+                    "connection": "connecting"
+                }
+            })
+        );
+        assert_eq!(
+            daemon.handle(LocalRequest::ConnectionSettings {
+                version: LocalProtocolVersion { major: 1, minor: 0 },
+            }),
+            Err(LocalProtocolError::FeatureUnavailable)
+        );
+        assert!(
+            serde_json::from_value::<LocalRequest>(serde_json::json!({
+                "request": "connection_settings",
+                "version": { "major": 1, "minor": 1 },
+                "identity_path": "not-client-controlled"
+            }))
+            .is_err()
+        );
+    }
 
     fn state() -> Arc<Mutex<DaemonState>> {
         Arc::new(Mutex::new(DaemonState::new(

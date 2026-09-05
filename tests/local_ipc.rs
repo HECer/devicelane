@@ -580,6 +580,22 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
         response => panic!("unexpected status response: {response:?}"),
     };
 
+    let connection = send_local_request(
+        &endpoint,
+        &LocalRequest::ConnectionSettings {
+            version: LocalProtocolVersion::CURRENT,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(connection, LocalResponse::ConnectionSettings {
+            registry_address: Some(ref address),
+            registry_peer_id: Some(ref peer),
+            ..
+        } if address == "registry.example:7443" && peer == "registry"),
+        "unexpected effective connection: {connection:?}"
+    );
+
     let access = approval_access("identity");
     let created = send_local_request(
         &endpoint,
