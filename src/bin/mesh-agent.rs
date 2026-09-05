@@ -315,16 +315,13 @@ fn start_apple_job(
         .lock()
         .unwrap()
         .insert(job_id.clone(), cancellation.clone());
-    if !send_apple_progress(
+    let start_acknowledged = send_apple_progress(
         &registry,
         &transport,
         &job_id,
         vec![network_event(1, "started", "")],
         false,
-    ) {
-        running.lock().unwrap().remove(&job_id);
-        return;
-    }
+    );
     thread::spawn(move || {
         let capabilities: HashSet<_> = capabilities.into_iter().collect();
         let devices: HashSet<_> = devices
@@ -339,7 +336,9 @@ fn start_apple_job(
         ) {
             let _ = std::fs::create_dir_all(&workspace);
         }
-        let validation_error = if let Err(code) =
+        let validation_error = if !start_acknowledged {
+            Some("start_ack_unavailable".to_owned())
+        } else if let Err(code) =
             validate_lease_grant(&operation, &job_id, lease_grant.as_ref(), &transport)
         {
             Some(code.to_owned())
@@ -1020,6 +1019,110 @@ mod tests {
                 "tool_io_failed",
             ]
         );
+    }
+
+    #[test]
+    fn lost_start_ack_reports_terminal_rejection_without_executing_tool() {
+        use device_development_mesh::remote_apple_protocol::{
+            AppleOperation, AppleRequest, RemoteProtocolVersion,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut registry =
+            SecureTransport::load_or_create(root.path().join("registry"), "registry").unwrap();
+        let mut agent =
+            SecureTransport::load_or_create(root.path().join("agent"), "agent").unwrap();
+        registry.trust("agent", agent.certificate_der()).unwrap();
+        agent.trust("registry", registry.certificate_der()).unwrap();
+        let workspace = root.path().join("workspaces");
+        std::fs::create_dir_all(workspace.join("project")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        listener.set_nonblocking(true).unwrap();
+        let peer = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut starts = 0;
+            while Instant::now() < deadline {
+                let (socket, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("listener failed: {error}"),
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut stream = registry.accept_tls(socket).unwrap();
+                let mut line = String::new();
+                BufReader::new(&mut stream).read_line(&mut line).unwrap();
+                let Request::AppleProgress {
+                    job_id,
+                    events,
+                    terminal,
+                } = serde_json::from_str(&line).unwrap()
+                else {
+                    panic!("unexpected RPC before start acknowledgement");
+                };
+                assert_eq!(job_id, "lost-ack-job");
+                if !terminal {
+                    starts += 1;
+                    assert_eq!(events[0].kind, "started");
+                    // Persisted by the peer, but the reply is lost on every start attempt.
+                    continue;
+                }
+                stream
+                    .write_all(b"{\"accepted\":true,\"hosts\":[]}\n")
+                    .unwrap();
+                stream.flush().unwrap();
+                return (starts, Some(events));
+            }
+            (starts, None)
+        });
+        let running = Arc::new(Mutex::new(HashMap::new()));
+        start_apple_job(
+            address,
+            Arc::new(agent),
+            workspace,
+            "lost-ack-job".into(),
+            AppleRequest {
+                version: RemoteProtocolVersion { major: 1, minor: 0 },
+                request_id: "lost-ack-request".into(),
+                idempotency_key: "lost-ack-request".into(),
+                capability: "apple.project@1".into(),
+                workspace_path: "project".into(),
+                device_id: None,
+                lease_id: None,
+                operation: AppleOperation::DiscoverProject {
+                    container: "App.xcodeproj".into(),
+                },
+            },
+            root.path().join("must-not-execute").display().to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "agent".into(),
+            None,
+            vec!["apple.project@1".into()],
+            Vec::new(),
+            running,
+            Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
+            None,
+        );
+        let (starts, events) = peer.join().unwrap();
+        assert!(starts > 0);
+        let events = events.expect("lost start ACK stranded the job without a terminal event");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[0].kind, "rejected");
+        assert_eq!(events[0].payload, "start_ack_unavailable");
     }
 
     #[test]
