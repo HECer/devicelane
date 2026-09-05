@@ -913,6 +913,7 @@ pub mod process_execution {
                     Ok(length) => {
                         let _ = sender.send(Some((kind.clone(), buffer[..length].to_vec())));
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
@@ -932,6 +933,45 @@ pub mod process_execution {
                 Ok(())
             }
             Err(_) => Err(ProcessError::Io),
+        }
+    }
+
+    #[cfg(test)]
+    mod stream_read_tests {
+        use super::*;
+
+        struct InterruptedOutput(u8);
+        impl Read for InterruptedOutput {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let step = self.0;
+                self.0 += 1;
+                let bytes: &[u8] = match step {
+                    0 | 2 => return Err(std::io::ErrorKind::Interrupted.into()),
+                    1 => b"runtime_",
+                    3 => b"missing\n",
+                    _ => return Ok(0),
+                };
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+
+        #[test]
+        fn interrupted_reads_preserve_output_until_actual_eof() {
+            for kind in [EventKind::Stdout, EventKind::Stderr] {
+                let (sender, receiver) = mpsc::channel();
+                let reader = read_stream(InterruptedOutput(0), kind.clone(), sender);
+                reader.join().unwrap();
+                let events = receiver.into_iter().collect::<Vec<_>>();
+                assert_eq!(
+                    events,
+                    vec![
+                        Some((kind.clone(), b"runtime_".to_vec())),
+                        Some((kind, b"missing\n".to_vec())),
+                        None,
+                    ]
+                );
+            }
         }
     }
 }
