@@ -9,8 +9,8 @@ use device_development_mesh::dashboard::{
     DashboardSnapshot, EventCursor, PolicyRule, RuleId, SubscriberId,
 };
 use device_development_mesh::local_ipc::{
-    DaemonSnapshot, DiagnosticItem, LocalProtocolVersion, LocalRequest, LocalResponse,
-    local_endpoint, send_local_request,
+    ConnectionState, DaemonSnapshot, DiagnosticItem, LocalProtocolVersion, LocalRequest,
+    LocalResponse, local_endpoint, send_local_request,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -48,6 +48,13 @@ impl DaemonTransport for LocalDaemonTransport {
 pub struct DiagnosticsResult {
     pub path: String,
     pub items: Vec<DiagnosticItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConnectionSettings {
+    pub registry_address: Option<String>,
+    pub registry_peer_id: Option<String>,
+    pub connection: ConnectionState,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -134,6 +141,23 @@ impl<T: DaemonTransport> DesktopBridge<T> {
             version: LocalProtocolVersion::CURRENT,
         })? {
             LocalResponse::Snapshot(snapshot) => Ok(snapshot),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn connection_settings(&self) -> Result<ConnectionSettings, String> {
+        match self.transport.send(LocalRequest::ConnectionSettings {
+            version: LocalProtocolVersion::CURRENT,
+        })? {
+            LocalResponse::ConnectionSettings {
+                registry_address,
+                registry_peer_id,
+                connection,
+            } => Ok(ConnectionSettings {
+                registry_address,
+                registry_peer_id,
+                connection,
+            }),
             response => Err(unexpected_response(response)),
         }
     }
@@ -771,6 +795,14 @@ fn daemon_status(app: AppHandle, bridge: State<'_, AppBridge>) -> Result<DaemonS
 }
 
 #[tauri::command]
+fn connection_settings(
+    app: AppHandle,
+    bridge: State<'_, AppBridge>,
+) -> Result<ConnectionSettings, String> {
+    report(&app, bridge.connection_settings())
+}
+
+#[tauri::command]
 fn pause_remote_access(app: AppHandle, bridge: State<'_, AppBridge>) -> Result<(), String> {
     report(&app, bridge.pause())
 }
@@ -1095,6 +1127,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             daemon_status,
+            connection_settings,
             pause_remote_access,
             resume_remote_access,
             set_autostart,

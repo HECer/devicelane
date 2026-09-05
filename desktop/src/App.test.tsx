@@ -71,6 +71,7 @@ function fakeClient(overrides: Partial<DaemonClient> = {}): DaemonClient {
   let state = { ...connected };
   const client: DaemonClient = {
     status: vi.fn(() => Promise.resolve({ ...state })),
+    connectionSettings: vi.fn(() => Promise.resolve({ registry_address: null, registry_peer_id: null, connection: "disconnected" as const })),
     pause: vi.fn(() => { state = { ...state, remote_access_paused: true }; return Promise.resolve(); }),
     resume: vi.fn(() => { state = { ...state, remote_access_paused: false }; return Promise.resolve(); }),
     setAutostart: vi.fn((enabled) => { state = { ...state, autostart: enabled }; return Promise.resolve(); }),

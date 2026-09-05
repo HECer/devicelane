@@ -33,6 +33,50 @@ struct FakeTransport {
 }
 
 #[test]
+fn connection_settings_uses_the_public_local_contract() {
+    let requests = Arc::new(Mutex::new(vec![]));
+    let bridge = DesktopBridge::new(FakeTransport {
+        requests: Arc::clone(&requests),
+        response: LocalResponse::ConnectionSettings {
+            registry_address: Some("mac-registry.local:7443".into()),
+            registry_peer_id: Some("registry".into()),
+            connection: ConnectionState::Connecting,
+        },
+    });
+    assert_eq!(
+        serde_json::to_value(bridge.connection_settings().unwrap()).unwrap(),
+        serde_json::json!({
+            "registry_address": "mac-registry.local:7443",
+            "registry_peer_id": "registry",
+            "connection": "connecting"
+        })
+    );
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![LocalRequest::ConnectionSettings {
+            version: LocalProtocolVersion::CURRENT
+        }]
+    );
+}
+
+#[test]
+fn connection_settings_does_not_turn_daemon_errors_into_local_only_success() {
+    for response in [
+        LocalResponse::Error {
+            code: "feature_unavailable".into(),
+            message: "service update required".into(),
+        },
+        LocalResponse::Acknowledged,
+    ] {
+        let bridge = DesktopBridge::new(FakeTransport {
+            requests: Arc::new(Mutex::new(vec![])),
+            response,
+        });
+        assert!(bridge.connection_settings().is_err());
+    }
+}
+
+#[test]
 fn installed_desktop_smoke_probe_uses_the_same_typed_bridge() {
     let transport = FakeTransport {
         requests: Arc::new(Mutex::new(vec![])),
