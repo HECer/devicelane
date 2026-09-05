@@ -778,7 +778,7 @@ fn controller_observations_do_not_replace_registry_inventory() {
     use device_development_mesh::dashboard::{Freshness, Presence};
     use device_development_mesh::network_processes::HostSnapshot;
     let root = tempfile::tempdir().unwrap();
-    let mut service = persistent_service(root.path(), PolicyEngine::new());
+    let mut service = persistent_service(&root.path().join("audit"), PolicyEngine::new());
     let remote = HostSnapshot {
         id: "remote-mac".into(),
         operating_system: "macos".into(),
@@ -824,7 +824,7 @@ fn controller_observations_do_not_replace_registry_inventory() {
 fn rejected_inventory_does_not_partially_update_service_topology() {
     use device_development_mesh::network_processes::HostSnapshot;
     let root = tempfile::tempdir().unwrap();
-    let mut service = persistent_service(root.path(), PolicyEngine::new());
+    let mut service = persistent_service(&root.path().join("audit"), PolicyEngine::new());
     let before = service.snapshot(DashboardScope::Mesh, 10);
     let hosts = (0..128)
         .map(|id| HostSnapshot {
