@@ -1651,7 +1651,11 @@ mod windows_private {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("identity");
             assert!(!path.exists());
-            fs::create_dir(&path).unwrap();
+            // An elevated Windows runner may assign the Administrators group
+            // as the default owner. This case tests a current-user-owned race;
+            // foreign owners must remain rejected by production validation.
+            create_new_directory(&path).unwrap();
+            assert!(owner_is_current(&path).unwrap());
             // Give only this empty, temporary test directory a permissive
             // DACL, so the test does not depend on the machine's inheritance.
             let mut name = wide(&path);
