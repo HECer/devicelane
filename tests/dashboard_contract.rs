@@ -47,7 +47,7 @@ fn sample_host() -> DashboardHost {
         freshness: Freshness::Live,
         trust: TrustState::Trusted,
         connection_path: ConnectionPath::Registry,
-        capabilities: vec![code("xcode_build")],
+        capabilities: vec![CapabilityCode::parse("xcode_build").unwrap()],
         permissions: vec![code("workspace_read")],
         devices: vec![DashboardDevice {
             id: device_id("iphone-1"),
@@ -56,7 +56,7 @@ fn sample_host() -> DashboardHost {
             platform: code("ios"),
             presence: Presence::Busy,
             freshness: Freshness::Live,
-            capabilities: vec![code("application_install")],
+            capabilities: vec![CapabilityCode::parse("application_install").unwrap()],
             permissions: vec![code("device_lease")],
         }],
     }
@@ -538,6 +538,37 @@ fn ids_text_and_vectors_have_explicit_bounds() {
 }
 
 #[test]
+fn versioned_capabilities_do_not_widen_other_dashboard_codes() {
+    for valid in ["xcode_build", "apple.build@1", "apple.xctest@12"] {
+        let capability = CapabilityCode::parse(valid).unwrap();
+        let json = serde_json::to_string(&capability).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CapabilityCode>(&json)
+                .unwrap()
+                .as_str(),
+            valid
+        );
+    }
+    for invalid in [
+        "@1",
+        "apple.build@",
+        "apple.build@0",
+        "apple.build@01",
+        "apple.build@-1",
+        "apple.build@1@2",
+        "apple.build@1\n",
+        "apple.build@<script>",
+    ] {
+        assert!(
+            CapabilityCode::parse(invalid).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+    assert!(CapabilityCode::parse("x".repeat(129)).is_err());
+    assert!(SafeCode::parse("apple.build@1").is_err());
+}
+
+#[test]
 fn direct_deserialization_rejects_each_nested_model_invariant() {
     assert!(
         serde_json::from_value::<MetricValue>(json!({
@@ -866,3 +897,4 @@ fn policy_rule_boolean_constraints_round_trip_and_missing_fields_are_wildcards()
         assert!(serde_json::from_value::<PolicyRule>(encoded).is_err());
     }
 }
+use device_development_mesh::dashboard::CapabilityCode;

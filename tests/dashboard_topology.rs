@@ -48,6 +48,184 @@ fn connect(projector: &mut TopologyProjector, session: &str, epoch: u64) {
 }
 
 #[test]
+fn full_inventory_counts_local_and_controller_collisions_only_once() {
+    let mut projector = TopologyProjector::new();
+    projector
+        .observe_local(1, 1, host("local", "online", &[]))
+        .unwrap();
+    connect(&mut projector, "registry", 1);
+    projector.observe_controller("registry", 1).unwrap();
+    let mut inventory: Vec<_> = (0..126)
+        .map(|index| registry_host(&format!("mac-{index}"), &[]))
+        .collect();
+    inventory.push(registry_host("local", &[]));
+    inventory.push(registry_host("registry", &[]));
+    projector.observe_registry(1, 2, true, inventory).unwrap();
+    assert_eq!(projector.snapshot(2).hosts.len(), 128);
+}
+
+#[test]
+fn registry_switch_retires_previous_controller_without_accumulating_slots() {
+    let mut projector = TopologyProjector::new();
+    for epoch in 1..140 {
+        let controller = format!("registry-{epoch}");
+        connect(&mut projector, &controller, epoch);
+        projector.observe_controller(&controller, epoch).unwrap();
+        let snapshot = projector.snapshot(epoch);
+        assert_eq!(
+            snapshot.hosts.len(),
+            1,
+            "old controller retained after switch"
+        );
+        assert_eq!(snapshot.hosts[0].id.as_str(), controller);
+    }
+}
+
+#[test]
+fn registry_switch_revokes_previous_inventory_leases_until_reobserved() {
+    let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry-a", 1);
+    for revision in [1, 2] {
+        projector
+            .observe_registry(
+                revision,
+                revision,
+                true,
+                vec![registry_host("mac", &[("phone", "ios", "connected")])],
+            )
+            .unwrap();
+    }
+    projector
+        .track_active_lease("lease", "mac", "phone")
+        .unwrap();
+    assert!(projector.lease_authorizable("lease"));
+    connect(&mut projector, "registry-b", 3);
+    assert!(!projector.lease_authorizable("lease"));
+    assert_eq!(projector.snapshot(3).hosts[0].presence, Presence::Offline);
+    assert_eq!(projector.snapshot(3).leases[0].state, LeaseState::Uncertain);
+}
+
+#[test]
+fn offline_device_keeps_last_seen_while_its_host_remains_online() {
+    let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry", 1);
+    for time in [10, 20, 30, 40] {
+        let state = if time <= 20 { "connected" } else { "offline" };
+        projector
+            .observe_registry(
+                time,
+                time,
+                true,
+                vec![registry_host("mac", &[("phone", "ios", state)])],
+            )
+            .unwrap();
+        if time >= 30 {
+            let snapshot = projector.snapshot(time);
+            assert_eq!(snapshot.hosts[0].presence, Presence::Online);
+            assert_eq!(
+                snapshot.hosts[0].devices[0].freshness,
+                Freshness::Stale {
+                    last_seen_at_ms: 20
+                }
+            );
+        }
+    }
+    projector.disconnect_registry(50).unwrap();
+    assert_eq!(
+        projector.snapshot(50).hosts[0].devices[0].freshness,
+        Freshness::Stale {
+            last_seen_at_ms: 20
+        }
+    );
+}
+
+#[test]
+fn registry_names_cannot_inject_terminal_controls() {
+    for unsafe_text in ["mac\x1b[2J", "mac\nforged", "mac\rforged", "mac\u{009b}2J"] {
+        for field in ["host_id", "host_name", "device_id", "device_name"] {
+            let mut projector = TopologyProjector::new();
+            connect(&mut projector, "registry", 1);
+            let mut remote = registry_host("mac", &[("phone", "ios", "connected")]);
+            match field {
+                "host_id" => remote.snapshot.id = unsafe_text.into(),
+                "host_name" => remote.display_name = unsafe_text.into(),
+                "device_id" => remote.snapshot.devices[0].id = unsafe_text.into(),
+                "device_name" => remote.devices[0].display_name = unsafe_text.into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                projector
+                    .observe_registry(1, 1, true, vec![remote])
+                    .is_err(),
+                "accepted terminal control in {field}: {unsafe_text:?}"
+            );
+            assert!(projector.snapshot(1).hosts.is_empty());
+        }
+    }
+}
+
+#[test]
+fn real_versioned_mesh_capabilities_survive_dashboard_projection() {
+    let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry", 1);
+    let mut remote = registry_host("mac", &[]);
+    remote.snapshot.capabilities = vec!["apple.build@1".into()];
+    projector
+        .observe_registry(1, 1, true, vec![remote])
+        .unwrap();
+    let snapshot = projector.snapshot(1);
+    assert_eq!(snapshot.hosts[0].capabilities[0].as_str(), "apple.build@1");
+    let bytes = serde_json::to_vec(&snapshot).unwrap();
+    let decoded: device_development_mesh::dashboard::DashboardSnapshot =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded.hosts[0].capabilities[0].as_str(), "apple.build@1");
+}
+
+#[test]
+fn offline_inventory_polls_preserve_last_online_observation() {
+    let mut projector = TopologyProjector::new();
+    connect(&mut projector, "registry", 1);
+    for time in [10, 20] {
+        projector
+            .observe_registry(
+                time,
+                time,
+                true,
+                vec![registry_host("mac", &[("phone", "ios", "connected")])],
+            )
+            .unwrap();
+    }
+    for time in [30, 40] {
+        let mut remote = registry_host("mac", &[("phone", "ios", "connected")]);
+        remote.snapshot.status = "offline".into();
+        projector
+            .observe_registry(time, time, true, vec![remote])
+            .unwrap();
+        let snapshot = projector.snapshot(time);
+        assert_eq!(
+            snapshot.hosts[0].freshness,
+            Freshness::Stale {
+                last_seen_at_ms: 20
+            }
+        );
+        assert_eq!(
+            snapshot.hosts[0].devices[0].freshness,
+            Freshness::Stale {
+                last_seen_at_ms: 20
+            }
+        );
+        assert_eq!(snapshot.hosts[0].devices[0].presence, Presence::Offline);
+    }
+    projector.disconnect_registry(50).unwrap();
+    assert_eq!(
+        projector.snapshot(50).hosts[0].freshness,
+        Freshness::Stale {
+            last_seen_at_ms: 20
+        }
+    );
+}
+
+#[test]
 fn normalized_snapshot_text_is_bounded_before_normalization() {
     let mut oversized_os = host("local", "online", &[]);
     oversized_os.operating_system = format!("{}linux", " ".repeat(128));

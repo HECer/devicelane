@@ -1,6 +1,6 @@
 pub use crate::dashboard::model::LeaseState;
 use crate::dashboard::{
-    ConnectionPath, DashboardDevice, DashboardHost, DashboardLease, DashboardScope,
+    CapabilityCode, ConnectionPath, DashboardDevice, DashboardHost, DashboardLease, DashboardScope,
     DashboardSnapshot, DeviceId, Freshness, HostId, LeaseId, MAX_COLLECTION_ITEMS, MAX_ID_BYTES,
     MAX_TEXT_BYTES, Presence, SafeCode, TrustState,
 };
@@ -67,6 +67,7 @@ struct StoredHost {
     dashboard: DashboardHost,
     last_seen_at_ms: u64,
     is_local: bool,
+    is_controller: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -76,7 +77,7 @@ struct StoredLease {
     state: LeaseState,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct TopologyProjector {
     hosts: BTreeMap<HostId, StoredHost>,
     leases: BTreeMap<String, StoredLease>,
@@ -140,6 +141,16 @@ impl TopologyProjector {
         };
         if is_new_epoch {
             self.preflight_revision()?;
+            if self
+                .authenticated_registry
+                .as_ref()
+                .is_some_and(|(id, _)| id != &session_id)
+            {
+                // Evidence supplied by the previous registry does not establish liveness
+                // under a different trust source. Retire its singleton controller slot.
+                self.mark_all_remote_stale();
+                self.hosts.retain(|_, host| !host.is_controller);
+            }
             self.registry_revision = None;
             self.authenticated_registry = Some((session_id, epoch));
         } else {
@@ -197,6 +208,7 @@ impl TopologyProjector {
                 dashboard,
                 last_seen_at_ms: observed_at_ms,
                 is_local: true,
+                is_controller: false,
             },
         );
         self.local_revision = Some(source_revision);
@@ -226,8 +238,11 @@ impl TopologyProjector {
             ));
         }
         ensure_limit("hosts", hosts.len())?;
-        let local_slots = usize::from(self.local_host_id.is_some());
-        ensure_limit("hosts", hosts.len() + local_slots)?;
+        let reserved_slots = self
+            .hosts
+            .values()
+            .filter(|host| host.is_local || host.is_controller)
+            .count();
         if self
             .registry_revision
             .is_some_and(|stored| source_revision <= stored)
@@ -254,7 +269,12 @@ impl TopologyProjector {
                 ));
             }
             let host_id = parse_host_id(&host.snapshot.id)?;
-            if self.local_host_id.as_ref() == Some(&host_id) {
+            if self.local_host_id.as_ref() == Some(&host_id)
+                || self
+                    .hosts
+                    .get(&host_id)
+                    .is_some_and(|host| host.is_controller)
+            {
                 continue;
             }
             let freshness = if self.hosts.contains_key(&host_id) {
@@ -262,7 +282,7 @@ impl TopologyProjector {
             } else {
                 Freshness::Unknown
             };
-            let dashboard = project_host(
+            let mut dashboard = project_host(
                 host.snapshot,
                 Some((host.display_name, host.devices)),
                 host.trust,
@@ -271,32 +291,133 @@ impl TopologyProjector {
                 freshness,
                 observed_at_ms,
             )?;
-            projected.push((host_id, dashboard));
+            let last_seen_at_ms = if matches!(dashboard.freshness, Freshness::Stale { .. }) {
+                let last_seen = self
+                    .hosts
+                    .get(&host_id)
+                    .map_or(observed_at_ms, |stored| stored.last_seen_at_ms);
+                dashboard.freshness = Freshness::Stale {
+                    last_seen_at_ms: last_seen,
+                };
+                for device in &mut dashboard.devices {
+                    device.presence = Presence::Offline;
+                    device.freshness = Freshness::Stale {
+                        last_seen_at_ms: last_seen,
+                    };
+                }
+                last_seen
+            } else {
+                observed_at_ms
+            };
+            if let Some(previous) = self.hosts.get(&host_id) {
+                for device in &mut dashboard.devices {
+                    if matches!(device.freshness, Freshness::Stale { .. }) {
+                        if let Some(previous_device) = previous
+                            .dashboard
+                            .devices
+                            .iter()
+                            .find(|previous_device| previous_device.id == device.id)
+                        {
+                            device.freshness = match previous_device.freshness {
+                                Freshness::Stale { last_seen_at_ms } => {
+                                    Freshness::Stale { last_seen_at_ms }
+                                }
+                                _ => Freshness::Stale {
+                                    last_seen_at_ms: previous.last_seen_at_ms,
+                                },
+                            };
+                        }
+                    }
+                }
+            }
+            projected.push((host_id, dashboard, last_seen_at_ms));
         }
+        let observed_ids: HashSet<_> = projected.iter().map(|(id, _, _)| id.clone()).collect();
+        ensure_limit("hosts", observed_ids.len() + reserved_slots)?;
         self.preflight_revision()?;
-        let observed_ids: HashSet<_> = projected.iter().map(|(id, _)| id.clone()).collect();
         let absent_ids: Vec<_> = self
             .hosts
             .iter()
-            .filter(|(id, host)| !host.is_local && !observed_ids.contains(*id))
+            .filter(|(id, host)| {
+                !host.is_local && !host.is_controller && !observed_ids.contains(*id)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in absent_ids {
             self.mark_host_stale(&id);
         }
-        for (host_id, dashboard) in projected {
+        for (host_id, dashboard, last_seen_at_ms) in projected {
             self.hosts.insert(
                 host_id,
                 StoredHost {
                     dashboard,
-                    last_seen_at_ms: observed_at_ms,
+                    last_seen_at_ms,
                     is_local: false,
+                    is_controller: false,
                 },
             );
         }
         self.prune_absent_hosts(&observed_ids);
         self.registry_revision = Some(source_revision);
         self.registry_authenticated = authenticated;
+        self.commit_revision();
+        Ok(())
+    }
+
+    /// A successfully authenticated registry RPC observes the controller itself, not a
+    /// complete inventory. Keep its ownership separate from registry-advertised agents.
+    pub fn observe_controller(
+        &mut self,
+        controller_id: &str,
+        observed_at_ms: u64,
+    ) -> Result<(), TopologyError> {
+        if !self.registry_authenticated
+            || self
+                .authenticated_registry
+                .as_ref()
+                .is_none_or(|(id, _)| id != controller_id)
+        {
+            return Err(invalid("controller", "unauthenticated controller".into()));
+        }
+        let id = parse_host_id(controller_id)?;
+        if self.local_host_id.as_ref() == Some(&id) {
+            return Ok(());
+        }
+        ensure_limit(
+            "hosts",
+            self.hosts.len() + usize::from(!self.hosts.contains_key(&id)),
+        )?;
+        let freshness = if self.hosts.contains_key(&id) {
+            Freshness::Live
+        } else {
+            Freshness::Unknown
+        };
+        let dashboard = project_host(
+            HostSnapshot {
+                id: controller_id.into(),
+                operating_system: "unknown".into(),
+                architecture: "unknown".into(),
+                status: "online".into(),
+                capabilities: Vec::new(),
+                devices: Vec::new(),
+            },
+            Some(("Paired controller".into(), Vec::new())),
+            TrustState::Trusted,
+            ConnectionPath::Registry,
+            Vec::new(),
+            freshness,
+            observed_at_ms,
+        )?;
+        self.preflight_revision()?;
+        self.hosts.insert(
+            id,
+            StoredHost {
+                dashboard,
+                last_seen_at_ms: observed_at_ms,
+                is_local: false,
+                is_controller: true,
+            },
+        );
         self.commit_revision();
         Ok(())
     }
@@ -463,7 +584,9 @@ impl TopologyProjector {
         let candidates: Vec<_> = self
             .hosts
             .iter()
-            .filter(|(id, host)| !host.is_local && !observed_ids.contains(*id))
+            .filter(|(id, host)| {
+                !host.is_local && !host.is_controller && !observed_ids.contains(*id)
+            })
             .map(|(id, host)| (host.last_seen_at_ms, id.clone()))
             .collect();
         let mut candidates = candidates;
@@ -486,9 +609,11 @@ impl TopologyProjector {
         };
         for device in &mut host.dashboard.devices {
             device.presence = Presence::Offline;
-            device.freshness = Freshness::Stale {
-                last_seen_at_ms: host.last_seen_at_ms,
-            };
+            if !matches!(device.freshness, Freshness::Stale { .. }) {
+                device.freshness = Freshness::Stale {
+                    last_seen_at_ms: host.last_seen_at_ms,
+                };
+            }
         }
         for lease in self.leases.values_mut() {
             if lease.owner_host_id == *host_id && lease.state == LeaseState::Active {
@@ -510,6 +635,21 @@ impl TopologyProjector {
     fn commit_revision(&mut self) {
         self.revision += 1;
     }
+}
+
+/// Validate a network inventory row before the registry mutates ownership or leases.
+/// Reuse the dashboard's bounded projection contract without retaining any state.
+pub fn validate_host_snapshot(snapshot: &HostSnapshot) -> Result<(), TopologyError> {
+    project_host(
+        snapshot.clone(),
+        None,
+        TrustState::Untrusted,
+        ConnectionPath::Registry,
+        Vec::new(),
+        Freshness::Unknown,
+        0,
+    )
+    .map(|_| ())
 }
 
 fn project_host(
@@ -556,7 +696,7 @@ fn project_host(
         })
         .collect::<Result<Vec<_>, _>>()?;
     devices.sort_by(|left, right| left.id.cmp(&right.id));
-    let mut capabilities = parse_codes(snapshot.capabilities, "capability")?;
+    let mut capabilities = parse_capabilities(snapshot.capabilities, "capability")?;
     let mut permissions = parse_codes(permissions, "permission")?;
     capabilities.sort();
     capabilities.dedup();
@@ -592,6 +732,7 @@ fn project_device(
 ) -> Result<DashboardDevice, TopologyError> {
     validate_code_input("device_platform", &snapshot.platform)?;
     validate_raw_text("device_state", &snapshot.state)?;
+    validate_identifier("device_id", &snapshot.id)?;
     let id = DeviceId::parse(snapshot.id.clone())
         .map_err(|error| invalid("device_id", error.to_string()))?;
     let (display_name, capabilities, permissions) = details.map_or_else(
@@ -604,7 +745,7 @@ fn project_device(
             )
         },
     );
-    let mut capabilities = parse_codes(capabilities, "device_capability")?;
+    let mut capabilities = parse_capabilities(capabilities, "device_capability")?;
     let mut permissions = parse_codes(permissions, "device_permission")?;
     capabilities.sort();
     capabilities.dedup();
@@ -631,6 +772,7 @@ fn index_device_details(devices: Vec<DeviceDetails>) -> HashMap<String, DeviceDe
 }
 
 fn parse_host_id(value: &str) -> Result<HostId, TopologyError> {
+    validate_identifier("host_id", value)?;
     HostId::parse(value.to_owned()).map_err(|error| invalid("host_id", error.to_string()))
 }
 
@@ -638,6 +780,19 @@ fn parse_codes(values: Vec<String>, field: &'static str) -> Result<Vec<SafeCode>
     values
         .into_iter()
         .map(|value| parse_code(&value, field))
+        .collect()
+}
+
+fn parse_capabilities(
+    values: Vec<String>,
+    field: &'static str,
+) -> Result<Vec<CapabilityCode>, TopologyError> {
+    values
+        .into_iter()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase().replace([' ', '/'], "_");
+            CapabilityCode::parse(normalized).map_err(|error| invalid(field, error.to_string()))
+        })
         .collect()
 }
 
@@ -672,14 +827,18 @@ fn freshness_for_presence(
 }
 
 fn validate_identifier(field: &'static str, value: &str) -> Result<(), TopologyError> {
-    if value.trim().is_empty() || value.len() > MAX_ID_BYTES {
-        return Err(invalid(field, value.into()));
+    if value.trim().is_empty() || value.len() > MAX_ID_BYTES || value.chars().any(char::is_control)
+    {
+        return Err(invalid(field, "invalid identifier".into()));
     }
     Ok(())
 }
 
 fn validate_display(field: &'static str, value: &str) -> Result<(), TopologyError> {
-    if value.trim().is_empty() || value.len() > MAX_TEXT_BYTES {
+    if value.trim().is_empty()
+        || value.len() > MAX_TEXT_BYTES
+        || value.chars().any(char::is_control)
+    {
         return Err(invalid(field, value.len().to_string()));
     }
     Ok(())

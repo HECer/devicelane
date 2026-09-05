@@ -1340,6 +1340,52 @@ fn execution_message(code: MessageCode) -> DisplayMessage {
     DisplayMessage::new(code, Vec::new()).expect("constant display message")
 }
 
+/// Poll using a separate transport and without holding the local IPC state lock during I/O.
+/// A weak reference lets the worker exit when its daemon state is released.
+pub fn start_registry_inventory_observer(state: &Arc<Mutex<DaemonState>>) {
+    let config = state
+        .lock()
+        .ok()
+        .and_then(|state| state.remote_execution.clone());
+    let Some(config) = config else { return };
+    let state = Arc::downgrade(state);
+    std::thread::spawn(move || {
+        let boundary = PersistentMeshRpcBoundary::default();
+        while state.strong_count() > 0 {
+            let result = boundary.call(&config, &MeshRequest::List);
+            let Some(state) = state.upgrade() else { break };
+            if let Ok(mut state) = state.lock() {
+                let connected = if let Some(dashboard) = state.dashboard.as_mut() {
+                    match result {
+                        Ok(response) if response.accepted => dashboard
+                            .observe_authenticated_inventory(
+                                &config.registry_peer_id,
+                                now_ms(),
+                                response.hosts,
+                            )
+                            .is_ok(),
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if !connected {
+                    if let Some(dashboard) = state.dashboard.as_mut() {
+                        dashboard.disconnect_inventory(now_ms());
+                    }
+                }
+                state.snapshot.connection = if connected {
+                    ConnectionState::Connected
+                } else {
+                    ConnectionState::Disconnected
+                };
+            }
+            drop(state);
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

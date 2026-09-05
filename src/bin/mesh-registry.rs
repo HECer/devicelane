@@ -390,6 +390,11 @@ fn handle(
                 if !agent_peers.contains(&peer_id) {
                     return write_response(&mut stream, error_response("agent_access_denied"));
                 }
+                if device_development_mesh::dashboard::topology::validate_host_snapshot(&host)
+                    .is_err()
+                {
+                    return write_response(&mut stream, error_response("invalid_host_inventory"));
+                }
                 let connected: HashSet<_> = host
                     .devices
                     .iter()

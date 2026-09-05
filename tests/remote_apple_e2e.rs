@@ -1,3 +1,4 @@
+use command_group::{CommandGroup, GroupChild};
 use device_development_mesh::{
     network_processes::{LeaseRequest, ManifestUpload, RunRequest},
     remote_apple_protocol::{AppleOperation, AppleRequest, RemoteProtocolVersion},
@@ -7,10 +8,406 @@ use sha2::{Digest, Sha256};
 use std::{
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
+    process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+#[test]
+#[cfg(windows)]
+fn child_guard_terminates_descendants() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("descendant-pid");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--ignored", "--exact", "child_guard_parent_fixture"])
+        .env("DEVICELANE_TEST_DESCENDANT_PID", &marker);
+    let parent = spawn_command(&mut command);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "descendant did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let descendant: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    drop(parent);
+    // Query and clean up only the PID created by this fixture. Cleanup on RED
+    // prevents the deliberately exposed orphan from surviving the test.
+    let result = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &format!(
+            "if (Get-Process -Id {descendant} -ErrorAction SilentlyContinue) {{ Stop-Process -Id {descendant} -Force; exit 1 }}; exit 0"
+        )])
+        .status()
+        .unwrap();
+    assert!(result.success(), "child guard left its descendant running");
+}
+
+#[test]
+#[ignore = "subprocess fixture for child_guard_terminates_descendants"]
+#[cfg(windows)]
+fn child_guard_parent_fixture() {
+    if std::env::var_os("DEVICELANE_TEST_DESCENDANT_PID").is_none() {
+        return;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "child_guard_leaf_fixture"])
+        .spawn()
+        .unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+#[ignore = "subprocess fixture for child_guard_terminates_descendants"]
+#[cfg(windows)]
+fn child_guard_leaf_fixture() {
+    let Some(marker) = std::env::var_os("DEVICELANE_TEST_DESCENDANT_PID") else {
+        return;
+    };
+    std::fs::write(marker, std::process::id().to_string()).unwrap();
+    thread::sleep(Duration::from_secs(60));
+}
+
+#[test]
+fn dashboard_job_preserves_live_inventory_during_real_mesh_execution() {
+    use device_development_mesh::dashboard::policy::{AccessRequest, RemoteOperationGrant};
+    use device_development_mesh::dashboard::{
+        ActivityId, ActivityState, ApprovalDecision, DashboardScope, DeviceId, Freshness, HostId,
+        OperationId, PrincipalId, ResourceClass,
+    };
+    use device_development_mesh::local_ipc::{
+        LocalProtocolVersion, LocalRequest, LocalResponse, local_endpoint, send_local_request,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let address = free_address();
+    let registry_identity = root.path().join("registry");
+    let agent_identity = root.path().join("agent");
+    let other_identity = root.path().join("inventory-agent");
+    let service_identity = root.path().join("mac-1");
+    let controller_identity = root.path().join("windows-client");
+    for (path, id) in [
+        (&agent_identity, "agent"),
+        (&other_identity, "inventory-agent"),
+        (&service_identity, "mac-1"),
+        (&controller_identity, "windows-client"),
+    ] {
+        pair(&registry_identity, "registry", path, id);
+    }
+    let _registry = spawn(
+        env!("CARGO_BIN_EXE_mesh-registry"),
+        &[
+            "--listen",
+            &address,
+            "--identity",
+            registry_identity.to_str().unwrap(),
+            "--offline-after-ms",
+            "5000",
+            "--agent-peer",
+            "agent",
+            "--agent-peer",
+            "inventory-agent",
+        ],
+    );
+    let workspace = root.path().join("workspaces");
+    std::fs::create_dir_all(workspace.join("mac-1/project/build/App.app")).unwrap();
+    let marker = root.path().join("tools.log");
+    let simctl = fake_tool(root.path(), "simctl", &marker);
+    let xcodebuild = fake_tool(root.path(), "xcodebuild", &marker);
+    let release_install = root.path().join("release-install");
+    let script = std::fs::read_to_string(&simctl).unwrap();
+    #[cfg(windows)]
+    let script = script.replace("echo agent-tool-output", &format!(
+        ":wait_install\r\nif \"%1\"==\"install\" if not exist \"{}\" (\r\n ping -n 2 127.0.0.1 >nul\r\n goto wait_install\r\n)\r\necho agent-tool-output", release_install.display()));
+    #[cfg(unix)]
+    let script = script.replace("echo \"agent-tool-output", &format!(
+        "while [ \"$1\" = install ] && [ ! -f '{}' ]; do sleep 0.05; done\necho \"agent-tool-output", release_install.display()));
+    std::fs::write(&simctl, script).unwrap();
+    let _agent = spawn(
+        env!("CARGO_BIN_EXE_mesh-agent"),
+        &[
+            "--registry",
+            &address,
+            "--identity",
+            agent_identity.to_str().unwrap(),
+            "--id",
+            "mac-1",
+            "--os",
+            "macos",
+            "--arch",
+            "aarch64",
+            "--workspace-root",
+            workspace.to_str().unwrap(),
+            "--simctl",
+            simctl.to_str().unwrap(),
+            "--xcodebuild",
+            xcodebuild.to_str().unwrap(),
+            "--capability",
+            "apple.simulator@1",
+            "--device",
+            "sim-1:ios:connected",
+            "--heartbeat-ms",
+            "100",
+        ],
+    );
+    let _other_agent = spawn(
+        env!("CARGO_BIN_EXE_mesh-agent"),
+        &[
+            "--registry",
+            &address,
+            "--identity",
+            other_identity.to_str().unwrap(),
+            "--peer-id",
+            "inventory-agent",
+            "--id",
+            "other-mac",
+            "--os",
+            "macos",
+            "--arch",
+            "aarch64",
+            "--heartbeat-ms",
+            "100",
+        ],
+    );
+    let runtime = root.path().join("runtime");
+    let logs = root.path().join("logs");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&logs).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    let listen = format!(r"\\.\pipe\devicelane-live-job-{}", std::process::id());
+    #[cfg(unix)]
+    let listen = runtime
+        .canonicalize()
+        .unwrap()
+        .join("job.sock")
+        .display()
+        .to_string();
+    let endpoint = local_endpoint(&runtime, &listen).unwrap();
+    let _service = spawn(
+        env!("CARGO_BIN_EXE_devicelane-service"),
+        &[
+            "--identity",
+            service_identity.to_str().unwrap(),
+            "--runtime-dir",
+            runtime.to_str().unwrap(),
+            "--role",
+            "workstation",
+            "--registry",
+            &address,
+            "--listen",
+            &listen,
+            "--log-dir",
+            logs.to_str().unwrap(),
+        ],
+    );
+    struct ReleaseOnDrop(PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+    let _release_on_drop = ReleaseOnDrop(release_install.clone());
+    let snapshot = || {
+        send_local_request(
+            &endpoint,
+            &LocalRequest::DashboardSnapshot {
+                version: LocalProtocolVersion::CURRENT,
+                scope: DashboardScope::Mesh,
+            },
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(LocalResponse::DashboardSnapshot(snapshot)) = snapshot() {
+            if snapshot
+                .hosts
+                .iter()
+                .any(|host| host.id.as_str() == "other-mac" && host.freshness == Freshness::Live)
+            {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "inventory observer did not become live"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let device = DeviceId::parse("sim-1").unwrap();
+    let activity = ActivityId::parse("live-inventory-install").unwrap();
+    let access = AccessRequest {
+        activity_id: activity.clone(),
+        principal_id: PrincipalId::parse("windows-agent").unwrap(),
+        source_host_id: HostId::parse("windows-client").unwrap(),
+        target_host_id: HostId::parse("mac-1").unwrap(),
+        device_id: Some(device.clone()),
+        operation: OperationId::parse("apple.install_app").unwrap(),
+        resources: vec![
+            ResourceClass::WorkspaceRead,
+            ResourceClass::DeviceLease,
+            ResourceClass::ApplicationInstall,
+        ],
+        remote_operation: Some(
+            RemoteOperationGrant::new(
+                "install-live",
+                "project",
+                Some(device),
+                AppleOperation::InstallApp {
+                    app_path: "build/App.app".into(),
+                },
+            )
+            .unwrap(),
+        ),
+        physical_device: false,
+        user_present: true,
+    };
+    use device_development_mesh::local_ipc::{
+        MeshRpcBoundary, PersistentMeshRpcBoundary, RemoteExecutionConfig,
+    };
+    let controller =
+        SecureTransport::load_or_create(&controller_identity, "windows-client").unwrap();
+    let (claim, client_signature) =
+        device_development_mesh::controller_session::sign_mesh_access_claim(&controller, access)
+            .unwrap();
+    let access = claim.access.clone();
+    let response = PersistentMeshRpcBoundary::default()
+        .call(
+            &RemoteExecutionConfig {
+                registry_address: address.clone(),
+                registry_peer_id: "registry".into(),
+                identity_path: controller_identity,
+                client_id: "windows-client".into(),
+            },
+            &device_development_mesh::network_processes::Request::AuthenticateDashboardAccess {
+                claim,
+                client_signature,
+            },
+        )
+        .unwrap();
+    assert!(
+        response.accepted,
+        "signed mesh access rejected: {:?}",
+        response.error
+    );
+    let assertion = response
+        .events
+        .iter()
+        .find(|event| event.kind == "authenticated_dashboard_access")
+        .map(|event| serde_json::from_str(&event.payload).unwrap())
+        .expect("missing signed assertion");
+    let response = send_local_request(
+        &endpoint,
+        &LocalRequest::RequestAuthenticatedApproval {
+            version: LocalProtocolVersion::CURRENT,
+            assertion,
+            lifetime_ms: 30_000,
+        },
+    )
+    .unwrap();
+    let LocalResponse::ApprovalCreated { nonce, .. } = response else {
+        panic!("approval failed: {response:?}")
+    };
+    let response = send_local_request(
+        &endpoint,
+        &LocalRequest::DecideApproval {
+            version: LocalProtocolVersion::CURRENT,
+            nonce,
+            access,
+            decision: ApprovalDecision::AllowOnce,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, LocalResponse::ApprovalDecided { .. }),
+        "{response:?}"
+    );
+    let response = send_local_request(
+        &endpoint,
+        &LocalRequest::StartRemoteExecution {
+            version: LocalProtocolVersion::CURRENT,
+            activity_id: activity.clone(),
+            workspace_path: "project".into(),
+            request_id: "install-live".into(),
+            app_path: "build/App.app".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, LocalResponse::ExecutionStarted { .. }),
+        "{response:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut gate_entered = None;
+    let mut released = false;
+    loop {
+        let LocalResponse::DashboardSnapshot(current) = snapshot().unwrap() else {
+            panic!("snapshot missing")
+        };
+        assert_eq!(
+            current
+                .hosts
+                .iter()
+                .find(|host| host.id.as_str() == "other-mac")
+                .unwrap()
+                .freshness,
+            Freshness::Live,
+            "remote job displaced live inventory"
+        );
+        let state = current
+            .activities
+            .iter()
+            .find(|entry| entry.activity_id == activity)
+            .unwrap()
+            .state;
+        if gate_entered.is_none()
+            && std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .contains("simctl install sim-1")
+        {
+            gate_entered = Some((Instant::now(), current.revision));
+        }
+        // Each inventory observation commits three topology revisions. After
+        // tool entry, no controller/lease setup remains to advance this counter.
+        if !released
+            && gate_entered.is_some_and(|(entered, revision)| {
+                entered.elapsed() >= Duration::from_millis(2200)
+                    && current.revision.saturating_sub(revision) >= 6
+            })
+        {
+            std::fs::write(&release_install, b"release").unwrap();
+            released = true;
+        }
+        if state == ActivityState::Succeeded {
+            assert!(
+                released,
+                "installation completed before its explicit test gate release"
+            );
+            break;
+        }
+        assert!(
+            !matches!(
+                state,
+                ActivityState::Failed | ActivityState::Denied | ActivityState::Cancelled
+            ),
+            "remote job failed: {:?}",
+            current.activities
+        );
+        assert!(
+            Instant::now() < deadline,
+            "remote job did not terminate: activities={:?}; tools={}",
+            current.activities,
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        std::fs::read_to_string(marker)
+            .unwrap()
+            .contains("simctl install sim-1")
+    );
+}
 
 #[test]
 fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
@@ -531,25 +928,30 @@ fn free_address() -> String {
 }
 
 fn spawn(path: &str, args: &[&str]) -> ChildGuard {
+    spawn_command(Command::new(path).args(args))
+}
+
+fn spawn_command(command: &mut Command) -> ChildGuard {
     ChildGuard(
-        Command::new(path)
-            .args(args)
+        command
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
+            .group()
+            .kill_on_drop(true)
             .spawn()
             .unwrap(),
     )
 }
 
-struct ChildGuard(Child);
+struct ChildGuard(GroupChild);
 impl std::ops::Deref for ChildGuard {
-    type Target = Child;
-    fn deref(&self) -> &Child {
+    type Target = GroupChild;
+    fn deref(&self) -> &GroupChild {
         &self.0
     }
 }
 impl std::ops::DerefMut for ChildGuard {
-    fn deref_mut(&mut self) -> &mut Child {
+    fn deref_mut(&mut self) -> &mut GroupChild {
         &mut self.0
     }
 }

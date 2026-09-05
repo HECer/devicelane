@@ -9,7 +9,7 @@ use device_development_mesh::dashboard::{HostId, policy::PolicyEngine};
 use device_development_mesh::local_ipc::{
     ConnectionState, DaemonRole, DaemonSnapshot, DaemonState, DiagnosticItem, LocalProtocolVersion,
     RemoteExecutionConfig, local_endpoint, platform_autostart_enabled, serve_local,
-    validate_state_paths,
+    start_registry_inventory_observer, validate_state_paths,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -179,6 +179,7 @@ fn run() -> Result<(), String> {
         });
     }
     let state = Arc::new(Mutex::new(daemon_state));
+    start_registry_inventory_observer(&state);
     if args.foreground {
         eprintln!("devicelane-service: listening on {}", args.listen);
     }

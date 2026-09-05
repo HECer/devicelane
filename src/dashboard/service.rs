@@ -418,27 +418,47 @@ impl DashboardService {
             .connect_registry(controller_id, observed_at_ms.max(1), true)
             .map_err(|_| DashboardServiceError::InvalidRequest)?;
         self.topology
+            .observe_controller(controller_id, observed_at_ms)
+            .map_err(|_| DashboardServiceError::InvalidRequest)
+    }
+
+    pub fn observe_authenticated_inventory(
+        &mut self,
+        registry_id: &str,
+        observed_at_ms: u64,
+        hosts: Vec<HostSnapshot>,
+    ) -> Result<(), DashboardServiceError> {
+        let mut topology = self.topology.clone();
+        topology
+            .connect_registry(registry_id, observed_at_ms.max(1), true)
+            .map_err(|_| DashboardServiceError::InvalidRequest)?;
+        topology
+            .observe_controller(registry_id, observed_at_ms)
+            .map_err(|_| DashboardServiceError::InvalidRequest)?;
+        topology
             .observe_registry(
                 observed_at_ms.max(1),
                 observed_at_ms,
                 true,
-                vec![RegistryHost {
-                    snapshot: HostSnapshot {
-                        id: controller_id.to_owned(),
-                        operating_system: "unknown".into(),
-                        architecture: "unknown".into(),
-                        status: "online".into(),
-                        capabilities: Vec::new(),
+                hosts
+                    .into_iter()
+                    .map(|snapshot| RegistryHost {
+                        display_name: snapshot.id.clone(),
+                        snapshot,
+                        trust: TrustState::Trusted,
+                        connection_path: ConnectionPath::Registry,
+                        permissions: Vec::new(),
                         devices: Vec::new(),
-                    },
-                    display_name: "Paired controller".into(),
-                    trust: TrustState::Trusted,
-                    connection_path: ConnectionPath::Registry,
-                    permissions: Vec::new(),
-                    devices: Vec::new(),
-                }],
+                    })
+                    .collect(),
             )
-            .map_err(|_| DashboardServiceError::InvalidRequest)
+            .map_err(|_| DashboardServiceError::InvalidRequest)?;
+        self.topology = topology;
+        Ok(())
+    }
+
+    pub fn disconnect_inventory(&mut self, detected_at_ms: u64) {
+        let _ = self.topology.disconnect_registry(detected_at_ms);
     }
 
     pub fn pending_approval_for_notification(

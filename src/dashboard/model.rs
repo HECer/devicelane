@@ -125,6 +125,50 @@ impl<'de> Deserialize<'de> for SafeCode {
     }
 }
 
+/// Display-safe capability names, optionally carrying the mesh protocol's major version.
+/// Other dashboard codes deliberately retain the narrower SafeCode grammar.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct CapabilityCode(String);
+
+impl CapabilityCode {
+    pub fn parse(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        if value.len() > 128 {
+            return Err(ValidationError::at("code_too_long", "capability"));
+        }
+        let name = if let Some((name, version)) = value.split_once('@') {
+            if version.is_empty()
+                || version.starts_with('0')
+                || !version.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(ValidationError::at(
+                    "invalid_capability_version",
+                    "capability",
+                ));
+            }
+            name
+        } else {
+            &value
+        };
+        SafeCode::parse(name)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum MessageCode {
@@ -435,7 +479,7 @@ pub struct DashboardDevice {
     pub platform: SafeCode,
     pub presence: Presence,
     pub freshness: Freshness,
-    pub capabilities: Vec<SafeCode>,
+    pub capabilities: Vec<CapabilityCode>,
     pub permissions: Vec<SafeCode>,
 }
 
@@ -450,7 +494,7 @@ pub struct DashboardHost {
     pub freshness: Freshness,
     pub trust: TrustState,
     pub connection_path: ConnectionPath,
-    pub capabilities: Vec<SafeCode>,
+    pub capabilities: Vec<CapabilityCode>,
     pub permissions: Vec<SafeCode>,
     pub devices: Vec<DashboardDevice>,
 }
@@ -818,7 +862,7 @@ struct DashboardDeviceWire {
     platform: SafeCode,
     presence: Presence,
     freshness: Freshness,
-    capabilities: Vec<SafeCode>,
+    capabilities: Vec<CapabilityCode>,
     permissions: Vec<SafeCode>,
 }
 
@@ -880,7 +924,7 @@ struct DashboardHostWire {
     freshness: Freshness,
     trust: TrustState,
     connection_path: ConnectionPath,
-    capabilities: Vec<SafeCode>,
+    capabilities: Vec<CapabilityCode>,
     permissions: Vec<SafeCode>,
     devices: Vec<DashboardDevice>,
 }

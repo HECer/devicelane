@@ -774,6 +774,77 @@ fn persistent_service(root: &std::path::Path, policy: PolicyEngine) -> Dashboard
 }
 
 #[test]
+fn controller_observations_do_not_replace_registry_inventory() {
+    use device_development_mesh::dashboard::{Freshness, Presence};
+    use device_development_mesh::network_processes::HostSnapshot;
+    let root = tempfile::tempdir().unwrap();
+    let mut service = persistent_service(root.path(), PolicyEngine::new());
+    let remote = HostSnapshot {
+        id: "remote-mac".into(),
+        operating_system: "macos".into(),
+        architecture: "arm64".into(),
+        status: "online".into(),
+        capabilities: vec!["apple.build@1".into()],
+        devices: Vec::new(),
+    };
+    for time in [10, 20] {
+        service
+            .observe_authenticated_inventory("registry", time, vec![remote.clone()])
+            .unwrap();
+    }
+    service
+        .observe_authenticated_controller("registry", 30)
+        .unwrap();
+    let snapshot = service.snapshot(DashboardScope::Mesh, 30);
+    assert_eq!(
+        snapshot
+            .hosts
+            .iter()
+            .find(|host| host.id.as_str() == "remote-mac")
+            .unwrap()
+            .freshness,
+        Freshness::Live
+    );
+    service
+        .observe_authenticated_inventory("registry", 40, vec![remote])
+        .unwrap();
+    let snapshot = service.snapshot(DashboardScope::Mesh, 40);
+    assert_eq!(
+        snapshot
+            .hosts
+            .iter()
+            .find(|host| host.id.as_str() == "registry")
+            .unwrap()
+            .presence,
+        Presence::Online
+    );
+}
+
+#[test]
+fn rejected_inventory_does_not_partially_update_service_topology() {
+    use device_development_mesh::network_processes::HostSnapshot;
+    let root = tempfile::tempdir().unwrap();
+    let mut service = persistent_service(root.path(), PolicyEngine::new());
+    let before = service.snapshot(DashboardScope::Mesh, 10);
+    let hosts = (0..128)
+        .map(|id| HostSnapshot {
+            id: format!("remote-{id}"),
+            operating_system: "macos".into(),
+            architecture: "arm64".into(),
+            status: "online".into(),
+            capabilities: Vec::new(),
+            devices: Vec::new(),
+        })
+        .collect();
+    assert!(
+        service
+            .observe_authenticated_inventory("registry", 10, hosts)
+            .is_err()
+    );
+    assert_eq!(service.snapshot(DashboardScope::Mesh, 10), before);
+}
+
+#[test]
 fn checkpoint_failure_rolls_back_staged_approval_request() {
     let request_root = tempfile::tempdir().unwrap();
     let state = request_root.path().join("state");
