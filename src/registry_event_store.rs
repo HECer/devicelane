@@ -49,6 +49,9 @@ pub use events::{read_event_batch, write_event_batch};
 mod fragments;
 pub use fragments::{BatchBinding, write_event_segments};
 
+mod reader;
+pub use reader::{DecodedBatch, read_event_segment_batch};
+
 #[cfg(test)]
 mod tests {
     use super::*;
