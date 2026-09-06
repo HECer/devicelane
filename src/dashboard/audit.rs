@@ -1219,6 +1219,29 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), AuditError> {
     windows_private::create_dir(path)
 }
 
+/// Creates exactly one new private directory, without repairing a collision.
+#[cfg(unix)]
+pub(crate) fn create_private_dir_exclusive(path: &Path) -> Result<(), AuditError> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .map_err(Into::into)
+}
+
+#[cfg(windows)]
+pub(crate) fn create_private_dir_exclusive(path: &Path) -> Result<(), AuditError> {
+    windows_private::create_new_directory(path)
+}
+
+/// Opens a no-follow read/write file with explicit private security on creation.
+/// It neither locks nor changes existing security; callers validate the opened
+/// object and apply their own lifetime/locking policy.
+#[cfg(windows)]
+pub(crate) fn open_private_shared_file(path: &Path) -> Result<File, AuditError> {
+    windows_private::open_shared_file(path)
+}
+
 #[cfg(not(windows))]
 fn create_private_file(path: &Path) -> Result<File, AuditError> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1338,7 +1361,7 @@ mod windows_private {
         finish_directory_creation(path, create_new_directory(path))
     }
 
-    fn create_new_directory(path: &Path) -> Result<(), AuditError> {
+    pub(super) fn create_new_directory(path: &Path) -> Result<(), AuditError> {
         let security = Security::current_user()?;
         let wide = wide(path);
         if unsafe { CreateDirectoryW(wide.as_ptr(), &security.attributes) } == 0 {
@@ -1513,6 +1536,26 @@ mod windows_private {
             return Err(error);
         }
         Ok(file)
+    }
+
+    pub fn open_shared_file(path: &Path) -> Result<File, AuditError> {
+        let security = Security::current_user()?;
+        let wide_path = wide(path);
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                &security.attributes,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(unsafe { File::from_raw_handle(handle as _) })
     }
 
     pub fn sync_dir(path: &Path) -> Result<(), AuditError> {

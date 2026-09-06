@@ -6,6 +6,39 @@ loop:
   decisionPolicy: auto
 runner:
   agent: codex
+routing:
+  enabled: true
+  strategy: capability
+  maxCandidates: 3
+  workers:
+    - id: codex-light
+      agent: codex
+      model: gpt-5.6-luna
+      reasoningEffort: low
+      tier: light
+      costTier: low
+      capabilities: [mechanical, tests]
+    - id: codex-standard
+      agent: codex
+      model: gpt-5.6-terra
+      reasoningEffort: medium
+      tier: standard
+      costTier: low
+      capabilities: [implementation]
+    - id: codex-strong
+      agent: codex
+      model: gpt-5.6-sol
+      reasoningEffort: high
+      tier: strong
+      costTier: medium
+      capabilities: [debugging]
+    - id: codex-frontier
+      agent: codex
+      model: gpt-6-astra
+      reasoningEffort: high
+      tier: frontier
+      costTier: high
+      capabilities: [architecture]
 codeGraph: graphify
 verify:
   command: cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check

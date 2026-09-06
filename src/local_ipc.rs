@@ -518,6 +518,7 @@ impl Authorizer for SameUserAuthorizer {
 }
 
 pub struct DaemonState {
+    registry_status: Option<crate::registry_runtime::RegistryStatus>,
     connection_storage: Option<PathBuf>,
     snapshot: DaemonSnapshot,
     diagnostics: Vec<DiagnosticItem>,
@@ -746,8 +747,43 @@ impl AutostartAdapter for PlatformAutostartAdapter {
 }
 
 impl DaemonState {
+    pub fn attach_registry_status(&mut self, status: crate::registry_runtime::RegistryStatus) {
+        self.registry_status = Some(status);
+        self.refresh_registry_status();
+    }
+
+    fn refresh_registry_status(&mut self) {
+        use crate::registry_runtime::RegistryRuntimeState;
+        let Some(status) = &self.registry_status else {
+            return;
+        };
+        let (code, message) = match status.snapshot() {
+            RegistryRuntimeState::Running => return,
+            RegistryRuntimeState::Stopped => {
+                ("registry_listener_stopped", "The controller has stopped.")
+            }
+            RegistryRuntimeState::Failed { code } => (
+                code,
+                "The controller failed. Restart the daemon after checking its logs.",
+            ),
+        };
+        self.snapshot.connection = ConnectionState::Degraded;
+        if !self.snapshot.warnings.iter().any(|warning| warning == code) {
+            self.snapshot.warnings.push(code.into());
+        }
+        self.diagnostics.retain(|item| item.code != "ready");
+        if !self.diagnostics.iter().any(|item| item.code == code) {
+            self.diagnostics.push(DiagnosticItem {
+                code: code.into(),
+                message: message.into(),
+                healthy: false,
+            });
+        }
+    }
+
     pub fn new(snapshot: DaemonSnapshot, diagnostics: Vec<DiagnosticItem>) -> Self {
         Self {
+            registry_status: None,
             connection_storage: None,
             snapshot,
             diagnostics,
@@ -767,6 +803,7 @@ impl DaemonState {
         diagnostics: Vec<DiagnosticItem>,
     ) -> Self {
         Self {
+            registry_status: None,
             connection_storage: None,
             snapshot,
             diagnostics,
@@ -787,6 +824,7 @@ impl DaemonState {
         autostart_adapter: Arc<dyn AutostartAdapter>,
     ) -> Self {
         Self {
+            registry_status: None,
             connection_storage: None,
             snapshot,
             diagnostics,
@@ -1046,6 +1084,7 @@ impl DaemonState {
 
     pub fn handle(&mut self, request: LocalRequest) -> Result<LocalResponse, LocalProtocolError> {
         request.validate()?;
+        self.refresh_registry_status();
         match request {
             LocalRequest::Status { .. } => Ok(LocalResponse::Snapshot(self.snapshot.clone())),
             LocalRequest::ConnectionSettings { .. } => Ok(LocalResponse::ConnectionSettings {
@@ -1117,6 +1156,7 @@ impl DaemonState {
         session: &AuthenticatedTargetSession,
     ) -> Result<LocalResponse, LocalProtocolError> {
         request.validate()?;
+        self.refresh_registry_status();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| LocalProtocolError::Io)?
@@ -1756,6 +1796,84 @@ mod inventory_generation_tests {
             },
             vec![],
         )))
+    }
+
+    #[test]
+    fn stopped_controller_refreshes_authenticated_requests_without_duplicate_diagnostics() {
+        use crate::registry_runtime::{
+            RegistryRecoveryPolicy, RegistryRuntime, RegistryRuntimeConfig,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let transport = Arc::new(
+            SecureTransport::load_or_create(root.path().join("identity"), "controller").unwrap(),
+        );
+        let mut runtime = RegistryRuntime::start(RegistryRuntimeConfig {
+            listener: std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            transport,
+            state_root: root.path().join("state"),
+            offline_after: Duration::from_secs(10),
+            agent_peers: Default::default(),
+            recovery_policy: RegistryRecoveryPolicy::Reject,
+        })
+        .unwrap();
+        let state = state();
+        {
+            let mut daemon = state.lock().unwrap();
+            daemon.diagnostics.push(DiagnosticItem {
+                code: "ready".into(),
+                message: "local daemon is ready".into(),
+                healthy: true,
+            });
+            daemon.attach_registry_status(runtime.status());
+        }
+        runtime.shutdown().unwrap();
+        let session = AuthenticatedTargetSession::issue(HostId::parse("controller").unwrap());
+        let mut daemon = state.lock().unwrap();
+        for _ in 0..3 {
+            let LocalResponse::Snapshot(snapshot) = daemon
+                .handle_authorized(
+                    LocalRequest::Status {
+                        version: LocalProtocolVersion::CURRENT,
+                    },
+                    &session,
+                )
+                .unwrap()
+            else {
+                panic!("expected snapshot");
+            };
+            assert_eq!(snapshot.connection, ConnectionState::Degraded);
+            assert_eq!(
+                snapshot
+                    .warnings
+                    .iter()
+                    .filter(|code| code.as_str() == "registry_listener_stopped")
+                    .count(),
+                1
+            );
+            let LocalResponse::Diagnostics(diagnostics) = daemon
+                .handle_authorized(
+                    LocalRequest::Diagnostics {
+                        version: LocalProtocolVersion::CURRENT,
+                    },
+                    &session,
+                )
+                .unwrap()
+            else {
+                panic!("expected diagnostics");
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|item| item.code == "registry_listener_stopped" && !item.healthy)
+                    .count(),
+                1
+            );
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|item| item.code == "ready" && item.healthy)
+            );
+        }
     }
 
     fn config() -> RemoteExecutionConfig {

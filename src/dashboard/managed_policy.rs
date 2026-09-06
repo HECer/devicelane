@@ -173,13 +173,9 @@ fn ensure_restrictive_file(
 pub(crate) fn windows_acl_is_restrictive(path: &Path, configured: &HashSet<String>) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    };
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-        DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID,
+        ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     };
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut owner: PSID = std::ptr::null_mut();
@@ -197,9 +193,63 @@ pub(crate) fn windows_acl_is_restrictive(path: &Path, configured: &HashSet<Strin
             &mut descriptor,
         )
     };
-    if status != 0 || owner.is_null() || descriptor.is_null() {
-        return false;
+    let safe = status == 0
+        && !owner.is_null()
+        && !descriptor.is_null()
+        && windows_descriptor_acl_is_restrictive(owner, dacl, configured);
+    if !descriptor.is_null() {
+        unsafe { LocalFree(descriptor as _) };
     }
+    safe
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_file_acl_is_restrictive(
+    file: &std::fs::File,
+    configured: &HashSet<String>,
+) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    let safe = status == 0
+        && !owner.is_null()
+        && !descriptor.is_null()
+        && windows_descriptor_acl_is_restrictive(owner, dacl, configured);
+    if !descriptor.is_null() {
+        unsafe { LocalFree(descriptor as _) };
+    }
+    safe
+}
+
+#[cfg(windows)]
+fn windows_descriptor_acl_is_restrictive(
+    owner: windows_sys::Win32::Security::PSID,
+    dacl: *mut windows_sys::Win32::Security::ACL,
+    configured: &HashSet<String>,
+) -> bool {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation, GetAce, GetAclInformation,
+    };
     let mut text = std::ptr::null_mut();
     let converted = unsafe { ConvertSidToStringSidW(owner, &mut text) };
     let owner_sid = if converted == 0 || text.is_null() {
@@ -216,11 +266,9 @@ pub(crate) fn windows_acl_is_restrictive(path: &Path, configured: &HashSet<Strin
         unsafe { LocalFree(text as _) };
     }
     let Some(current_user_sid) = current_process_user_sid() else {
-        unsafe { LocalFree(descriptor as _) };
         return false;
     };
     if !acl_owner_allowed(&owner_sid, &current_user_sid, configured) {
-        unsafe { LocalFree(descriptor as _) };
         return false;
     }
     let mut allowed = configured.clone();
@@ -262,7 +310,6 @@ pub(crate) fn windows_acl_is_restrictive(path: &Path, configured: &HashSet<Strin
             }
         }
     }
-    unsafe { LocalFree(descriptor as _) };
     safe
 }
 
@@ -351,6 +398,69 @@ mod windows_acl_tests {
         acl_owner_allowed, acl_writer_allowed, has_policy_write_rights, is_allow_ace_type,
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn opened_file_acl_validation_tracks_the_handle_after_path_replacement() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let permissive = |path: &std::path::Path| {
+            let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            assert_eq!(
+                unsafe {
+                    SetNamedSecurityInfoW(
+                        wide.as_mut_ptr(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+        };
+        for original_private in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("owned");
+            crate::dashboard::audit::create_private_dir(&directory).unwrap();
+            let path = directory.join("original");
+            crate::dashboard::audit::write_private_atomic(&path, b"original file").unwrap();
+            if !original_private {
+                permissive(&path);
+            }
+            assert_eq!(
+                super::windows_acl_is_restrictive(&path, &HashSet::new()),
+                original_private
+            );
+            // Rust's ordinary file open retains share-delete, matching the
+            // registry file-sharing contract and allowing this owned rename.
+            let file = std::fs::File::open(&path).unwrap();
+            assert_eq!(
+                super::windows_file_acl_is_restrictive(&file, &HashSet::new()),
+                original_private
+            );
+            let retained = directory.join("retained");
+            std::fs::rename(&path, &retained).unwrap();
+            crate::dashboard::audit::write_private_atomic(&path, b"replacement file").unwrap();
+            if original_private {
+                permissive(&path);
+            }
+            assert_eq!(
+                super::windows_acl_is_restrictive(&path, &HashSet::new()),
+                !original_private
+            );
+            assert_eq!(
+                super::windows_file_acl_is_restrictive(&file, &HashSet::new()),
+                original_private,
+                "opened-file ACL validation followed the replacement pathname"
+            );
+            assert_eq!(std::fs::read(retained).unwrap(), b"original file");
+        }
+    }
 
     #[test]
     fn dangerous_well_known_and_foreign_writers_are_never_implicit_admins() {

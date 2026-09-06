@@ -27,4 +27,5 @@
 .yoke/decision-*.yaml.*.tmp
 .yoke/story-durations.json
 .yoke/proof/
+.yoke/events/
 .yoke/context/DECISIONS.md

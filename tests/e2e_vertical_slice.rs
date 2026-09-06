@@ -1,9 +1,10 @@
 use serde_json::Value;
+use std::io::Read;
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn real_vertical_slice_resumes_without_reexecution_and_survives_registry_restart() {
@@ -109,6 +110,7 @@ fn pair_process(
     registry_identity: &std::path::Path,
     peer_identity: &std::path::Path,
 ) {
+    let deadline = Instant::now() + Duration::from_secs(5);
     let pairing_address = free_address();
     let mut pairing_server = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_mesh-registry"))
@@ -122,22 +124,139 @@ fn pair_process(
             .spawn()
             .unwrap(),
     );
-    let pairing = Command::new(binary)
-        .args([
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        assert!(
+            Instant::now() < deadline,
+            "pairing deadline: client={binary}, attempt={attempt}"
+        );
+        assert!(
+            pairing_server.try_wait().unwrap().is_none(),
+            "pairing server exited before client={binary}, attempt={attempt}"
+        );
+        let mut command = Command::new(binary);
+        command.args([
             "pair",
             "--address",
             &pairing_address,
             "--identity",
             peer_identity.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        pairing.status.success(),
-        "{}",
-        String::from_utf8_lossy(&pairing.stderr)
-    );
-    assert!(pairing_server.wait().unwrap().success());
+        ]);
+        let pairing = bounded_pairing_output(&mut command, deadline);
+        if pairing.status.success() {
+            break;
+        }
+        let server_status = pairing_server.try_wait();
+        let retryable = binary == env!("CARGO_BIN_EXE_mesh-agent")
+            && pairing.status.code() == Some(1)
+            && pairing.stdout.is_empty()
+            && serde_json::from_slice::<Value>(&pairing.stderr).ok()
+                == Some(serde_json::json!({"error": "connection_unavailable"}))
+            && matches!(&server_status, Ok(None));
+        assert!(
+            retryable && Instant::now() < deadline,
+            "pairing client={binary}, identity={}, status={}, server_status={server_status:?}, attempt={attempt}, stderr={}",
+            peer_identity.display(),
+            pairing.status,
+            String::from_utf8_lossy(&pairing.stderr)
+        );
+        // Backoff only after a real pre-protocol refusal, not a readiness proof.
+        thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "pairing server did not exit within deadline: client={binary}"
+        );
+        if let Some(status) = pairing_server.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "pairing server failed: client={binary}, status={status}"
+            );
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+struct PairingOutput {
+    child: ChildGuard,
+    readers: Vec<thread::JoinHandle<(Vec<u8>, bool)>>,
+}
+
+impl Drop for PairingOutput {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn bounded_pairing_output(command: &mut Command, deadline: Instant) -> std::process::Output {
+    fn drain(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<(Vec<u8>, bool)> {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut overflow = false;
+            let mut chunk = [0; 4096];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let keep = count.min((64 * 1024usize).saturating_sub(bytes.len()));
+                        overflow |= keep != count;
+                        bytes.extend_from_slice(&chunk[..keep]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("pairing output read failed: {error}"),
+                }
+            }
+            (bytes, overflow)
+        })
+    }
+    let mut output = PairingOutput {
+        child: ChildGuard(
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        ),
+        readers: Vec::new(),
+    };
+    output
+        .readers
+        .push(drain(output.child.stdout.take().unwrap()));
+    output
+        .readers
+        .push(drain(output.child.stderr.take().unwrap()));
+    let status = loop {
+        assert!(
+            Instant::now() < deadline,
+            "pairing client exceeded deadline: {command:?}"
+        );
+        if let Some(status) = output.child.try_wait().unwrap() {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    let mut captured = Vec::new();
+    while !output.readers.is_empty() {
+        let reader = output.readers.remove(0);
+        let (bytes, overflow) = reader.join().unwrap();
+        assert!(!overflow, "pairing output exceeded 64 KiB capture bound");
+        captured.push(bytes);
+    }
+    std::process::Output {
+        status,
+        stdout: captured.remove(0),
+        stderr: captured.remove(0),
+    }
 }
 
 fn cli(

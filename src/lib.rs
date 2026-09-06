@@ -6721,3 +6721,5 @@ pub mod dashboard;
 pub mod local_ipc;
 pub mod mac_bootstrap;
 pub mod registry_event_store;
+pub mod registry_runtime;
+pub mod state_paths;

@@ -1071,29 +1071,38 @@ fn failed_decision_checkpoint_keeps_pending_policy_and_activity_unchanged() {
 #[test]
 #[cfg(windows)]
 fn slow_client_cannot_block_a_second_named_pipe_client() {
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let pipe = format!(r"\\.\pipe\devicelane-slow-{}", std::process::id());
     let temp = tempfile::tempdir().unwrap();
     let identity = temp.path().join("identity");
     let logs = temp.path().join("logs");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
-        .args([
-            "--identity",
-            identity.to_str().unwrap(),
-            "--runtime-dir",
-            temp.path().to_str().unwrap(),
-            "--role",
-            "workstation",
-            "--registry",
-            "registry:7443",
-            "--listen",
-            &pipe,
-            "--agent-peer",
-            "agent",
-            "--log-dir",
-            logs.to_str().unwrap(),
-        ])
-        .spawn()
-        .unwrap();
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+            .args([
+                "--identity",
+                identity.to_str().unwrap(),
+                "--runtime-dir",
+                temp.path().to_str().unwrap(),
+                "--role",
+                "workstation",
+                "--registry",
+                "registry:7443",
+                "--listen",
+                &pipe,
+                "--agent-peer",
+                "agent",
+                "--log-dir",
+                logs.to_str().unwrap(),
+            ])
+            .spawn()
+            .unwrap(),
+    );
     let endpoint = device_development_mesh::local_ipc::LocalEndpoint::NamedPipe(pipe);
     let request = LocalRequest::Status {
         version: LocalProtocolVersion::CURRENT,
@@ -1113,9 +1122,9 @@ fn slow_client_cannot_block_a_second_named_pipe_client() {
     ));
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     drop(slow);
-    assert!(child.try_wait().unwrap().is_none());
-    child.kill().unwrap();
-    child.wait().unwrap();
+    assert!(child.0.try_wait().unwrap().is_none());
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
 }
 
 #[test]

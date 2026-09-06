@@ -1,6 +1,6 @@
 # Daemon-owned controller runtime
 
-Status: Implementation contract, not an implemented or deployable controller.
+Status: Runtime implementation in progress; first seeded-trust service/TLS test passes on Windows. Not a deployable or fully verified controller.
 
 This is the runtime prerequisite of `2026-09-06-daemon-pairing-session-design.md`, within the approved autonomous Desktop/CLI product scope. It does not replace the full pairing, persistence, policy or native-host acceptance gates.
 
@@ -64,6 +64,9 @@ An `unknown argument --registry-listen` baseline exit proves absent configured-c
 - Clean-worktree Windows baseline: 14 registry unit tests, 6 local CLI tests and 13 secure-transport tests passed (33 total).
 - The latest hosted CI passed macOS, Ubuntu and npm jobs. Its Windows job failed two `remote_apple_e2e` tests: inventory became stale during execution, and lease validation reported a response timeout. The new runtime discovery tests passed there.
 - The same clean source passed all three active `remote_apple_e2e` tests locally in 15.34 seconds; two subprocess-fixture tests were correctly ignored. This does not resolve the intermittent hosted failures or establish their cause.
-- No production source has changed for this runtime yet. Existing installed services and keys have not been modified.
+- At the baseline/RED checkpoint no production source had changed. The current worktree now contains the in-process runtime extraction and service integration; existing installed services and keys have not been modified.
+- First controller test compiled and failed behaviorally on Windows after private runtime/log fixture preparation: one failed test in 1.34 seconds, service exit 2, `unknown argument: --registry-listen`. Its scoped Clippy check with warnings denied passed. The expected TLS/inventory success path has not executed yet.
+- Independent specification review and the subsequent quality review passed the corrected first-test fixture; the quality review found no actionable P1/P2 issues. These are static test reviews, not success-path or cross-platform runtime proof. Runtime implementation and its full specification/quality reviews remain outstanding.
+- The first implementation compiled but the Windows TLS handshake failed. Explicitly restoring blocking mode on sockets accepted by the nonblocking listener made the unchanged service test pass: one passed test in 1.84 seconds. The real service presented the exact seeded certificate, returned accepted normal inventory and preserved certificate/key bytes. Startup/lifecycle edge tests and full compatibility review remain outstanding.
 
 Provenance: AI-assisted design and test contract based on inspected committed source and independent architecture review. No human-authorship or security-certification claim.

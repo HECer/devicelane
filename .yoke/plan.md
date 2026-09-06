@@ -1,5 +1,32 @@
 # Device Development Mesh – Systemdesign und Masterplan
 
+## Active handoff: controller runtime, 2026-09-06
+
+AI-assisted implementation checkpoint, not a release or completion claim.
+The approved next Yoke task is STORY-37: truthful failure supervision for registry
+workers. Use the existing runtime design and plan in docs/superpowers/ as context.
+Preserve all credentials, installed binaries, configuration and autostart; do not
+deploy, migrate trust or claim native Mac verification in this task.
+
+Current evidence: the malformed-Run rejection and test-fixture corrections passed
+independent scoped specification/quality review. The latest Windows and Linux runs
+each passed 8 daemon-controller tests, 1 vertical-slice test and 4 runtime tests.
+The Linux library run passed 87 tests; the Windows library run passed 110 tests.
+These are scoped checks, not a full workspace or release gate.
+
+The local checkpoint retains unfinished runtime work so isolated Yoke workers can
+continue from the real source state. STORY-37 must first demonstrate a failing
+behavioral regression, then implement and independently review the correction.
+Do not weaken the existing workspace verification command to make it green.
+
+The full product objective remains open: secure live pairing and revocation,
+controller inventory/UI integration, resource/activity visibility, approvals,
+policies and audit, desktop/CLI parity, Windows/macOS/Linux packaging and autostart,
+and actual Windows/Mac UI and native build end-to-end verification. The historical
+hardware story is retained and must not pass from mocks or simulator evidence.
+After this bounded runtime task, reconcile the full remaining backlog against the
+current design and actual source before claiming that all product work is queued.
+
 Stand: 2026-07-30  
 Status: Phase 1 verifiziert; Phase 2 (Mac/iOS) in Umsetzung
 

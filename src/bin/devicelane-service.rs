@@ -12,9 +12,17 @@ use device_development_mesh::local_ipc::{
     RemoteExecutionConfig, local_endpoint, platform_autostart_enabled, serve_local,
     start_registry_inventory_observer, validate_state_paths,
 };
+use device_development_mesh::registry_runtime::{
+    RegistryRecoveryPolicy, RegistryRuntime, RegistryRuntimeConfig,
+};
+use device_development_mesh::secure_transport::SecureTransport;
+use device_development_mesh::state_paths::{
+    prepare_private_state_directory, validate_private_state_directory,
+};
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Default)]
 struct Args {
@@ -22,8 +30,9 @@ struct Args {
     runtime_dir: PathBuf,
     role: String,
     registry: String,
+    registry_listen: Option<SocketAddr>,
     listen: String,
-    agent_peer: String,
+    agent_peers: Vec<String>,
     log_dir: PathBuf,
     foreground: bool,
     managed_policy: Option<PathBuf>,
@@ -47,8 +56,11 @@ fn parse_args() -> Result<Args, String> {
             "--runtime-dir" => parsed.runtime_dir = value.into(),
             "--role" => parsed.role = value,
             "--registry" => parsed.registry = value,
+            "--registry-listen" => {
+                parsed.registry_listen = Some(registry_listener_address(&value)?)
+            }
             "--listen" => parsed.listen = value,
-            "--agent-peer" => parsed.agent_peer = value,
+            "--agent-peer" => parsed.agent_peers.push(value),
             "--log-dir" => parsed.log_dir = value.into(),
             "--managed-policy" => parsed.managed_policy = Some(value.into()),
             "--policy-admin-trust" => parsed.policy_admin_trust = Some(value.into()),
@@ -59,9 +71,17 @@ fn parse_args() -> Result<Args, String> {
     if parsed.role.is_empty() {
         return Err("--role is required".into());
     }
-    if parsed.role != "workstation" && (parsed.registry.is_empty() || parsed.agent_peer.is_empty())
-    {
+    if !matches!(parsed.role.as_str(), "workstation" | "agent" | "registry") {
+        return Err("invalid --role".into());
+    }
+    if parsed.role == "agent" && (parsed.registry.is_empty() || parsed.agent_peers.is_empty()) {
         return Err("--registry and --agent-peer are required for remote roles".into());
+    }
+    if parsed.role == "registry" && parsed.registry_listen.is_none() {
+        return Err("--registry-listen is required for the registry role".into());
+    }
+    if parsed.role != "registry" && parsed.registry_listen.is_some() {
+        return Err("--registry-listen requires the registry role".into());
     }
     if parsed.managed_policy.is_some() != parsed.policy_admin_trust.is_some() {
         return Err("--managed-policy and --policy-admin-trust must be configured together".into());
@@ -75,29 +95,119 @@ fn parse_args() -> Result<Args, String> {
     Ok(parsed)
 }
 
+fn registry_listener_address(value: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| "invalid --registry-listen".to_owned())?;
+    let allowed_v4 =
+        |ip: std::net::Ipv4Addr| ip.is_loopback() || ip.is_private() || ip.is_link_local();
+    let allowed = match address {
+        SocketAddr::V4(address) => allowed_v4(*address.ip()),
+        SocketAddr::V6(address) => {
+            let ip = address.ip();
+            if let Some(ipv4) = ip.to_ipv4_mapped() {
+                allowed_v4(ipv4)
+            } else {
+                ip.is_loopback()
+                    || ip.is_unique_local()
+                    || (ip.is_unicast_link_local() && address.scope_id() != 0)
+            }
+        }
+    };
+    allowed
+        .then_some(address)
+        .ok_or_else(|| "--registry-listen requires a numeric private or loopback address".into())
+}
+
 fn run() -> Result<(), String> {
-    let args = parse_args()?;
-    // State path validation deliberately precedes endpoint creation/binding.
-    let endpoint =
-        local_endpoint(&args.runtime_dir, &args.listen).map_err(|error| error.to_string())?;
+    let mut args = parse_args()?;
+    // Resolve all selected directories read-only before any endpoint preparation
+    // or state mutation, retaining the resolved paths for every later consumer.
+    args.identity =
+        validate_private_state_directory(&args.identity).map_err(|error| error.to_string())?;
+    args.runtime_dir =
+        validate_private_state_directory(&args.runtime_dir).map_err(|error| error.to_string())?;
+    args.log_dir =
+        validate_private_state_directory(&args.log_dir).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    if !args.listen.is_empty() {
+        let requested = std::path::Path::new(&args.listen);
+        let parent = requested.parent().ok_or("invalid local endpoint")?;
+        if !requested.is_absolute()
+            || validate_private_state_directory(parent).map_err(|error| error.to_string())?
+                != args.runtime_dir
+        {
+            return Err("invalid local endpoint".into());
+        }
+        args.listen = args
+            .runtime_dir
+            .join(requested.file_name().ok_or("invalid local endpoint")?)
+            .to_str()
+            .ok_or("invalid local endpoint")?
+            .to_owned();
+    }
+    #[cfg(windows)]
+    local_endpoint(&args.runtime_dir, &args.listen).map_err(|error| error.to_string())?;
     let role = match args.role.as_str() {
         "workstation" => DaemonRole::Workstation,
         "agent" => DaemonRole::Agent,
         "registry" => DaemonRole::Registry,
         _ => return Err("invalid --role".into()),
     };
-    let public_identity = args
-        .identity
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("devicelane")
-        .to_owned();
+    // Reserve the normal endpoint before identity creation or store writes.
+    let registry_listener = args
+        .registry_listen
+        .map(TcpListener::bind)
+        .transpose()
+        .map_err(|error| format!("cannot bind registry listener: {error}"))?;
+    args.identity =
+        prepare_private_state_directory(&args.identity).map_err(|error| error.to_string())?;
+    args.runtime_dir =
+        prepare_private_state_directory(&args.runtime_dir).map_err(|error| error.to_string())?;
+    args.log_dir =
+        prepare_private_state_directory(&args.log_dir).map_err(|error| error.to_string())?;
+    let endpoint =
+        local_endpoint(&args.runtime_dir, &args.listen).map_err(|error| error.to_string())?;
+    let registry_transport = registry_listener
+        .as_ref()
+        .map(|_| {
+            SecureTransport::load_or_create(&args.identity, "registry")
+                .map(Arc::new)
+                .map_err(|error| format!("cannot load registry identity: {error:?}"))
+        })
+        .transpose()?;
+    let public_identity = if let Some(transport) = &registry_transport {
+        transport
+            .identity_id()
+            .map_err(|error| format!("invalid registry identity: {error:?}"))?
+    } else {
+        args.identity
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("devicelane")
+            .to_owned()
+    };
     let local_host_id =
         HostId::parse(public_identity.clone()).map_err(|error| error.to_string())?;
     let connection = if args.registry.is_empty() {
         ConnectionConfig::load(&args.identity)
     } else {
         ConnectionConfig::new(&args.registry, "registry").map(Some)
+    };
+    // This first slice serves seeded normal trust only; it does not advertise pairing.
+    let _registry_runtime = match (registry_listener, registry_transport) {
+        (Some(listener), Some(transport)) => Some(
+            RegistryRuntime::start(RegistryRuntimeConfig {
+                listener,
+                transport,
+                state_root: args.identity.join("registry-state"),
+                offline_after: Duration::from_secs(10),
+                agent_peers: args.agent_peers.iter().cloned().collect(),
+                recovery_policy: RegistryRecoveryPolicy::Reject,
+            })
+            .map_err(|error| format!("cannot start registry: {error}"))?,
+        ),
+        _ => None,
     };
     let mut diagnostics = vec![DiagnosticItem {
         code: "ready".into(),
@@ -198,6 +308,12 @@ fn run() -> Result<(), String> {
         });
     }
     let state = Arc::new(Mutex::new(daemon_state));
+    if let Some(runtime) = &_registry_runtime {
+        state
+            .lock()
+            .map_err(|_| "daemon state lock poisoned".to_owned())?
+            .attach_registry_status(runtime.status());
+    }
     start_registry_inventory_observer(&state);
     if args.foreground {
         eprintln!("devicelane-service: listening on {}", args.listen);
