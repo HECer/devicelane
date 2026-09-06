@@ -1197,20 +1197,33 @@ pub mod secure_transport {
             secure_directory(&root.join("trust"))?;
             let certificate_path = root.join("certificate.der");
             let key_path = root.join("private-key.der");
-            let (certificate, private_key) = if certificate_path.exists() && key_path.exists() {
-                (
-                    fs::read(&certificate_path).map_err(|_| TransportError::Io)?,
-                    fs::read(&key_path).map_err(|_| TransportError::Io)?,
-                )
-            } else {
-                let generated = rcgen::generate_simple_self_signed(vec![id.clone()])
-                    .map_err(|_| TransportError::InvalidCertificate)?;
-                let certificate = generated.cert.der().to_vec();
-                let private_key = generated.key_pair.serialize_der();
-                write_secret(&certificate_path, &certificate)?;
-                write_secret(&key_path, &private_key)?;
-                (certificate, private_key)
+            let (certificate, private_key) = match (
+                read_identity_file(&certificate_path)?,
+                read_identity_file(&key_path)?,
+            ) {
+                (Some(certificate), Some(private_key)) => (certificate, private_key),
+                (None, None) => {
+                    let generated = rcgen::generate_simple_self_signed(vec![id.clone()])
+                        .map_err(|_| TransportError::InvalidCertificate)?;
+                    let certificate = generated.cert.der().to_vec();
+                    let private_key = generated.key_pair.serialize_der();
+                    create_identity_file(&certificate_path, &certificate)?;
+                    create_identity_file(&key_path, &private_key)?;
+                    (certificate, private_key)
+                }
+                _ => return Err(TransportError::InvalidCertificate),
             };
+            // Both files may exist after an interrupted write or a competing
+            // creator. Parse them and require a proven certificate/key match
+            // before exposing this identity, without modifying either file.
+            let provider = ServerConfig::builder().crypto_provider().clone();
+            rustls::sign::CertifiedKey::from_der(
+                vec![CertificateDer::from(certificate.clone())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key.clone())),
+                &provider,
+            )
+            .and_then(|identity| identity.keys_match())
+            .map_err(|_| TransportError::InvalidCertificate)?;
             let mut trusted = HashMap::new();
             for entry in fs::read_dir(root.join("trust")).map_err(|_| TransportError::Io)? {
                 let entry = entry.map_err(|_| TransportError::Io)?;
@@ -1520,6 +1533,108 @@ pub mod secure_transport {
                     })
             })
             .ok_or(TransportError::InvalidCertificate)
+    }
+
+    fn read_identity_file(path: &Path) -> Result<Option<Vec<u8>>, TransportError> {
+        use std::io::Read;
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(TransportError::Io),
+        };
+        if !identity_file_is_regular(&metadata) {
+            return Err(TransportError::Io);
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = options.open(path).map_err(|_| TransportError::Io)?;
+        if !identity_file_is_regular(&file.metadata().map_err(|_| TransportError::Io)?) {
+            return Err(TransportError::Io);
+        }
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .map_err(|_| TransportError::Io)?;
+        Ok(Some(contents))
+    }
+
+    fn identity_file_is_regular(metadata: &fs::Metadata) -> bool {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return false;
+            }
+        }
+        metadata.file_type().is_file()
+    }
+
+    #[cfg(test)]
+    mod identity_creation_tests {
+        use super::*;
+
+        #[test]
+        fn credential_creation_collision_preserves_existing_bytes() {
+            let directory = tempfile::tempdir().unwrap();
+            for name in ["certificate.der", "private-key.der"] {
+                let path = directory.path().join(name);
+                assert!(!path.exists());
+                // A competing creator wins after the caller checked absence.
+                fs::write(&path, b"original credential").unwrap();
+                let result = create_identity_file(&path, b"replacement credential");
+                assert_eq!(result, Err(TransportError::Io));
+                assert_eq!(fs::read(&path).unwrap(), b"original credential");
+            }
+        }
+
+        #[test]
+        fn failed_second_credential_write_does_not_regenerate_first_on_reload() {
+            let directory = tempfile::tempdir().unwrap();
+            let certificate_path = directory.path().join("certificate.der");
+            let key_path = directory.path().join("private-key.der");
+            let generated = rcgen::generate_simple_self_signed(vec!["host".to_owned()]).unwrap();
+            let certificate = generated.cert.der().to_vec();
+            create_identity_file(&certificate_path, &certificate).unwrap();
+            // A nonregular path appearing between the two writes forces failure.
+            fs::create_dir(&key_path).unwrap();
+            assert_eq!(
+                create_identity_file(&key_path, &generated.key_pair.serialize_der()),
+                Err(TransportError::Io)
+            );
+            fs::remove_dir(&key_path).unwrap();
+            assert!(SecureTransport::load_or_create(directory.path(), "host").is_err());
+            assert_eq!(fs::read(&certificate_path).unwrap(), certificate);
+            assert!(!key_path.exists());
+        }
+    }
+
+    // Initial identity writes must never replace a credential, including when a
+    // competing creator wins after the absence check. Partial writes stay put
+    // so the next load fails closed instead of silently rotating the identity.
+    fn create_identity_file(path: &Path, contents: &[u8]) -> Result<(), TransportError> {
+        use std::io::Write;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path).map_err(|_| TransportError::Io)?;
+        #[cfg(windows)]
+        restrict_windows_path(path)?;
+        file.write_all(contents).map_err(|_| TransportError::Io)
     }
 
     fn write_secret(path: &Path, contents: &[u8]) -> Result<(), TransportError> {
