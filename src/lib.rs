@@ -1119,6 +1119,7 @@ pub mod identity {
 }
 
 pub mod secure_transport {
+    pub mod pairing_tls;
     use rand::{RngCore, rngs::OsRng};
     use ring::{rand::SystemRandom, signature};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
