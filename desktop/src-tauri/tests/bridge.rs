@@ -27,6 +27,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "support/registry_diagnostics.rs"]
+mod support_registry_diagnostics;
+
 struct FakeTransport {
     requests: Arc<Mutex<Vec<LocalRequest>>>,
     response: LocalResponse,
@@ -653,7 +656,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
             .as_str(),
         activity_id
     );
-    let running = wait_for_activity(&bridge, activity_id, "running");
+    let running = wait_for_activity(&bridge, activity_id, "running", &registry_identity);
     assert_eq!(
         running
             .activities
@@ -789,7 +792,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     ));
     registry.kill().unwrap();
     registry.wait().unwrap();
-    wait_for_activity(&bridge, activity_id, "reconnecting");
+    wait_for_activity(&bridge, activity_id, "reconnecting", &registry_identity);
     registry = spawn(
         &workspace_binary("mesh-registry"),
         &[
@@ -806,7 +809,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     wait_for_mesh_host(&registry_address, &service_identity, "mac-agent");
 
     std::fs::write(&install_gate, b"release").unwrap();
-    let terminal = wait_for_activity(&bridge, activity_id, "succeeded");
+    let terminal = wait_for_activity(&bridge, activity_id, "succeeded", &registry_identity);
     assert_eq!(
         terminal
             .activities
@@ -922,20 +925,32 @@ fn wait_for_activity(
     bridge: &DesktopBridge<EndpointTransport>,
     activity_id: &str,
     expected: &str,
+    registry_identity: &Path,
 ) -> DashboardSnapshot {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let snapshot = bridge.dashboard_snapshot(DashboardScope::Mesh).unwrap();
-        if snapshot.activities.iter().any(|activity| {
-            activity.activity_id.as_str() == activity_id
-                && format!("{:?}", activity.state).eq_ignore_ascii_case(expected)
-        }) {
-            return snapshot;
+        if let Some(activity) = snapshot
+            .activities
+            .iter()
+            .find(|activity| activity.activity_id.as_str() == activity_id)
+        {
+            if format!("{:?}", activity.state).eq_ignore_ascii_case(expected) {
+                return snapshot;
+            }
+            if support_registry_diagnostics::unexpected_terminal(activity.state, expected) {
+                panic!(
+                    "unexpected terminal state waiting for {expected}; {}; last snapshot: {snapshot:?}",
+                    support_registry_diagnostics::registry_diagnostics(registry_identity),
+                );
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {expected}; last snapshot: {snapshot:?}"
-        );
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {expected}; {}; last snapshot: {snapshot:?}",
+                support_registry_diagnostics::registry_diagnostics(registry_identity),
+            );
+        }
         thread::sleep(Duration::from_millis(25));
     }
 }
