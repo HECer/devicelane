@@ -190,6 +190,81 @@ describe("DeviceLane desktop foundation", () => {
     expect(client.repair).toHaveBeenCalledOnce();
   });
 
+  it("keeps a failed offline repair visible despite background polling failures", async () => {
+    const user = userEvent.setup();
+    const client = fakeClient({
+      status: vi.fn().mockRejectedValue(new Error("offline")),
+      repair: vi.fn().mockRejectedValue(new Error("repair failed")),
+      pendingApprovals: vi.fn().mockRejectedValue(new Error("poll failed")),
+      policyRules: vi.fn().mockRejectedValue(new Error("poll failed")),
+    });
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole("button", { name: "Dienst reparieren" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveAttribute("aria-live", "assertive");
+    expect(alert).toHaveTextContent("repair failed");
+  });
+
+  it("preserves a repair error when a background poll rejects after the repair fails", async () => {
+    const user = userEvent.setup();
+    let rejectPoll!: (reason: Error) => void;
+    const client = fakeClient({
+      status: vi.fn().mockRejectedValue(new Error("offline")),
+      repair: vi.fn().mockRejectedValue(new Error("repair failed")),
+      pendingApprovals: vi.fn(() => new Promise<ApprovalRequest[]>((_, reject) => { rejectPoll = reject; })),
+    });
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole("button", { name: "Dienst reparieren" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("repair failed");
+    await act(async () => { rejectPoll(new Error("poll failed later")); });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("repair failed");
+  });
+
+  it("clears a repair error while retrying and recovers after a successful status refresh", async () => {
+    const user = userEvent.setup();
+    let resolveRepair!: () => void;
+    const repair = vi.fn()
+      .mockRejectedValueOnce("first repair failed")
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { resolveRepair = resolve; }));
+    const status = vi.fn()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(new Error("still offline"))
+      .mockResolvedValue(connected);
+    render(<App client={fakeClient({ status, repair })} />);
+
+    const button = await screen.findByRole("button", { name: "Dienst reparieren" });
+    await user.click(button);
+    expect(await screen.findByRole("alert")).toHaveTextContent("first repair failed");
+
+    await user.click(button);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(button).toBeDisabled();
+    await act(async () => { resolveRepair(); });
+
+    expect(await screen.findByRole("heading", { name: "Geräteübersicht" })).toBeVisible();
+    expect(screen.queryByText("first repair failed")).not.toBeInTheDocument();
+  });
+
+  it("reenables offline repair after a later repair failure", async () => {
+    const user = userEvent.setup();
+    const repair = vi.fn()
+      .mockRejectedValueOnce(new Error("first repair failed"))
+      .mockRejectedValueOnce(new Error("second repair failed"));
+    render(<App client={fakeClient({ status: vi.fn().mockRejectedValue(new Error("offline")), repair })} />);
+
+    const button = await screen.findByRole("button", { name: "Dienst reparieren" });
+    await user.click(button);
+    expect(await screen.findByRole("alert")).toHaveTextContent("first repair failed");
+    await user.click(button);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("second repair failed");
+    expect(button).toBeEnabled();
+  });
+
   it("keeps every interactive control keyboard reachable with a visible semantic name", async () => {
     const user = userEvent.setup();
     render(<App client={fakeClient()} />);

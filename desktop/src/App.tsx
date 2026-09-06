@@ -28,6 +28,8 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
   const [diagnostics, setDiagnostics] = useState<Awaited<ReturnType<DaemonClient["diagnostics"]>>["items"]>([]);
   const [busy, setBusy] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [repairError, setRepairError] = useState("");
+  const [repairPending, setRepairPending] = useState(false);
   const [streamError, setStreamError] = useState("");
   const [scope, setScope] = useState<DashboardScope>("local");
   const scopeRef = useRef<DashboardScope>(scope);
@@ -293,6 +295,19 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
     }
   };
 
+  const repair = async () => {
+    setRepairError("");
+    setRepairPending(true);
+    try {
+      await client.repair();
+    } catch (error) {
+      setRepairError(error instanceof Error ? error.message : String(error));
+    } finally {
+      await refresh();
+      setRepairPending(false);
+    }
+  };
+
   if (unavailable) {
     return (
       <main className="shell shell--centered">
@@ -301,7 +316,8 @@ export function App({ client = tauriDaemonClient }: { client?: DaemonClient }) {
           <p className="eyebrow">Lokaler Dienst</p>
           <h1 id="offline-title" data-pretext>Dienst nicht erreichbar</h1>
           <p data-pretext>DeviceLane kann den Hintergrunddienst nicht erreichen. Deine Identität bleibt dabei erhalten.</p>
-          <button className="primary-action" onClick={() => void run(client.repair)} disabled={busy}>Dienst reparieren</button>
+          {repairError && <p className="error-banner" role="alert" aria-live="assertive">{repairError}</p>}
+          <button className="primary-action" onClick={() => void repair()} disabled={repairPending}>Dienst reparieren</button>
         </section>
       </main>
     );
