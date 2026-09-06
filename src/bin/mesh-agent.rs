@@ -714,9 +714,14 @@ fn validate_lease_with_retry(
     for attempt in 0..3 {
         match validate() {
             Ok(()) => return Ok(()),
-            Err(LeaseValidationError::ConnectUnavailable) => {
+            Err(
+                error @ (LeaseValidationError::ConnectUnavailable
+                | LeaseValidationError::ResponseTimeout),
+            ) => {
+                // Repeat only the current-state lease query, never the device
+                // operation. A server denial on any attempt remains terminal.
                 if attempt == 2 || Instant::now() >= deadline {
-                    return Err(LeaseValidationError::ConnectUnavailable);
+                    return Err(error);
                 }
                 thread::sleep(Duration::from_millis(10));
             }
@@ -1386,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_validation_retries_only_transport_unavailability() {
+    fn lease_validation_retries_only_transient_transport_failures() {
         let mut transient_attempts = 0;
         assert_eq!(
             validate_lease_with_retry(
@@ -1408,7 +1413,6 @@ mod tests {
             LeaseValidationError::InvalidAddress,
             LeaseValidationError::Tls,
             LeaseValidationError::Io,
-            LeaseValidationError::ResponseTimeout,
             LeaseValidationError::Protocol,
             LeaseValidationError::ServerDenied("lease_inactive".into()),
             LeaseValidationError::ServerDenied("lease_validation_unavailable".into()),
@@ -1426,6 +1430,42 @@ mod tests {
             );
             assert_eq!(attempts, 1);
         }
+    }
+
+    #[test]
+    fn lease_validation_response_timeout_is_bounded_and_rechecks_denials() {
+        for final_result in [
+            Ok(()),
+            Err(LeaseValidationError::ResponseTimeout),
+            Err(LeaseValidationError::ServerDenied("lease_inactive".into())),
+        ] {
+            let mut attempts = 0;
+            let result = validate_lease_with_retry(
+                || {
+                    attempts += 1;
+                    if attempts < 3 {
+                        Err(LeaseValidationError::ResponseTimeout)
+                    } else {
+                        final_result.clone()
+                    }
+                },
+                Duration::from_secs(2),
+            );
+            assert_eq!(result, final_result);
+            assert_eq!(attempts, 3);
+        }
+        let mut attempts = 0;
+        assert_eq!(
+            validate_lease_with_retry(
+                || {
+                    attempts += 1;
+                    Err(LeaseValidationError::ResponseTimeout)
+                },
+                Duration::ZERO,
+            ),
+            Err(LeaseValidationError::ResponseTimeout),
+        );
+        assert_eq!(attempts, 1);
     }
 
     #[test]
