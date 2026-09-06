@@ -37,6 +37,7 @@ enum ExternalFailureCase {
     OldAgentOptionalMessage,
     CancellationRace,
     AuditDiskFailure,
+    ArtifactPublication,
 }
 
 impl ExternalFailureCase {
@@ -50,6 +51,7 @@ impl ExternalFailureCase {
             Self::OldAgentOptionalMessage => MessageCode::AgentIncompatible,
             Self::CancellationRace => MessageCode::OperationCancelled,
             Self::AuditDiskFailure => MessageCode::AuditUnavailable,
+            Self::ArtifactPublication => MessageCode::OperationFailed,
         }
     }
 }
@@ -109,6 +111,13 @@ impl MeshRpcBoundary for ScriptedMeshBoundary {
                 _ => Ok(response().accepted_job("job-1")),
             },
             MeshRequest::Events { .. } => match self.case {
+                ExternalFailureCase::ArtifactPublication => {
+                    Ok(response().events(vec![NetworkEvent {
+                        sequence: 1,
+                        kind: "rejected".into(),
+                        payload: "artifact_publish_failed".into(),
+                    }]))
+                }
                 ExternalFailureCase::DisconnectPostauth => {
                     Err(RemoteExecutionFailure::RegistryDisconnected)
                 }
@@ -497,6 +506,7 @@ fn external_failure_matrix_terminates_the_real_worker_with_stable_identity_and_a
         ExternalFailureCase::OverflowResync,
         ExternalFailureCase::StaleLease,
         ExternalFailureCase::OldAgentOptionalMessage,
+        ExternalFailureCase::ArtifactPublication,
     ] {
         let fixture = fixture(case);
         let access = approved_access(&fixture.endpoint, &format!("failure-{case:?}"));
@@ -591,19 +601,21 @@ fn external_failure_matrix_terminates_the_real_worker_with_stable_identity_and_a
             1,
             "{case:?} must release the acquired lease exactly once: {calls:?}"
         );
-        let dispatched = !matches!(
+        let requires_cancel = !matches!(
             case,
-            ExternalFailureCase::StaleLease | ExternalFailureCase::OldAgentOptionalMessage
+            ExternalFailureCase::StaleLease
+                | ExternalFailureCase::OldAgentOptionalMessage
+                | ExternalFailureCase::ArtifactPublication
         );
         assert_eq!(
             calls
                 .iter()
                 .filter(|call| call.as_str() == "apple_cancel")
                 .count(),
-            usize::from(dispatched),
-            "{case:?} must cancel exactly when AppleRun was dispatched: {calls:?}"
+            usize::from(requires_cancel),
+            "{case:?} must cancel only a dispatched job without a confirmed terminal event: {calls:?}"
         );
-        if dispatched {
+        if requires_cancel {
             let cancel = calls
                 .iter()
                 .position(|call| call == "apple_cancel")

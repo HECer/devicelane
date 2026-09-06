@@ -566,6 +566,7 @@ impl ConnectionWriteObservation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteExecutionFailure {
+    OperationFailed,
     TargetOffline,
     RegistryDisconnected,
     DaemonRestarted,
@@ -582,6 +583,7 @@ pub enum RemoteExecutionFailure {
 impl RemoteExecutionFailure {
     fn message_code(self) -> MessageCode {
         match self {
+            Self::OperationFailed => MessageCode::OperationFailed,
             Self::TargetOffline => MessageCode::TargetOffline,
             Self::RegistryDisconnected => MessageCode::RegistryDisconnected,
             Self::DaemonRestarted => MessageCode::DaemonRestarted,
@@ -1891,7 +1893,9 @@ fn map_transition_failure(error: LocalProtocolError) -> RemoteExecutionFailure {
 
 fn classify_remote_rejection(value: Option<&str>) -> RemoteExecutionFailure {
     let value = value.unwrap_or_default().to_ascii_lowercase();
-    if value.contains("observer_unavailable") {
+    if value == "artifact_publish_failed" {
+        RemoteExecutionFailure::OperationFailed
+    } else if value.contains("observer_unavailable") {
         RemoteExecutionFailure::ObserverUnavailable
     } else if value.contains("resync") || value.contains("overflow") {
         RemoteExecutionFailure::EventResyncRequired
