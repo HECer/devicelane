@@ -119,6 +119,16 @@ fn dashboard_job_preserves_live_inventory_during_real_mesh_execution() {
     #[cfg(unix)]
     let script = script.replace("echo \"agent-tool-output", &format!(
         "while [ \"$1\" = install ] && [ ! -f '{}' ]; do sleep 0.05; done\necho \"agent-tool-output", release_install.display()));
+    #[cfg(windows)]
+    let script = script.replace(
+        "echo agent-tool-output simctl %*\r\n",
+        &format!("echo agent-tool-output simctl %*\r\nif \"%1\"==\"install\" echo install-gate-exit>>\"{}\"\r\n", marker.display()),
+    );
+    #[cfg(unix)]
+    let script = format!(
+        "{script}\n[ \"$1\" != install ] || echo install-gate-exit >> '{}'\n",
+        marker.display()
+    );
     std::fs::write(&simctl, script).unwrap();
     let _agent = spawn(
         env!("CARGO_BIN_EXE_mesh-agent"),
@@ -338,9 +348,11 @@ fn dashboard_job_preserves_live_inventory_during_real_mesh_execution() {
         matches!(response, LocalResponse::ExecutionStarted { .. }),
         "{response:?}"
     );
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let execution_started = Instant::now();
+    let deadline = execution_started + Duration::from_secs(15);
     let mut gate_entered = None;
     let mut released = false;
+    let mut released_at_ms = None;
     let event_diagnostics = || {
         send_local_request(
             &endpoint,
@@ -392,6 +404,7 @@ fn dashboard_job_preserves_live_inventory_during_real_mesh_execution() {
         {
             std::fs::write(&release_install, b"release").unwrap();
             released = true;
+            released_at_ms = Some(execution_started.elapsed().as_millis());
         }
         if state == ActivityState::Succeeded {
             assert!(
@@ -405,19 +418,33 @@ fn dashboard_job_preserves_live_inventory_during_real_mesh_execution() {
                 state,
                 ActivityState::Failed | ActivityState::Denied | ActivityState::Cancelled
             ),
-            "remote job failed: {:?}; events={:?}; tools={}",
+            "remote job failed: {:?}; events={:?}; tools={}; diagnostics={}",
             current.activities,
             event_diagnostics(),
-            std::fs::read_to_string(&marker).unwrap_or_default()
+            std::fs::read_to_string(&marker).unwrap_or_default(),
+            live_job_diagnostics(
+                &registry_identity,
+                &marker,
+                execution_started,
+                gate_entered.map(|(at, _)| at.duration_since(execution_started).as_millis()),
+                released_at_ms
+            )
         );
         assert!(
             Instant::now() < deadline,
-            "remote job did not terminate: activities={:?}; events={:?}; gate={:?}; released={released}; revision={}; tools={}",
+            "remote job did not terminate: activities={:?}; events={:?}; gate={:?}; released={released}; revision={}; tools={}; diagnostics={}",
             current.activities,
             event_diagnostics(),
             gate_entered,
             current.revision,
-            std::fs::read_to_string(&marker).unwrap_or_default()
+            std::fs::read_to_string(&marker).unwrap_or_default(),
+            live_job_diagnostics(
+                &registry_identity,
+                &marker,
+                execution_started,
+                gate_entered.map(|(at, _)| at.duration_since(execution_started).as_millis()),
+                released_at_ms
+            )
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -426,6 +453,45 @@ fn dashboard_job_preserves_live_inventory_during_real_mesh_execution() {
             .unwrap()
             .contains("simctl install sim-1")
     );
+}
+
+// Read only this test's synthetic registry state. Omit event payloads, artifact
+// contents, identities and logs; cap input size and output collection lengths.
+fn live_job_diagnostics(
+    registry: &Path,
+    marker: &Path,
+    started: Instant,
+    entered_at_ms: Option<u128>,
+    released_at_ms: Option<u128>,
+) -> serde_json::Value {
+    fn read_fixture_json(path: &Path) -> serde_json::Value {
+        use std::io::Read;
+        let result = std::fs::File::open(path).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(256 * 1024 + 1).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        match result {
+            Ok(bytes) if bytes.len() <= 256 * 1024 => serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({"read_error": "invalid_json"})),
+            Ok(_) => serde_json::json!({"read_error": "size_limit"}),
+            Err(error) => serde_json::json!({"read_error": format!("{:?}", error.kind())}),
+        }
+    }
+    let state = read_fixture_json(&registry.join("vertical-slice.json"));
+    let payload = &state["payload"];
+    let jobs: Vec<_> = payload["jobs"].as_object().into_iter().flatten().take(8).map(|(id, events)| {
+        let events: Vec<_> = events.as_array().into_iter().flatten().take(32).map(|event| {
+            serde_json::json!({"sequence": event["sequence"], "kind": event["kind"], "payload_bytes": event["payload"].as_str().map(str::len)})
+        }).collect();
+        serde_json::json!({"id": id, "events": events, "pending": payload["apple_pending"].get(id).is_some(), "acknowledged": payload["acknowledged"].as_array().is_some_and(|ids| ids.iter().any(|value| value == id))})
+    }).collect();
+    let index = read_fixture_json(&registry.join("artifacts/index.json"));
+    let artifacts: Vec<_> = index["payload"].as_object().into_iter().flatten().take(8).map(|(id, entry)| {
+        serde_json::json!({"id": id, "job_id": entry["metadata"]["job_id"], "name": entry["metadata"]["name"], "total_size": entry["metadata"]["total_size"], "confirmed_offset": entry["confirmed_offset"], "published": entry["published"]})
+    }).collect();
+    let markers = std::fs::read_to_string(marker).unwrap_or_default();
+    serde_json::json!({"elapsed_ms": started.elapsed().as_millis(), "gate_entered_ms": entered_at_ms, "gate_released_ms": released_at_ms, "gate_exit_seen": markers.lines().any(|line| line.trim() == "install-gate-exit"), "registry_read_error": state["read_error"], "registry_generation": state["generation"], "jobs": jobs, "artifact_index_read_error": index["read_error"], "artifact_generation": index["generation"], "artifacts": artifacts})
 }
 
 #[test]
