@@ -36,7 +36,20 @@ fn main() {
     if args.first().map(String::as_str) == Some("pair") {
         let mut identity =
             SecureTransport::load_or_create(value(&args, "--identity"), &peer_id).unwrap();
-        let mut reader = BufReader::new(TcpStream::connect(value(&args, "--address")).unwrap());
+        let stream = TcpStream::connect(value(&args, "--address")).unwrap_or_else(|error| {
+            let code = match error.kind() {
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut => {
+                    "connection_unavailable"
+                }
+                std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::InvalidInput => {
+                    "connection_invalid_address"
+                }
+                _ => "connection_failed",
+            };
+            eprintln!("{}", serde_json::json!({"error": code}));
+            std::process::exit(1);
+        });
+        let mut reader = BufReader::new(stream);
         let mut challenge = String::new();
         reader.read_line(&mut challenge).unwrap();
         let challenge: serde_json::Value = serde_json::from_str(&challenge).unwrap();
