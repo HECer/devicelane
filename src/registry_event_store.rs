@@ -43,6 +43,9 @@ pub fn segment_digest(bytes: &[u8]) -> [u8; 32] {
 mod codec;
 pub use codec::{HEADER_BYTES, MAX_BODY_BYTES, SegmentHeader, decode_segment};
 
+mod events;
+pub use events::{read_event_batch, write_event_batch};
+
 #[cfg(test)]
 mod tests {
     use super::*;
