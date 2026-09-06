@@ -46,6 +46,9 @@ pub use codec::{HEADER_BYTES, MAX_BODY_BYTES, SegmentHeader, decode_segment};
 mod events;
 pub use events::{read_event_batch, write_event_batch};
 
+mod fragments;
+pub use fragments::{BatchBinding, write_event_segments};
+
 #[cfg(test)]
 mod tests {
     use super::*;
