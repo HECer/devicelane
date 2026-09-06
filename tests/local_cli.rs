@@ -17,7 +17,12 @@ impl Drop for Service {
 fn endpoint_text(_runtime_dir: &std::path::Path) -> String {
     #[cfg(windows)]
     {
-        format!(r"\\.\pipe\devicelane-test-{}", std::process::id())
+        let unique = _runtime_dir
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .expect("temporary runtime parent name");
+        format!(r"\\.\pipe\devicelane-test-{}-{unique}", std::process::id())
     }
     #[cfg(unix)]
     {
@@ -281,6 +286,246 @@ fn unified_cli_round_trips_typed_local_requests() {
         serde_json::from_slice::<LocalResponse>(&diagnostics.stdout).unwrap(),
         direct_diagnostics
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn explicit_endpoint_does_not_require_localappdata() {
+    let (_root, endpoint_text, _endpoint, _service) = start_service();
+    let output = Command::new(env!("CARGO_BIN_EXE_devicelane"))
+        .args(["status", "--local", "--endpoint", &endpoint_text])
+        .env_remove("LOCALAPPDATA")
+        .output()
+        .expect("run devicelane");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+mod installed_unix_runtime {
+    use super::*;
+    use device_development_mesh::local_ipc::{DaemonRole, DaemonSnapshot};
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    fn capture(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        pipe.by_ref().take(64 * 1024).read_to_end(&mut bytes)?;
+        // Drain excess output without retaining it or blocking the child.
+        std::io::copy(&mut pipe, &mut std::io::sink())?;
+        Ok(bytes)
+    }
+
+    fn bounded_output(command: &mut Command, deadline: Instant) -> Result<Output, String> {
+        if Instant::now() >= deadline {
+            return Err("CLI deadline exceeded".into());
+        }
+        let mut child = Service(
+            command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|error| error.to_string())?,
+        );
+        let stdout = child.0.stdout.take().expect("piped stdout");
+        let stderr = child.0.stderr.take().expect("piped stderr");
+        let stdout_reader = std::thread::spawn(move || capture(stdout));
+        let stderr_reader = std::thread::spawn(move || capture(stderr));
+        let status = loop {
+            match child.0.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Err(error) => break Err(error.to_string()),
+                Ok(None) => {}
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Err("CLI deadline exceeded".into());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        };
+        if status.is_err() {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+        }
+        // Join both readers before propagating any process or reader error.
+        let stdout = stdout_reader.join();
+        let stderr = stderr_reader.join();
+        Ok(Output {
+            status: status?,
+            stdout: stdout
+                .map_err(|_| "stdout reader panicked".to_owned())?
+                .map_err(|error| error.to_string())?,
+            stderr: stderr
+                .map_err(|_| "stderr reader panicked".to_owned())?
+                .map_err(|error| error.to_string())?,
+        })
+    }
+
+    #[test]
+    fn bounded_output_kills_a_stalled_child_at_its_deadline() {
+        let start = Instant::now();
+        let result = bounded_output(
+            Command::new("/bin/sleep").arg("30"),
+            start + Duration::from_millis(100),
+        );
+        assert_eq!(result.unwrap_err(), "CLI deadline exceeded");
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    struct InstalledService {
+        // Stop the daemon before removing its socket and private state.
+        _service: Service,
+        _root: tempfile::TempDir,
+        home: PathBuf,
+        xdg: PathBuf,
+        endpoint: PathBuf,
+        snapshot: DaemonSnapshot,
+    }
+
+    impl InstalledService {
+        fn start(runtime_relative: &str) -> Self {
+            // macOS TMPDIR paths can exceed sockaddr_un.sun_path once the
+            // installed Library/Application Support suffix is appended.
+            let root = tempfile::Builder::new()
+                .prefix("dl-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let base = root.path().canonicalize().unwrap();
+            let home = base.join("h");
+            let xdg = base.join("x");
+            let runtime = base.join(runtime_relative);
+            let identity_name = format!("identity-{}", base.file_name().unwrap().to_str().unwrap());
+            let identity = base.join(&identity_name);
+            let logs = base.join("logs");
+            for path in [&home, &xdg, &runtime, &identity, &logs] {
+                std::fs::create_dir_all(path).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            local_endpoint(&runtime, "").unwrap();
+            let endpoint = runtime.join("devicelane.sock");
+            let child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
+                .arg("--identity")
+                .arg(&identity)
+                .arg("--runtime-dir")
+                .arg(&runtime)
+                .arg("--log-dir")
+                .arg(&logs)
+                .args(["--role", "workstation", "--foreground"])
+                .env("HOME", &home)
+                .env_remove("XDG_RUNTIME_DIR")
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("start isolated workstation service");
+            let mut service = Service(child);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let output = bounded_output(
+                    Command::new(env!("CARGO_BIN_EXE_devicelane"))
+                        .args(["status", "--local", "--json", "--endpoint"])
+                        .arg(&endpoint)
+                        .env("HOME", &home)
+                        .env_remove("XDG_RUNTIME_DIR"),
+                    deadline,
+                )
+                .expect("readiness CLI must finish before the service deadline");
+                if output.status.success()
+                    && let Ok(LocalResponse::Snapshot(snapshot)) =
+                        serde_json::from_slice::<LocalResponse>(&output.stdout)
+                {
+                    assert_eq!(snapshot.public_identity, identity_name);
+                    assert_eq!(snapshot.role, DaemonRole::Workstation);
+                    assert_eq!(snapshot.local_protocol, LocalProtocolVersion::CURRENT);
+                    return Self {
+                        _service: service,
+                        _root: root,
+                        home,
+                        xdg,
+                        endpoint,
+                        snapshot,
+                    };
+                }
+                assert!(
+                    service.0.try_wait().unwrap().is_none(),
+                    "isolated workstation service exited before becoming ready"
+                );
+                assert!(Instant::now() < deadline, "service did not become ready");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        fn cli(&self) -> Command {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_devicelane"));
+            command
+                .args(["status", "--local", "--json"])
+                .env("HOME", &self.home)
+                .env_remove("XDG_RUNTIME_DIR");
+            command
+        }
+
+        fn assert_status(&self, command: &mut Command) {
+            let output = bounded_output(command, Instant::now() + Duration::from_secs(5))
+                .expect("local status CLI must finish before its deadline");
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let LocalResponse::Snapshot(snapshot) =
+                serde_json::from_slice::<LocalResponse>(&output.stdout).unwrap()
+            else {
+                panic!("expected typed daemon snapshot");
+            };
+            assert_eq!(snapshot, self.snapshot);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn local_status_discovers_macos_installed_runtime_despite_foreign_xdg() {
+        let service =
+            InstalledService::start("h/Library/Application Support/DeviceLane/state/runtime");
+        service.assert_status(service.cli().env("XDG_RUNTIME_DIR", &service.xdg));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_status_discovers_linux_installed_runtime_without_xdg() {
+        let service = InstalledService::start("h/.local/state/devicelane/runtime/devicelane");
+        service.assert_status(&mut service.cli());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_status_discovers_linux_installed_runtime_with_empty_xdg() {
+        let service = InstalledService::start("h/.local/state/devicelane/runtime/devicelane");
+        service.assert_status(service.cli().env("XDG_RUNTIME_DIR", ""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_status_prefers_linux_xdg_runtime_over_home() {
+        let service = InstalledService::start("x/devicelane");
+        service.assert_status(service.cli().env("XDG_RUNTIME_DIR", &service.xdg));
+    }
+
+    #[test]
+    fn explicit_unix_endpoint_works_without_runtime_environment() {
+        let service = InstalledService::start("runtime");
+        service.assert_status(
+            service
+                .cli()
+                .arg("--endpoint")
+                .arg(&service.endpoint)
+                .env_remove("HOME")
+                .env_remove("XDG_RUNTIME_DIR"),
+        );
+    }
 }
 
 #[test]

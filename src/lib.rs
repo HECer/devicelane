@@ -1,3 +1,5 @@
+pub mod local_runtime;
+
 pub mod controller_session {
     use crate::dashboard::model::{HostId, PrincipalId};
     use crate::dashboard::policy::AccessRequest;

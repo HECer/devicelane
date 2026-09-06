@@ -39,7 +39,7 @@ pub struct LocalDaemonTransport;
 
 impl DaemonTransport for LocalDaemonTransport {
     fn send(&self, request: LocalRequest) -> Result<LocalResponse, String> {
-        let endpoint = local_endpoint(&runtime_dir(), "").map_err(|error| error.to_string())?;
+        let endpoint = local_endpoint(&runtime_dir()?, "").map_err(|error| error.to_string())?;
         send_local_request(&endpoint, &request).map_err(|error| error.to_string())
     }
 }
@@ -488,22 +488,11 @@ fn user_home() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-fn runtime_dir() -> PathBuf {
+fn runtime_dir() -> Result<PathBuf, String> {
     if let Some(smoke_runtime) = std::env::var_os("DEVICELANE_RUNTIME_DIR") {
-        return PathBuf::from(smoke_runtime);
+        return Ok(PathBuf::from(smoke_runtime));
     }
-    #[cfg(target_os = "macos")]
-    return user_home().join("Library/Application Support/DeviceLane/state/runtime");
-    #[cfg(target_os = "linux")]
-    return std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| user_home().join(".local/state/devicelane/runtime"))
-        .join("devicelane");
-    #[cfg(windows)]
-    return std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| user_home().join("AppData/Local"))
-        .join("DeviceLane/service/runtime");
+    device_development_mesh::local_runtime::installed_runtime_dir()
 }
 
 fn log_dir() -> PathBuf {

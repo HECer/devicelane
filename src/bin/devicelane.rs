@@ -614,24 +614,14 @@ fn parse() -> Result<Option<Args>, String> {
 }
 
 fn runtime() -> Result<PathBuf, String> {
-    #[cfg(windows)]
-    {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .map(|p| p.join("DeviceLane/runtime"))
-            .ok_or("LOCALAPPDATA unavailable".into())
-    }
-    #[cfg(unix)]
-    {
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .map(|p| p.join("devicelane"))
-            .ok_or("XDG_RUNTIME_DIR unavailable".into())
-    }
+    device_development_mesh::local_runtime::installed_runtime_dir()
 }
 fn endpoint(x: Option<&str>) -> Result<LocalEndpoint, String> {
     #[cfg(windows)]
-    let r = runtime()?;
+    let r = match x {
+        Some(value) => PathBuf::from(value),
+        None => runtime()?,
+    };
     #[cfg(unix)]
     let r = match x {
         Some(v) => std::path::Path::new(v)
