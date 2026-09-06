@@ -1339,6 +1339,11 @@ fn write_artifact(
             .is_ok()
             && existing == write.bytes;
         return if read_matches {
+            // A prior write may have advanced memory before index persistence
+            // failed. Replayed bytes alone cannot prove a durable upload ACK.
+            if store.persist().is_err() {
+                return error_response("persistence_failed");
+            }
             Response {
                 confirmed_offset: Some(entry.confirmed_offset),
                 ..response()
@@ -1765,6 +1770,92 @@ fn metadata(args: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_artifact_write_requires_durable_publication_before_ack() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = NetworkArtifacts::new(root.path().to_path_buf());
+        let bytes = b"build output";
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let total_size = bytes.len() as u64;
+        store.entries.insert(
+            "artifact-1".into(),
+            NetworkArtifact {
+                metadata: NetworkArtifactMetadata {
+                    id: "artifact-1".into(),
+                    job_id: "job-1".into(),
+                    name: "build.log".into(),
+                    media_type: "text/plain".into(),
+                    total_size,
+                    sha256: sha256.clone(),
+                },
+                participants: HashSet::from(["agent-1".into()]),
+                confirmed_offset: 0,
+                published: false,
+            },
+        );
+        store.persist().unwrap();
+        // Block only the temporary index file, leaving artifact bytes writable.
+        let obstruction = sidecar_path(&store.index_path, ".next");
+        fs::create_dir(&obstruction).unwrap();
+        for attempt in 0..2 {
+            let failed = write_artifact(
+                &mut store,
+                "agent-1",
+                "artifact-1",
+                0,
+                ArtifactWrite {
+                    total_size,
+                    sha256: &sha256,
+                    chunk_sha256: &sha256,
+                    bytes,
+                },
+            );
+            assert_eq!(
+                failed.error.as_deref(),
+                Some("persistence_failed"),
+                "attempt {attempt}"
+            );
+            assert!(!failed.accepted);
+            assert_eq!(failed.confirmed_offset, None);
+            assert!(store.entries["artifact-1"].published);
+            assert_eq!(store.entries["artifact-1"].confirmed_offset, total_size);
+        }
+        fs::remove_dir(&obstruction).unwrap();
+        let recovered_before_retry = NetworkArtifacts::new(root.path().to_path_buf());
+        assert!(!recovered_before_retry.entries["artifact-1"].published);
+        let retried = write_artifact(
+            &mut store,
+            "agent-1",
+            "artifact-1",
+            0,
+            ArtifactWrite {
+                total_size,
+                sha256: &sha256,
+                chunk_sha256: &sha256,
+                bytes,
+            },
+        );
+        assert!(retried.accepted);
+        assert_eq!(retried.error, None);
+        assert_eq!(retried.confirmed_offset, Some(total_size));
+        drop(store);
+        let restarted = NetworkArtifacts::new(root.path().to_path_buf());
+        assert!(restarted.entries["artifact-1"].published);
+        assert_eq!(restarted.entries["artifact-1"].confirmed_offset, total_size);
+        let downloaded = read_artifact(
+            &restarted,
+            "agent-1",
+            "artifact-1",
+            0,
+            total_size,
+            total_size,
+            &sha256,
+        );
+        assert!(downloaded.accepted);
+        assert_eq!(downloaded.artifact_chunk.unwrap().bytes, bytes);
+        assert_eq!(hash_file(&restarted.path("artifact-1")).unwrap(), sha256);
+    }
 
     fn lease_with_waiter_and_writer() -> LeaseBook {
         let mut leases = LeaseBook::default();

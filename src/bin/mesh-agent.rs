@@ -765,6 +765,22 @@ impl LeaseValidationError {
     }
 }
 
+fn retry_artifact_rpc(
+    mut call: impl FnMut() -> Result<Response, RpcError>,
+) -> Result<Response, RpcError> {
+    // Only callers using the registry's idempotent artifact operations may use
+    // this retry. Never replay a tool execution or an authorization decision.
+    for attempt in 0..3 {
+        match call() {
+            Err(RpcError::ConnectUnavailable | RpcError::ResponseTimeout) if attempt < 2 => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
+}
+
 fn publish_artifact(
     registry: &str,
     transport: &SecureTransport,
@@ -774,32 +790,36 @@ fn publish_artifact(
     bytes: &[u8],
 ) -> Option<String> {
     let sha256 = format!("{:x}", Sha256::digest(bytes));
-    let metadata = rpc(
-        registry,
-        transport,
-        &Request::ArtifactRegister {
-            job_id: job_id.into(),
-            name: name.into(),
-            media_type: media_type.into(),
-            total_size: bytes.len() as u64,
-            sha256: sha256.clone(),
-        },
-    )
+    let metadata = retry_artifact_rpc(|| {
+        rpc(
+            registry,
+            transport,
+            &Request::ArtifactRegister {
+                job_id: job_id.into(),
+                name: name.into(),
+                media_type: media_type.into(),
+                total_size: bytes.len() as u64,
+                sha256: sha256.clone(),
+            },
+        )
+    })
     .ok()?
     .artifact_metadata?;
     for (index, chunk) in bytes.chunks(64 * 1024).enumerate() {
-        let response = rpc(
-            registry,
-            transport,
-            &Request::ArtifactWrite {
-                artifact_id: metadata.id.clone(),
-                offset: (index * 64 * 1024) as u64,
-                total_size: bytes.len() as u64,
-                sha256: sha256.clone(),
-                chunk_sha256: format!("{:x}", Sha256::digest(chunk)),
-                bytes: chunk.to_vec(),
-            },
-        )
+        let response = retry_artifact_rpc(|| {
+            rpc(
+                registry,
+                transport,
+                &Request::ArtifactWrite {
+                    artifact_id: metadata.id.clone(),
+                    offset: (index * 64 * 1024) as u64,
+                    total_size: bytes.len() as u64,
+                    sha256: sha256.clone(),
+                    chunk_sha256: format!("{:x}", Sha256::digest(chunk)),
+                    bytes: chunk.to_vec(),
+                },
+            )
+        })
         .ok()?;
         if response.error.is_some() {
             return None;
@@ -1009,6 +1029,140 @@ fn metadata(a: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_upload_replays_identical_requests_after_lost_responses() {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry =
+            SecureTransport::load_or_create(root.path().join("registry"), "registry").unwrap();
+        let mut agent =
+            SecureTransport::load_or_create(root.path().join("agent"), "agent").unwrap();
+        registry.trust("agent", agent.certificate_der()).unwrap();
+        agent.trust("registry", registry.certificate_der()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        listener.set_nonblocking(true).unwrap();
+        let peer = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut lost_replies = Vec::new();
+            let mut requests = Vec::new();
+            for index in 0..4 {
+                let socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("expected upload request {index}: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut stream = registry.accept_tls(socket).unwrap();
+                let mut line = String::new();
+                BufReader::new(&mut stream).read_line(&mut line).unwrap();
+                requests.push(line.clone());
+                let request: Request = serde_json::from_str(&line).unwrap();
+                let response = match request {
+                    Request::ArtifactRegister {
+                        job_id,
+                        name,
+                        media_type,
+                        total_size,
+                        sha256,
+                    } if index < 2 => {
+                        serde_json::json!({"accepted":true,"hosts":[],"artifact_metadata": {"id":"artifact-1", "job_id":job_id,"name":name,"media_type":media_type,"total_size":total_size,"sha256":sha256}})
+                    }
+                    Request::ArtifactWrite { bytes, offset, .. } if index >= 2 => {
+                        serde_json::json!({"accepted":true,"hosts":[],"confirmed_offset":offset + bytes.len() as u64})
+                    }
+                    _ => panic!("unexpected upload operation"),
+                };
+                if index % 2 == 0 {
+                    // Keep the connection alive without a reply. The next
+                    // request must result from the client's response timeout.
+                    lost_replies.push(stream);
+                } else {
+                    serde_json::to_writer(&mut stream, &response).unwrap();
+                    stream.write_all(b"\n").unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+            assert_eq!(requests[0], requests[1]);
+            assert_eq!(requests[2], requests[3]);
+        });
+        let result = publish_artifact(
+            &address,
+            &agent,
+            "job-1",
+            "result.log",
+            "text/plain",
+            b"tool-output",
+        );
+        peer.join().unwrap();
+        assert_eq!(result.as_deref(), Some("artifact-1"));
+    }
+
+    #[test]
+    fn artifact_transport_retries_are_bounded_and_do_not_retry_denials() {
+        let mut attempts = 0;
+        let response = retry_artifact_rpc(|| {
+            attempts += 1;
+            match attempts {
+                1 => Err(RpcError::ConnectUnavailable),
+                2 => Err(RpcError::ResponseTimeout),
+                _ => serde_json::from_str::<Response>(r#"{"accepted":true,"hosts":[]}"#)
+                    .map_err(|_| RpcError::Protocol),
+            }
+        });
+        assert!(response.is_ok());
+        assert_eq!(attempts, 3);
+        for error in [
+            RpcError::ConnectUnavailable,
+            RpcError::ResponseTimeout,
+            RpcError::InvalidAddress,
+            RpcError::Tls,
+            RpcError::Io,
+            RpcError::Protocol,
+        ] {
+            let mut attempts = 0;
+            let result = retry_artifact_rpc(|| {
+                attempts += 1;
+                Err(error.clone())
+            });
+            assert_eq!(result.err(), Some(error.clone()));
+            assert_eq!(
+                attempts,
+                if matches!(
+                    error,
+                    RpcError::ConnectUnavailable | RpcError::ResponseTimeout
+                ) {
+                    3
+                } else {
+                    1
+                }
+            );
+        }
+        let mut denied_attempts = 0;
+        let denied = retry_artifact_rpc(|| {
+            denied_attempts += 1;
+            Ok(serde_json::from_str::<Response>(
+                r#"{"accepted":false,"hosts":[],"error":"artifact_access_denied"}"#,
+            )
+            .unwrap())
+        })
+        .unwrap();
+        assert_eq!(denied.error.as_deref(), Some("artifact_access_denied"));
+        assert_eq!(denied_attempts, 1);
+    }
 
     #[test]
     fn successful_tool_without_published_artifact_cannot_report_completion() {
