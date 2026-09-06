@@ -100,7 +100,7 @@ fn unreadable_credential_is_not_treated_as_absent() {
         SecureTransport::load_or_create(directory.path(), "host").unwrap();
         let path = directory.path().join(name);
         let original = std::fs::read(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
         let result = SecureTransport::load_or_create(directory.path(), "host");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(result.unwrap_err(), TransportError::Io);
