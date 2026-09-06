@@ -19,6 +19,8 @@ use std::{
     time::{Duration, Instant},
 };
 const NAME: &str = "mesh-agent";
+#[path = "mesh-agent/artifact_diagnostics.rs"]
+mod artifact_diagnostics;
 const DEFAULT_PEER_ID: &str = "agent";
 const REGISTRY_RPC_TIMEOUT: Duration = Duration::from_millis(250);
 fn main() {
@@ -807,39 +809,74 @@ fn publish_artifact(
     media_type: &str,
     bytes: &[u8],
 ) -> Option<String> {
+    publish_artifact_with(
+        job_id,
+        name,
+        media_type,
+        bytes,
+        |request| rpc(registry, transport, request),
+        artifact_diagnostics::report,
+    )
+}
+
+fn publish_artifact_with(
+    job_id: &str,
+    name: &str,
+    media_type: &str,
+    bytes: &[u8],
+    mut call: impl FnMut(&Request) -> Result<Response, RpcError>,
+    mut report: impl for<'a> FnMut(artifact_diagnostics::Stage, artifact_diagnostics::Failure<'a>),
+) -> Option<String> {
+    use artifact_diagnostics::{Failure, Stage};
+
     let sha256 = format!("{:x}", Sha256::digest(bytes));
-    let metadata = retry_artifact_rpc(|| {
-        rpc(
-            registry,
-            transport,
-            &Request::ArtifactRegister {
-                job_id: job_id.into(),
-                name: name.into(),
-                media_type: media_type.into(),
+    let registration = match retry_artifact_rpc(|| {
+        call(&Request::ArtifactRegister {
+            job_id: job_id.into(),
+            name: name.into(),
+            media_type: media_type.into(),
+            total_size: bytes.len() as u64,
+            sha256: sha256.clone(),
+        })
+    }) {
+        Ok(response) => response,
+        Err(error) => {
+            report(Stage::Register, Failure::Rpc(error));
+            return None;
+        }
+    };
+    let metadata = match registration.artifact_metadata {
+        Some(metadata) => metadata,
+        None => {
+            report(
+                Stage::Register,
+                match registration.error.as_deref() {
+                    Some(code) => Failure::Server(code),
+                    None => Failure::MissingMetadata,
+                },
+            );
+            return None;
+        }
+    };
+    for (index, chunk) in bytes.chunks(64 * 1024).enumerate() {
+        let response = match retry_artifact_rpc(|| {
+            call(&Request::ArtifactWrite {
+                artifact_id: metadata.id.clone(),
+                offset: (index * 64 * 1024) as u64,
                 total_size: bytes.len() as u64,
                 sha256: sha256.clone(),
-            },
-        )
-    })
-    .ok()?
-    .artifact_metadata?;
-    for (index, chunk) in bytes.chunks(64 * 1024).enumerate() {
-        let response = retry_artifact_rpc(|| {
-            rpc(
-                registry,
-                transport,
-                &Request::ArtifactWrite {
-                    artifact_id: metadata.id.clone(),
-                    offset: (index * 64 * 1024) as u64,
-                    total_size: bytes.len() as u64,
-                    sha256: sha256.clone(),
-                    chunk_sha256: format!("{:x}", Sha256::digest(chunk)),
-                    bytes: chunk.to_vec(),
-                },
-            )
-        })
-        .ok()?;
-        if response.error.is_some() {
+                chunk_sha256: format!("{:x}", Sha256::digest(chunk)),
+                bytes: chunk.to_vec(),
+            })
+        }) {
+            Ok(response) => response,
+            Err(error) => {
+                report(Stage::Write, Failure::Rpc(error));
+                return None;
+            }
+        };
+        if let Some(code) = response.error.as_deref() {
+            report(Stage::Write, Failure::Server(code));
             return None;
         }
     }
