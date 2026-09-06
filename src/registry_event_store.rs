@@ -40,6 +40,9 @@ pub fn segment_digest(bytes: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 
+mod codec;
+pub use codec::{HEADER_BYTES, MAX_BODY_BYTES, SegmentHeader, decode_segment};
+
 #[cfg(test)]
 mod tests {
     use super::*;
