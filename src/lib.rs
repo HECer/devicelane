@@ -1580,45 +1580,6 @@ pub mod secure_transport {
         metadata.file_type().is_file()
     }
 
-    #[cfg(test)]
-    mod identity_creation_tests {
-        use super::*;
-
-        #[test]
-        fn credential_creation_collision_preserves_existing_bytes() {
-            let directory = tempfile::tempdir().unwrap();
-            for name in ["certificate.der", "private-key.der"] {
-                let path = directory.path().join(name);
-                assert!(!path.exists());
-                // A competing creator wins after the caller checked absence.
-                fs::write(&path, b"original credential").unwrap();
-                let result = create_identity_file(&path, b"replacement credential");
-                assert_eq!(result, Err(TransportError::Io));
-                assert_eq!(fs::read(&path).unwrap(), b"original credential");
-            }
-        }
-
-        #[test]
-        fn failed_second_credential_write_does_not_regenerate_first_on_reload() {
-            let directory = tempfile::tempdir().unwrap();
-            let certificate_path = directory.path().join("certificate.der");
-            let key_path = directory.path().join("private-key.der");
-            let generated = rcgen::generate_simple_self_signed(vec!["host".to_owned()]).unwrap();
-            let certificate = generated.cert.der().to_vec();
-            create_identity_file(&certificate_path, &certificate).unwrap();
-            // A nonregular path appearing between the two writes forces failure.
-            fs::create_dir(&key_path).unwrap();
-            assert_eq!(
-                create_identity_file(&key_path, &generated.key_pair.serialize_der()),
-                Err(TransportError::Io)
-            );
-            fs::remove_dir(&key_path).unwrap();
-            assert!(SecureTransport::load_or_create(directory.path(), "host").is_err());
-            assert_eq!(fs::read(&certificate_path).unwrap(), certificate);
-            assert!(!key_path.exists());
-        }
-    }
-
     // Initial identity writes must never replace a credential, including when a
     // competing creator wins after the absence check. Partial writes stay put
     // so the next load fails closed instead of silently rotating the identity.
@@ -1725,6 +1686,45 @@ pub mod secure_transport {
     impl From<io::Error> for TransportError {
         fn from(_: io::Error) -> Self {
             Self::Io
+        }
+    }
+
+    #[cfg(test)]
+    mod identity_creation_tests {
+        use super::*;
+
+        #[test]
+        fn credential_creation_collision_preserves_existing_bytes() {
+            let directory = tempfile::tempdir().unwrap();
+            for name in ["certificate.der", "private-key.der"] {
+                let path = directory.path().join(name);
+                assert!(!path.exists());
+                // A competing creator wins after the caller checked absence.
+                fs::write(&path, b"original credential").unwrap();
+                let result = create_identity_file(&path, b"replacement credential");
+                assert_eq!(result, Err(TransportError::Io));
+                assert_eq!(fs::read(&path).unwrap(), b"original credential");
+            }
+        }
+
+        #[test]
+        fn failed_second_credential_write_does_not_regenerate_first_on_reload() {
+            let directory = tempfile::tempdir().unwrap();
+            let certificate_path = directory.path().join("certificate.der");
+            let key_path = directory.path().join("private-key.der");
+            let generated = rcgen::generate_simple_self_signed(vec!["host".to_owned()]).unwrap();
+            let certificate = generated.cert.der().to_vec();
+            create_identity_file(&certificate_path, &certificate).unwrap();
+            // A nonregular path appearing between the two writes forces failure.
+            fs::create_dir(&key_path).unwrap();
+            assert_eq!(
+                create_identity_file(&key_path, &generated.key_pair.serialize_der()),
+                Err(TransportError::Io)
+            );
+            fs::remove_dir(&key_path).unwrap();
+            assert!(SecureTransport::load_or_create(directory.path(), "host").is_err());
+            assert_eq!(fs::read(&certificate_path).unwrap(), certificate);
+            assert!(!key_path.exists());
         }
     }
 }
