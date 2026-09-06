@@ -1,22 +1,192 @@
 use device_development_mesh::{
     network_processes::{
-        DeviceSnapshot, HostSnapshot, LeaseGrant, LeaseRequest, NetworkEvent, Request,
+        DeviceSnapshot, HostSnapshot, LeaseGrant, LeaseRequest, NetworkEvent, Request, Response,
     },
     remote_apple_protocol::{AppleOperation, AppleRequest, RemoteProtocolVersion},
     secure_transport::SecureTransport,
 };
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 const DEVICE: &str = "sim-1";
 static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn cli_capture_drains_both_large_output_streams() {
+    const MARKER: &[u8] = b"DEVICELANE_STDOUT_PAYLOAD\n";
+    const PAYLOAD_BYTES: usize = 128 * 1024;
+
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "cli_pipe_output_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("DEVICELANE_PIPE_TEST_CHILD", "1");
+    let output = bounded_cli_output(child, "cli pipe output child");
+
+    assert!(
+        output.status.success(),
+        "child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let marker_positions: Vec<_> = output
+        .stdout
+        .windows(MARKER.len())
+        .enumerate()
+        .filter_map(|(index, bytes)| (bytes == MARKER).then_some(index))
+        .collect();
+    assert_eq!(marker_positions.len(), 1, "stdout={:?}", output.stdout);
+    assert_eq!(
+        &output.stdout[marker_positions[0] + MARKER.len()..],
+        vec![b'o'; PAYLOAD_BYTES]
+    );
+    assert_eq!(output.stderr, vec![b'e'; PAYLOAD_BYTES]);
+}
+
+#[test]
+#[ignore = "invoked as a bounded subprocess fixture"]
+fn cli_pipe_output_child() {
+    if std::env::var("DEVICELANE_PIPE_TEST_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(b"DEVICELANE_STDOUT_PAYLOAD\n").unwrap();
+    stdout.write_all(&vec![b'o'; 128 * 1024]).unwrap();
+    stdout.flush().unwrap();
+    let mut stderr = std::io::stderr().lock();
+    stderr.write_all(&vec![b'e'; 128 * 1024]).unwrap();
+    stderr.flush().unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+fn cli_drains_large_authenticated_events_output_before_waiting_for_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = root.path().join("registry");
+    let client = root.path().join("client");
+    pair(&registry, "registry", &client, "client");
+
+    let payload = "x".repeat(128 * 1024);
+    let response = Response {
+        accepted: true,
+        hosts: vec![],
+        job_id: Some("large-events-job".into()),
+        events: vec![NetworkEvent {
+            sequence: 1,
+            kind: "stdout".into(),
+            payload: payload.clone(),
+        }],
+        audit: vec![],
+        artifact: None,
+        error: None,
+        operation: None,
+        apple_operation: None,
+        cancel_jobs: vec![],
+        artifact_metadata: None,
+        artifact_chunk: None,
+        confirmed_offset: None,
+        lease_grant: None,
+        lease_status: None,
+    };
+    let response_frame = serde_json::to_vec(&response).unwrap();
+    let mut expected_stdout = response_frame.clone();
+    expected_stdout.push(b'\n');
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let registry_transport = SecureTransport::load_or_create(&registry, "registry").unwrap();
+    let fully_flushed_replies = Arc::new(AtomicUsize::new(0));
+    let server_flushed_replies = Arc::clone(&fully_flushed_replies);
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "fixture timed out accepting mesh-cli"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("fixture failed accepting mesh-cli: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = registry_transport.accept_tls(stream).unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream).read_line(&mut request).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).unwrap(),
+                Request::Events { ref job_id, after: 0 } if job_id == "large-events-job"
+            ));
+            stream.write_all(&response_frame).unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            server_flushed_replies.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    let body = serde_json::json!({"job_id": "large-events-job", "after": 0});
+    let scenario = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let control = cli_with_concurrent_drain(&address, &client, "events", &body);
+        eprintln!(
+            "control status={} stdout_bytes={}",
+            control.status,
+            control.stdout.len()
+        );
+        assert!(
+            control.status.success(),
+            "control mesh-cli failed: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+        assert_eq!(control.stdout, expected_stdout);
+        let control_response: serde_json::Value = serde_json::from_slice(&control.stdout).unwrap();
+        assert_eq!(control_response["events"][0]["payload"], payload);
+
+        cli(&address, &client, "events", &body)
+    }));
+    let server_result = server.join();
+    eprintln!(
+        "fully_flushed_replies={}",
+        fully_flushed_replies.load(Ordering::SeqCst)
+    );
+    if let Err(panic) = server_result {
+        std::panic::resume_unwind(panic);
+    }
+    let output = match scenario {
+        Ok(output) => output,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert!(
+        output.status.success(),
+        "mesh-cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, expected_stdout);
+}
 
 #[test]
 fn lease_rpc_covers_acquire_renew_queue_release_revoke_and_one_writer() {
@@ -1247,34 +1417,69 @@ fn fake_tool(
 }
 
 fn cli<T: serde::Serialize>(address: &str, identity: &Path, command: &str, body: &T) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
-        .args([
-            "--registry",
-            address,
-            "--identity",
-            identity.to_str().unwrap(),
-            command,
-            "--json-request",
-            &serde_json::to_string(body).unwrap(),
-        ])
+    cli_with_concurrent_drain(address, identity, command, body)
+}
+
+fn cli_with_concurrent_drain<T: serde::Serialize>(
+    address: &str,
+    identity: &Path,
+    command: &str,
+    body: &T,
+) -> Output {
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_mesh-cli"));
+    cli.args([
+        "--registry",
+        address,
+        "--identity",
+        identity.to_str().unwrap(),
+        command,
+        "--json-request",
+        &serde_json::to_string(body).unwrap(),
+    ]);
+    bounded_cli_output(cli, &format!("mesh-cli {command}"))
+}
+
+fn bounded_cli_output(mut command: Command, label: &str) -> Output {
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stdout).read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stderr).read_to_end(&mut bytes).unwrap();
+        bytes
+    });
     let deadline = Instant::now() + Duration::from_secs(5);
-    while child.try_wait().unwrap().is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if Instant::now() >= deadline {
             child.kill().unwrap();
-            let output = child.wait_with_output().unwrap();
+            let status = child.wait().unwrap();
+            let stdout = stdout_reader.join().unwrap();
+            let stderr = stderr_reader.join().unwrap();
             panic!(
-                "mesh-cli {command} timed out after five seconds; status={}; stderr={}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
+                "concurrently drained {label} timed out after five seconds; status={status}; stdout_bytes={}; stderr={}",
+                stdout.len(),
+                String::from_utf8_lossy(&stderr)
             );
         }
         thread::sleep(Duration::from_millis(10));
+    };
+    Output {
+        status,
+        stdout: stdout_reader.join().unwrap(),
+        stderr: stderr_reader.join().unwrap(),
     }
-    child.wait_with_output().unwrap()
 }
 
 fn cli_json<T: serde::Serialize>(
