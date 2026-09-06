@@ -2,6 +2,100 @@ use device_development_mesh::mac_bootstrap::validate_production_launch_agent;
 use std::fs;
 use std::process::Command;
 
+fn bootstrap_dry_run(controller: &str) -> String {
+    use std::{
+        io::Read,
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let home = tempfile::tempdir().unwrap();
+    let shell = if cfg!(windows) {
+        "C:/Program Files/Git/bin/sh.exe"
+    } else {
+        "sh"
+    };
+    let home_argument = home.path().to_str().unwrap().replace('\\', "/");
+    let home_argument = if cfg!(windows) {
+        format!(
+            "/{}{}",
+            home_argument[..1].to_lowercase(),
+            &home_argument[2..]
+        )
+    } else {
+        home_argument
+    };
+    let mut child = Command::new(shell)
+        .arg(root.join("scripts/setup-mac.sh"))
+        .args(["--dry-run", "--controller", controller, "--home"])
+        .arg(home_argument)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bootstrap regression requires a POSIX shell (Git for Windows)");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bootstrap dry-run timed out");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "{stderr}");
+    assert!(home.path().read_dir().unwrap().next().is_none());
+    stdout
+}
+
+#[test]
+fn generated_pairing_command_uses_private_numeric_controller_interface() {
+    for (controller, endpoint) in [
+        ("192.168.0.61", "192.168.0.61:7445"),
+        ("fd12:3456::61", "[fd12:3456::61]:7445"),
+        ("fc00:1:2:3:4:5:6:7", "[fc00:1:2:3:4:5:6:7]:7445"),
+    ] {
+        let output = bootstrap_dry_run(controller);
+        assert!(output.contains(&format!(
+            "NEXT_CONTROLLER_COMMAND=mesh-registry pair --listen {endpoint} --identity .mesh/registry"
+        )), "{output}");
+    }
+    for controller in [
+        "controller.local",
+        "8.8.8.8",
+        "0.0.0.0",
+        "192.168.999.1",
+        "fd12:::1",
+        "fd12:1:2:3:4:5:6:7:8",
+        "fd12::1::2",
+        "192.168.001.1",
+    ] {
+        let output = bootstrap_dry_run(controller);
+        assert!(!output.contains("mesh-registry pair --listen"), "{output}");
+        assert!(
+            output.contains("numeric private controller interface"),
+            "{output}"
+        );
+    }
+}
+
 #[test]
 fn mac_bootstrap_defines_the_complete_user_launch_agent_lifecycle() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

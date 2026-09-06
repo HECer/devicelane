@@ -169,17 +169,19 @@ In a second terminal, pair the local CLI:
 
 ### 2. Pair and install a Mac agent
 
-On the controller, temporarily permit inbound TCP `7445` **only from the Mac's private IP**, then run:
+On the controller, temporarily permit inbound TCP `7445` **only from the Mac's private IP**, then run the following, replacing `192.168.0.61` with the controller's numeric private LAN or VPN interface address:
 
 ```powershell
-.\target\debug\mesh-registry.exe pair --listen 0.0.0.0:7445 --identity .mesh\registry
+.\target\debug\mesh-registry.exe pair --listen 192.168.0.61:7445 --identity .mesh\registry
 ```
 
 On the Mac, from the cloned repository:
 
 ```sh
-sh ./scripts/setup-mac.sh --controller CONTROLLER_HOST
+sh ./scripts/setup-mac.sh --controller 192.168.0.61
 ```
+
+Use the same controller address on the Mac. IPv6 ULA addresses use brackets in the listener command, for example `--listen [fd12:3456::61]:7445`, and no brackets in `--controller fd12:3456::61`. Pairing rejects wildcard, hostname, and public listener addresses. The setup dry run prints a pairing command for private IPv4 and ULA addresses; other forms receive guidance to choose a numeric private interface. Hostnames remain supported for registry transport. A private bind limits exposure; the legacy pairing exchange still sends its code in-band.
 
 The setup script builds release binaries, pairs the agent, installs a per-user LaunchAgent, validates the Apple toolchain, starts the service, and prints the exact registry command required for that agent. Close firewall port `7445` immediately after pairing.
 

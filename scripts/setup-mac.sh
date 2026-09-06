@@ -93,7 +93,39 @@ DAEMON_RUNTIME_DIR="$DAEMON_STATE_DIR/runtime"
 DAEMON_LOG_DIR="$HOME_DIR/Library/Logs/DeviceLane"
 DAEMON_PLIST_PATH="$HOME_DIR/Library/LaunchAgents/dev.devicelane.service.plist"
 DAEMON_SERVICE="gui/$(id -u)/dev.devicelane.service"
-PAIR_COMMAND="mesh-registry pair --listen 0.0.0.0:7445 --identity .mesh/registry"
+# Only offer an executable handoff for validated private numeric interfaces.
+# Hostnames remain supported for registry transport; resolving them is not a bind policy.
+private_pairing_host() {
+    printf '%s\n' "$1" | awk '
+        function groups(value, parts, count, i) {
+            if (value == "") return 0
+            count = split(value, parts, ":")
+            for (i = 1; i <= count; i++)
+                if (length(parts[i]) < 1 || length(parts[i]) > 4 || parts[i] ~ /[^0-9a-f]/) return 99
+            return count
+        }
+        {
+            host = tolower($0)
+            if (host ~ /^[0-9.]+$/ && split(host, octets, ".") == 4) {
+                for (i = 1; i <= 4; i++)
+                    if (octets[i] == "" || octets[i] > 255 || (length(octets[i]) > 1 && substr(octets[i], 1, 1) == "0")) exit 1
+                exit !(octets[1] == 10 || octets[1] == 127 ||
+                    (octets[1] == 172 && octets[2] >= 16 && octets[2] <= 31) ||
+                    (octets[1] == 192 && octets[2] == 168) ||
+                    (octets[1] == 169 && octets[2] == 254))
+            }
+            if (host !~ /^f[cd][0-9a-f][0-9a-f]:/) exit 1
+            compressed = split(host, halves, "::")
+            if (compressed == 1) exit !(groups(host) == 8)
+            if (compressed == 2) exit !(groups(halves[1]) + groups(halves[2]) < 8)
+            exit 1
+        }'
+}
+if private_pairing_host "$CONTROLLER_HOST"; then
+    PAIR_COMMAND="mesh-registry pair --listen $CONTROLLER_ENDPOINT:7445 --identity .mesh/registry"
+else
+    PAIR_COMMAND="Choose a numeric private controller interface for the temporary pairing listener; rerun --dry-run --controller with that IP."
+fi
 
 redact() {
     sed -E 's/(pairing_code|private_key|signing_secret|token)([=:][^ ,}]*)/\1=[REDACTED]/g'
