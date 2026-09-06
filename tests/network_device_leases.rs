@@ -1084,6 +1084,103 @@ fn start_registry(address: &str, identity: &Path) -> ChildGuard {
     )
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_lease_fixture_delay_works_with_cleared_environment() {
+    assert_windows_lease_fixture(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_lease_fixture_gate_works_with_cleared_environment() {
+    assert_windows_lease_fixture(true);
+}
+
+#[cfg(windows)]
+fn assert_windows_lease_fixture(gated: bool) {
+    use device_development_mesh::process_execution::{
+        CancellationToken, EventKind, ProcessExecutor, ProcessRequest, TerminalStatus,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("fixture.log");
+    let gate = root.path().join("release");
+    let delay = if gated {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(1)
+    };
+    let tool = fake_tool(
+        root.path(),
+        "simctl",
+        &marker,
+        delay,
+        gated.then_some(gate.as_path()),
+    );
+    let executor = ProcessExecutor::new(root.path(), [tool.clone()], []).unwrap();
+    let started = Instant::now();
+    let events = thread::scope(|scope| {
+        let release = gated.then(|| {
+            scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !std::fs::read_to_string(&marker)
+                    .is_ok_and(|text| text.contains("mutation-start"))
+                {
+                    assert!(Instant::now() < deadline, "fixture did not enter mutation");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                thread::sleep(Duration::from_millis(200));
+                assert!(
+                    !std::fs::read_to_string(&marker)
+                        .unwrap()
+                        .contains("mutation-end"),
+                    "fixture completed before explicit release"
+                );
+                std::fs::write(&gate, b"release").unwrap();
+            })
+        });
+        let events = executor
+            .execute(
+                ProcessRequest {
+                    program: tool,
+                    args: vec!["install".into(), DEVICE.into(), "build/App.app".into()],
+                    working_directory: ".".into(),
+                    environment: Default::default(),
+                },
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .unwrap();
+        if let Some(release) = release {
+            release.join().unwrap();
+        }
+        events
+    });
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == EventKind::Terminal(TerminalStatus::Exited(0))),
+        "fixture did not exit successfully"
+    );
+    let stderr_bytes: usize = events
+        .iter()
+        .filter(|event| event.kind == EventKind::Stderr)
+        .map(|event| event.payload.len())
+        .sum();
+    assert_eq!(
+        stderr_bytes, 0,
+        "fixture wrote stderr with cleared environment"
+    );
+    let marker = std::fs::read_to_string(marker).unwrap();
+    assert!(marker.contains("mutation-start") && marker.contains("mutation-end"));
+    if !gated {
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "fixture skipped its requested delay"
+        );
+    }
+}
+
 fn fake_tool(
     root: &Path,
     name: &str,
@@ -1094,18 +1191,19 @@ fn fake_tool(
     #[cfg(windows)]
     {
         let path = root.join(format!("{name}.cmd"));
+        let ping = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/ping.exe");
         let delay_command = if mutation_delay.is_zero() {
             "rem no mutation delay".to_owned()
         } else {
             let ping_count = mutation_delay.as_millis().div_ceil(1_000) + 1;
-            format!("ping.exe -n {ping_count} 127.0.0.1 >nul")
+            format!("\"{}\" -n {ping_count} 127.0.0.1 >nul", ping.display())
         };
         let gate_command = mutation_gate.map_or_else(
             || "rem no mutation gate".to_owned(),
             |gate| {
                 format!(
-                    ":wait_gate\r\nif not exist \"{}\" (\r\n  ping.exe -n 2 127.0.0.1 >nul\r\n  goto wait_gate\r\n)",
-                    gate.display()
+                    ":wait_gate\r\nif not exist \"{}\" (\r\n  \"{}\" -n 2 127.0.0.1 >nul\r\n  goto wait_gate\r\n)",
+                    gate.display(), ping.display()
                 )
             },
         );
