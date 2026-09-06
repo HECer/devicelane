@@ -286,9 +286,10 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     let workspace_root = root.path().join("workspaces");
     std::fs::create_dir_all(workspace_root.join("mac-agent/project/build")).unwrap();
     let marker = root.path().join("agent-tool.log");
-    let xcodebuild = fake_apple_tool(root.path(), "xcodebuild", &marker, 0);
-    let devicectl = fake_apple_tool(root.path(), "devicectl", &marker, 0);
-    let simctl = fake_apple_tool(root.path(), "simctl", &marker, 4_000);
+    let install_gate = root.path().join("release-install");
+    let xcodebuild = fake_apple_tool(root.path(), "xcodebuild", &marker, None);
+    let devicectl = fake_apple_tool(root.path(), "devicectl", &marker, None);
+    let simctl = fake_apple_tool(root.path(), "simctl", &marker, Some(&install_gate));
     let _agent = spawn(
         &workspace_binary("mesh-agent"),
         &[
@@ -322,6 +323,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     );
     wait_for_mesh_host(&registry_address, &service_identity, "mac-agent");
 
+    let _release_on_failure = InstallGateRelease(install_gate.clone());
     let runtime = root.path().join("runtime");
     let logs = root.path().join("logs");
     std::fs::create_dir_all(&runtime).unwrap();
@@ -803,6 +805,7 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     );
     wait_for_mesh_host(&registry_address, &service_identity, "mac-agent");
 
+    std::fs::write(&install_gate, b"release").unwrap();
     let terminal = wait_for_activity(&bridge, activity_id, "succeeded");
     assert_eq!(
         terminal
@@ -1121,14 +1124,82 @@ fn devicelane_cli_process(endpoint: &str, args: &[&str]) -> (u32, Output) {
     (process_id, child.wait_with_output().unwrap())
 }
 
-fn fake_apple_tool(root: &Path, name: &str, marker: &Path, delay_ms: u64) -> PathBuf {
+#[test]
+fn install_fixture_waits_for_explicit_release_with_cleared_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("tools.log");
+    let gate = root.path().join("release-install");
+    let tool = fake_apple_tool(root.path(), "simctl", &marker, Some(&gate));
+    #[cfg(windows)]
+    let mut command = {
+        let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        let mut command = Command::new(cmd);
+        let script = tool.to_string_lossy();
+        command
+            .args(["/D", "/C"])
+            .arg(script.strip_prefix(r"\\?\").unwrap_or(&script))
+            .args(["install", "iphone-1", "build/Mesh.app"]);
+        command
+    };
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new(&tool);
+        command.args(["install", "iphone-1", "build/Mesh.app"]);
+        command
+    };
+    let mut child = ChildGuard(
+        command
+            .env_clear()
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(&marker).is_ok_and(|text| text.contains("simctl install")) {
+        assert!(
+            Instant::now() < deadline,
+            "install fixture did not enter: marker={:?}, status={:?}",
+            std::fs::read_to_string(&marker),
+            child.try_wait()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Observe a blocked process repeatedly; release is controlled by this test,
+    // never inferred from how much time the host took to execute other steps.
+    let observation = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < observation {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "install fixture exited before explicit gate release under env_clear"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(&gate, b"release").unwrap();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "released fixture did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn fake_apple_tool(root: &Path, name: &str, marker: &Path, gate: Option<&Path>) -> PathBuf {
     #[cfg(windows)]
     {
         let path = root.join(format!("{name}.cmd"));
+        let wait = gate.map(|gate| {
+            let ping = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("ping.exe");
+            format!(":wait_install\r\nif exist \"{}\" goto install_released\r\nif not exist \"{}\" exit /b 1\r\n\"{}\" -n 2 127.0.0.1 >nul\r\nif errorlevel 1 exit /b 1\r\ngoto wait_install\r\n:install_released\r\n", gate.display(), root.display(), ping.display())
+        }).unwrap_or_default();
         std::fs::write(
             &path,
             format!(
-                "@echo off\r\necho {name} %*>>\"{}\"\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"install\" goto mutation\r\nif \"%1\"==\"-version\" goto version\r\nif \"{name}\"==\"devicectl\" if \"%1\"==\"list\" goto devices\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"list\" goto simulators\r\necho complete\r\nexit /b 0\r\n:mutation\r\npowershell.exe -NoProfile -Command \"Start-Sleep -Milliseconds {delay_ms}\"\r\necho installed\r\nexit /b 0\r\n:version\r\necho Xcode 16\r\nexit /b 0\r\n:devices\r\necho {{\"result\":{{\"devices\":[]}}}}\r\nexit /b 0\r\n:simulators\r\necho {{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"iphone-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}\r\nexit /b 0\r\n",
+                "@echo off\r\necho {name} %*>>\"{}\"\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"install\" goto mutation\r\nif \"%1\"==\"-version\" goto version\r\nif \"{name}\"==\"devicectl\" if \"%1\"==\"list\" goto devices\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"list\" goto simulators\r\necho complete\r\nexit /b 0\r\n:mutation\r\n{wait}echo installed\r\nexit /b 0\r\n:version\r\necho Xcode 16\r\nexit /b 0\r\n:devices\r\necho {{\"result\":{{\"devices\":[]}}}}\r\nexit /b 0\r\n:simulators\r\necho {{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"iphone-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}\r\nexit /b 0\r\n",
                 marker.display()
             ),
         )
@@ -1139,13 +1210,30 @@ fn fake_apple_tool(root: &Path, name: &str, marker: &Path, delay_ms: u64) -> Pat
     {
         use std::os::unix::fs::PermissionsExt;
         let path = root.join(name);
+        let wait = gate
+            .map(|gate| {
+                format!(
+                    "while [ ! -f '{}' ]; do [ -d '{}' ] || exit 1; /bin/sleep 0.05 || exit 1; done;",
+                    gate.display(), root.display()
+                )
+            })
+            .unwrap_or_default();
         std::fs::write(
             &path,
-            format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\nif [ '{name}' = simctl ] && [ \"$1\" = install ]; then sleep {}; echo installed; exit 0; fi\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && [ \"$1\" = list ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && [ \"$1\" = list ] && echo '{{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"iphone-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}' && exit 0\necho complete\n", marker.display(), delay_ms as f64 / 1000.0),
+            format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\nif [ '{name}' = simctl ] && [ \"$1\" = install ]; then {wait} echo installed; exit 0; fi\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && [ \"$1\" = list ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && [ \"$1\" = list ] && echo '{{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"iphone-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}' && exit 0\necho complete\n", marker.display()),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+}
+
+// Release before the owning agent is dropped if an assertion aborts the test.
+// The fixture's short-lived polling child can then exit without waiting forever.
+struct InstallGateRelease(PathBuf);
+impl Drop for InstallGateRelease {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"release");
     }
 }
 
