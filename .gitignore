@@ -30,5 +30,6 @@
 .yoke/proof/
 .yoke/checks/
 .yoke/artifacts/
+.yoke/history/
 .yoke/events/
 .yoke/context/DECISIONS.md
