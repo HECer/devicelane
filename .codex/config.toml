@@ -7,6 +7,9 @@ hooks = true
 command = "python"
 args = ["-m", "graphify.serve", "graphify-out/graph.json"]
 
+[mcp_servers.supabase]
+enabled = false
+
 [mcp_servers.playwright]
 command = "npx"
 args = ["@playwright/mcp@latest"]
