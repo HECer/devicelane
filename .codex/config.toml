@@ -4,8 +4,8 @@
 hooks = true
 
 [mcp_servers.graphify]
-command = "graphify"
-args = ["serve"]
+command = "python"
+args = ["-m", "graphify.serve", "graphify-out/graph.json"]
 
 [mcp_servers.playwright]
 command = "npx"

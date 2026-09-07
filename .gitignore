@@ -6,6 +6,7 @@
 /desktop/src-tauri/binaries/
 /desktop/src-tauri/icons/android/
 /desktop/src-tauri/icons/ios/
+/graphify-out/cache/
 /.mesh/
 .worktrees/
 .yoke/worktrees/
@@ -27,5 +28,7 @@
 .yoke/decision-*.yaml.*.tmp
 .yoke/story-durations.json
 .yoke/proof/
+.yoke/checks/
+.yoke/artifacts/
 .yoke/events/
 .yoke/context/DECISIONS.md

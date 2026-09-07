@@ -1,0 +1,1028 @@
+{
+  ".codex/hooks.json": {
+    "mtime": 1788785445.0816464,
+    "seen": 1788786663.3673503,
+    "ast_hash": "f4923c7d32bc6f7045f7016ff6d0e7b9",
+    "semantic_hash": "f4923c7d32bc6f7045f7016ff6d0e7b9"
+  },
+  ".codex/hooks/rtk.mjs": {
+    "mtime": 1788785445.0816464,
+    "seen": 1788786663.3673503,
+    "ast_hash": "1c5517f5e7ba1327e972cc357a850867",
+    "semantic_hash": "1c5517f5e7ba1327e972cc357a850867"
+  },
+  "Cargo.toml": {
+    "mtime": 1788785445.0886645,
+    "seen": 1788786663.3673503,
+    "ast_hash": "7c677ffa5b7a4319ed7313b656d8193e",
+    "semantic_hash": "7c677ffa5b7a4319ed7313b656d8193e"
+  },
+  "desktop/finalized.json": {
+    "mtime": 1788785445.0916643,
+    "seen": 1788786663.3673503,
+    "ast_hash": "4b5bee3973440b677de8d0cb6795b858",
+    "semantic_hash": "4b5bee3973440b677de8d0cb6795b858"
+  },
+  "desktop/package.json": {
+    "mtime": 1788785445.092665,
+    "seen": 1788786663.3673503,
+    "ast_hash": "df162178fec5beba66f859685ff63a2b",
+    "semantic_hash": "df162178fec5beba66f859685ff63a2b"
+  },
+  "desktop/scripts/stage-sidecar.mjs": {
+    "mtime": 1788785445.0936644,
+    "seen": 1788786663.3673503,
+    "ast_hash": "75a333c431cfa8c0d7d7b0bb73d67671",
+    "semantic_hash": "75a333c431cfa8c0d7d7b0bb73d67671"
+  },
+  "desktop/src-tauri/Cargo.toml": {
+    "mtime": 1788785445.0936644,
+    "seen": 1788786663.3673503,
+    "ast_hash": "6b8abaac153fb42c642a44c152ba6c10",
+    "semantic_hash": "6b8abaac153fb42c642a44c152ba6c10"
+  },
+  "desktop/src-tauri/build.rs": {
+    "mtime": 1788785445.0946639,
+    "seen": 1788786663.3673503,
+    "ast_hash": "7bf2fe3b7e5c64bdb3119298caa0bd57",
+    "semantic_hash": "7bf2fe3b7e5c64bdb3119298caa0bd57"
+  },
+  "desktop/src-tauri/capabilities/default.json": {
+    "mtime": 1788785445.0946639,
+    "seen": 1788786663.3673503,
+    "ast_hash": "0f6b70ea8fbc04b3154a2810e9f435c3",
+    "semantic_hash": "0f6b70ea8fbc04b3154a2810e9f435c3"
+  },
+  "desktop/src-tauri/src/lib.rs": {
+    "mtime": 1788785445.1021807,
+    "seen": 1788786663.3673503,
+    "ast_hash": "5e0f10169545bd8697ff090751c3b24f",
+    "semantic_hash": "5e0f10169545bd8697ff090751c3b24f"
+  },
+  "desktop/src-tauri/src/main.rs": {
+    "mtime": 1788785445.1021807,
+    "seen": 1788786663.3673503,
+    "ast_hash": "69d5bc05837b6745265f69fe98838ca5",
+    "semantic_hash": "69d5bc05837b6745265f69fe98838ca5"
+  },
+  "desktop/src-tauri/tauri.conf.json": {
+    "mtime": 1788785445.102689,
+    "seen": 1788786663.3673503,
+    "ast_hash": "3a2ead570001d9cb4c7fcbdc0f50bea8",
+    "semantic_hash": "3a2ead570001d9cb4c7fcbdc0f50bea8"
+  },
+  "desktop/src-tauri/tests/bridge.rs": {
+    "mtime": 1788785445.1037002,
+    "seen": 1788786663.3673503,
+    "ast_hash": "75d79036f740ef5532fc8a3b0b516eef",
+    "semantic_hash": "75d79036f740ef5532fc8a3b0b516eef"
+  },
+  "desktop/src-tauri/tests/support/registry_diagnostics.rs": {
+    "mtime": 1788785445.1037002,
+    "seen": 1788786663.3673503,
+    "ast_hash": "3e2d4a3afe252ba0f032a32f7503bf10",
+    "semantic_hash": "3e2d4a3afe252ba0f032a32f7503bf10"
+  },
+  "desktop/src/App.test.tsx": {
+    "mtime": 1788785445.1046994,
+    "seen": 1788786663.3673503,
+    "ast_hash": "0fc5b785127c331f60bb9053b214bb26",
+    "semantic_hash": "0fc5b785127c331f60bb9053b214bb26"
+  },
+  "desktop/src/App.tsx": {
+    "mtime": 1788785445.1056986,
+    "seen": 1788786663.3673503,
+    "ast_hash": "d5073a7769bd4c6d01cb4d136974dde0",
+    "semantic_hash": "d5073a7769bd4c6d01cb4d136974dde0"
+  },
+  "desktop/src/api.connection.test.ts": {
+    "mtime": 1788785445.1062088,
+    "seen": 1788786663.3673503,
+    "ast_hash": "91c9781041f891542b2210567ce06d41",
+    "semantic_hash": "91c9781041f891542b2210567ce06d41"
+  },
+  "desktop/src/api.ts": {
+    "mtime": 1788785445.1062088,
+    "seen": 1788786663.3673503,
+    "ast_hash": "2b991c57b920deb4d5f4e9468d8bd565",
+    "semantic_hash": "2b991c57b920deb4d5f4e9468d8bd565"
+  },
+  "desktop/src/components/ActivityFeed.test.tsx": {
+    "mtime": 1788785445.1067166,
+    "seen": 1788786663.3673503,
+    "ast_hash": "b9d373a90924ee5aefc974f747652e25",
+    "semantic_hash": "b9d373a90924ee5aefc974f747652e25"
+  },
+  "desktop/src/components/ActivityFeed.tsx": {
+    "mtime": 1788785445.1072366,
+    "seen": 1788786663.3673503,
+    "ast_hash": "f731b8ce0da028cee981d684725566a5",
+    "semantic_hash": "f731b8ce0da028cee981d684725566a5"
+  },
+  "desktop/src/components/ApprovalPanel.test.tsx": {
+    "mtime": 1788785445.1072366,
+    "seen": 1788786663.3673503,
+    "ast_hash": "25b57372ad96a1657b82d34902428c18",
+    "semantic_hash": "25b57372ad96a1657b82d34902428c18"
+  },
+  "desktop/src/components/ApprovalPanel.tsx": {
+    "mtime": 1788785445.1072366,
+    "seen": 1788786663.3673503,
+    "ast_hash": "4077bc19930761f66dcfedcf2579a007",
+    "semantic_hash": "4077bc19930761f66dcfedcf2579a007"
+  },
+  "desktop/src/components/AuditHistory.test.tsx": {
+    "mtime": 1788785445.1082454,
+    "seen": 1788786663.3673503,
+    "ast_hash": "d1cba3319f758a8d21df49e5fe8d80c6",
+    "semantic_hash": "d1cba3319f758a8d21df49e5fe8d80c6"
+  },
+  "desktop/src/components/AuditHistory.tsx": {
+    "mtime": 1788785445.1082454,
+    "seen": 1788786663.3673503,
+    "ast_hash": "1441e84da5b126d1241508a61b32dfbb",
+    "semantic_hash": "1441e84da5b126d1241508a61b32dfbb"
+  },
+  "desktop/src/components/ConnectionSettingsCard.test.tsx": {
+    "mtime": 1788785445.1082454,
+    "seen": 1788786663.3673503,
+    "ast_hash": "f43f3f9ff187055ca6859dcf37269391",
+    "semantic_hash": "f43f3f9ff187055ca6859dcf37269391"
+  },
+  "desktop/src/components/ConnectionSettingsCard.tsx": {
+    "mtime": 1788785445.1092455,
+    "seen": 1788786663.3673503,
+    "ast_hash": "615a81a7bea27c3973ac71be707551ba",
+    "semantic_hash": "615a81a7bea27c3973ac71be707551ba"
+  },
+  "desktop/src/components/Modal.test.tsx": {
+    "mtime": 1788785445.1092455,
+    "seen": 1788786663.3673503,
+    "ast_hash": "0f48452f00543bb639b5f533f105f11d",
+    "semantic_hash": "0f48452f00543bb639b5f533f105f11d"
+  },
+  "desktop/src/components/Modal.tsx": {
+    "mtime": 1788785445.1102455,
+    "seen": 1788786663.3673503,
+    "ast_hash": "60a7f0be7cdea87a8f9d7d6998555300",
+    "semantic_hash": "60a7f0be7cdea87a8f9d7d6998555300"
+  },
+  "desktop/src/components/PolicyRules.test.tsx": {
+    "mtime": 1788785445.1102455,
+    "seen": 1788786663.3673503,
+    "ast_hash": "31b53a179d285650f82746ac11754a3e",
+    "semantic_hash": "31b53a179d285650f82746ac11754a3e"
+  },
+  "desktop/src/components/PolicyRules.tsx": {
+    "mtime": 1788785445.1102455,
+    "seen": 1788786663.3673503,
+    "ast_hash": "0b7c63c72e111b6a874ea9e6965c4a17",
+    "semantic_hash": "0b7c63c72e111b6a874ea9e6965c4a17"
+  },
+  "desktop/src/components/ResourceOccupancy.test.tsx": {
+    "mtime": 1788785445.1102455,
+    "seen": 1788786663.3673503,
+    "ast_hash": "78853132b1875595be1daee14787da60",
+    "semantic_hash": "78853132b1875595be1daee14787da60"
+  },
+  "desktop/src/components/ResourceOccupancy.tsx": {
+    "mtime": 1788785445.1117544,
+    "seen": 1788786663.3673503,
+    "ast_hash": "928f46fd4a256fa97a53932452042403",
+    "semantic_hash": "928f46fd4a256fa97a53932452042403"
+  },
+  "desktop/src/components/ScopeSwitcher.test.tsx": {
+    "mtime": 1788785445.1117544,
+    "seen": 1788786663.3673503,
+    "ast_hash": "adabe462b8a555a8573b2f7f3495736d",
+    "semantic_hash": "adabe462b8a555a8573b2f7f3495736d"
+  },
+  "desktop/src/components/ScopeSwitcher.tsx": {
+    "mtime": 1788785445.1117544,
+    "seen": 1788786663.3673503,
+    "ast_hash": "ab6e39a0aa3ab597103a1764c6759529",
+    "semantic_hash": "ab6e39a0aa3ab597103a1764c6759529"
+  },
+  "desktop/src/components/TopologyView.test.tsx": {
+    "mtime": 1788785445.112764,
+    "seen": 1788786663.3673503,
+    "ast_hash": "06a62bc6641cfb299c66b775cd7aef65",
+    "semantic_hash": "06a62bc6641cfb299c66b775cd7aef65"
+  },
+  "desktop/src/components/TopologyView.tsx": {
+    "mtime": 1788785445.112764,
+    "seen": 1788786663.3673503,
+    "ast_hash": "8fb11bf64bd07b191a7b5286151f3528",
+    "semantic_hash": "8fb11bf64bd07b191a7b5286151f3528"
+  },
+  "desktop/src/components/responsive.test.ts": {
+    "mtime": 1788785445.112764,
+    "seen": 1788786663.3673503,
+    "ast_hash": "1fd024d54cba1744d8ac3797def0fdff",
+    "semantic_hash": "1fd024d54cba1744d8ac3797def0fdff"
+  },
+  "desktop/src/dashboard-model.test.ts": {
+    "mtime": 1788785445.1137636,
+    "seen": 1788786663.3673503,
+    "ast_hash": "c8d40f8ad6d6c23a2bdb8f7b78ca7402",
+    "semantic_hash": "c8d40f8ad6d6c23a2bdb8f7b78ca7402"
+  },
+  "desktop/src/dashboard-model.ts": {
+    "mtime": 1788785445.1137636,
+    "seen": 1788786663.3673503,
+    "ast_hash": "088ace47f315c438d814ca0759ed1947",
+    "semantic_hash": "088ace47f315c438d814ca0759ed1947"
+  },
+  "desktop/src/main.tsx": {
+    "mtime": 1788785445.1147635,
+    "seen": 1788786663.3673503,
+    "ast_hash": "ef9ad7b07e4a55b414026eb9f2aa91e4",
+    "semantic_hash": "ef9ad7b07e4a55b414026eb9f2aa91e4"
+  },
+  "desktop/src/node-test.d.ts": {
+    "mtime": 1788785445.1147635,
+    "seen": 1788786663.3673503,
+    "ast_hash": "868f3bf45132cdd9921e06709eff1f94",
+    "semantic_hash": "868f3bf45132cdd9921e06709eff1f94"
+  },
+  "desktop/src/test-setup.ts": {
+    "mtime": 1788785445.1157637,
+    "seen": 1788786663.3673503,
+    "ast_hash": "c423067709b0f04af885a0332dacd6b7",
+    "semantic_hash": "c423067709b0f04af885a0332dacd6b7"
+  },
+  "desktop/src/usePretext.ts": {
+    "mtime": 1788785445.1157637,
+    "seen": 1788786663.3673503,
+    "ast_hash": "5e140bb3e7cbc668f851d939f0afad20",
+    "semantic_hash": "5e140bb3e7cbc668f851d939f0afad20"
+  },
+  "desktop/tsconfig.json": {
+    "mtime": 1788785445.1157637,
+    "seen": 1788786663.3673503,
+    "ast_hash": "f5f647ebba0b3af9b95de6396f8c316f",
+    "semantic_hash": "f5f647ebba0b3af9b95de6396f8c316f"
+  },
+  "desktop/tsconfig.node.json": {
+    "mtime": 1788785445.1157637,
+    "seen": 1788786663.3673503,
+    "ast_hash": "64db09254162251dabadff14ae080610",
+    "semantic_hash": "64db09254162251dabadff14ae080610"
+  },
+  "desktop/vite.config.ts": {
+    "mtime": 1788785445.116764,
+    "seen": 1788786663.3673503,
+    "ast_hash": "535279d9ef0cefa6b641573286dfcbcf",
+    "semantic_hash": "535279d9ef0cefa6b641573286dfcbcf"
+  },
+  "hardware/DeviceMeshGate/DeviceMeshGateUITests/DeviceMeshGateUITests.swift": {
+    "mtime": 1788785445.1293192,
+    "seen": 1788786663.3673503,
+    "ast_hash": "d97fd4753b50957503e98b58d2bdc7c7",
+    "semantic_hash": "d97fd4753b50957503e98b58d2bdc7c7"
+  },
+  "hardware/DeviceMeshGate/DeviceMeshGate/AppDelegate.swift": {
+    "mtime": 1788785445.1283193,
+    "seen": 1788786663.3673503,
+    "ast_hash": "fd138c877b419bcc217f2d29143b330d",
+    "semantic_hash": "fd138c877b419bcc217f2d29143b330d"
+  },
+  "hardware/DeviceMeshGate/DeviceMeshGate/SceneDelegate.swift": {
+    "mtime": 1788785445.1283193,
+    "seen": 1788786663.3673503,
+    "ast_hash": "6135942d4c64a64e50a63ebd7ae23591",
+    "semantic_hash": "6135942d4c64a64e50a63ebd7ae23591"
+  },
+  "hardware/DeviceMeshGate/DeviceMeshGate/ViewController.swift": {
+    "mtime": 1788785445.1283193,
+    "seen": 1788786663.3673503,
+    "ast_hash": "e2fcf177e458a58757c313a7d685eac8",
+    "semantic_hash": "e2fcf177e458a58757c313a7d685eac8"
+  },
+  "npm/bin/devicelane-agent.mjs": {
+    "mtime": 1788785445.1308253,
+    "seen": 1788786663.3673503,
+    "ast_hash": "351f12ab26082159b87da00f9377b335",
+    "semantic_hash": "351f12ab26082159b87da00f9377b335"
+  },
+  "npm/bin/devicelane-registry.mjs": {
+    "mtime": 1788785445.1308253,
+    "seen": 1788786663.3673503,
+    "ast_hash": "58416ee657913c9e5327537bc7beac7c",
+    "semantic_hash": "58416ee657913c9e5327537bc7beac7c"
+  },
+  "npm/bin/devicelane-service.mjs": {
+    "mtime": 1788785445.1308253,
+    "seen": 1788786663.3673503,
+    "ast_hash": "d064ec7b9bae33b4d9effbd6721036cf",
+    "semantic_hash": "d064ec7b9bae33b4d9effbd6721036cf"
+  },
+  "npm/bin/devicelane.mjs": {
+    "mtime": 1788785445.131832,
+    "seen": 1788786663.3673503,
+    "ast_hash": "17a89c85585a654a388a80e51a56de4a",
+    "semantic_hash": "17a89c85585a654a388a80e51a56de4a"
+  },
+  "npm/bin/mesh-agent.mjs": {
+    "mtime": 1788785445.131832,
+    "seen": 1788786663.3673503,
+    "ast_hash": "351f12ab26082159b87da00f9377b335",
+    "semantic_hash": "351f12ab26082159b87da00f9377b335"
+  },
+  "npm/bin/mesh-cli.mjs": {
+    "mtime": 1788785445.131832,
+    "seen": 1788786663.3673503,
+    "ast_hash": "72e5eaa1a6d778ed5be7753c10f73891",
+    "semantic_hash": "72e5eaa1a6d778ed5be7753c10f73891"
+  },
+  "npm/bin/mesh-registry.mjs": {
+    "mtime": 1788785445.131832,
+    "seen": 1788786663.3673503,
+    "ast_hash": "58416ee657913c9e5327537bc7beac7c",
+    "semantic_hash": "58416ee657913c9e5327537bc7beac7c"
+  },
+  "npm/lib/platform.mjs": {
+    "mtime": 1788785445.1328318,
+    "seen": 1788786663.3673503,
+    "ast_hash": "78eb74bcf6a8e4343f1452a7e0de2076",
+    "semantic_hash": "78eb74bcf6a8e4343f1452a7e0de2076"
+  },
+  "npm/lib/run.mjs": {
+    "mtime": 1788785445.1328318,
+    "seen": 1788786663.3673503,
+    "ast_hash": "032b12b370d0a9b4b17346fd36ecefaa",
+    "semantic_hash": "032b12b370d0a9b4b17346fd36ecefaa"
+  },
+  "npm/package.json": {
+    "mtime": 1788785445.1338327,
+    "seen": 1788786663.3673503,
+    "ast_hash": "d36e2d3c0255580469ab38f1a5822450",
+    "semantic_hash": "d36e2d3c0255580469ab38f1a5822450"
+  },
+  "npm/test/platform.test.mjs": {
+    "mtime": 1788785445.1338327,
+    "seen": 1788786663.3673503,
+    "ast_hash": "8eeb940a81cf2fc7cc770e2cbb6cd24e",
+    "semantic_hash": "8eeb940a81cf2fc7cc770e2cbb6cd24e"
+  },
+  "scripts/bootstrap-smoke": {
+    "mtime": 1788785445.1348324,
+    "seen": 1788786663.3673503,
+    "ast_hash": "4078061121b35a05b6706fd1dd1897fd",
+    "semantic_hash": "4078061121b35a05b6706fd1dd1897fd"
+  },
+  "scripts/compare-msi-payloads.ps1": {
+    "mtime": 1788785445.1348324,
+    "seen": 1788786663.3673503,
+    "ast_hash": "5ed0cc30f096077686ee27ef3b7669cc",
+    "semantic_hash": "5ed0cc30f096077686ee27ef3b7669cc"
+  },
+  "scripts/compare-native-payloads.sh": {
+    "mtime": 1788785445.1358335,
+    "seen": 1788786663.3673503,
+    "ast_hash": "7021e387375d72ca3ddef299879416d3",
+    "semantic_hash": "7021e387375d72ca3ddef299879416d3"
+  },
+  "scripts/desktop-release-smoke.ps1": {
+    "mtime": 1788785445.1358335,
+    "seen": 1788786663.3673503,
+    "ast_hash": "f760ad1c0c28f49aba44f969e2890b18",
+    "semantic_hash": "f760ad1c0c28f49aba44f969e2890b18"
+  },
+  "scripts/desktop-release-smoke.sh": {
+    "mtime": 1788785445.1358335,
+    "seen": 1788786663.3673503,
+    "ast_hash": "ccf19b9b741a89b7360ec6a7e48f1ee7",
+    "semantic_hash": "ccf19b9b741a89b7360ec6a7e48f1ee7"
+  },
+  "scripts/lifecycle-transaction-smoke.sh": {
+    "mtime": 1788785445.1368334,
+    "seen": 1788786663.3673503,
+    "ast_hash": "90ed550c97357777a7f7e583b500959e",
+    "semantic_hash": "90ed550c97357777a7f7e583b500959e"
+  },
+  "scripts/mac-bootstrap-smoke": {
+    "mtime": 1788785445.1368334,
+    "seen": 1788786663.3673503,
+    "ast_hash": "b3b7bc746f01b9043a60c06c6529b113",
+    "semantic_hash": "b3b7bc746f01b9043a60c06c6529b113"
+  },
+  "scripts/mac-hardware-gate.sh": {
+    "mtime": 1788785445.1368334,
+    "seen": 1788786663.3673503,
+    "ast_hash": "ea8c230180ccb348cee3921b9ccfa4f0",
+    "semantic_hash": "ea8c230180ccb348cee3921b9ccfa4f0"
+  },
+  "scripts/setup-linux.sh": {
+    "mtime": 1788785445.1378307,
+    "seen": 1788786663.3673503,
+    "ast_hash": "d4ce5260421bffa48fb836f7cdcd76d3",
+    "semantic_hash": "d4ce5260421bffa48fb836f7cdcd76d3"
+  },
+  "scripts/setup-mac.sh": {
+    "mtime": 1788785445.1378307,
+    "seen": 1788786663.3673503,
+    "ast_hash": "3441e18f483a85ae21fc1804e956e277",
+    "semantic_hash": "3441e18f483a85ae21fc1804e956e277"
+  },
+  "scripts/setup-windows.ps1": {
+    "mtime": 1788785445.138831,
+    "seen": 1788786663.3673503,
+    "ast_hash": "7c04b8dee5026b8fe08b492628be151a",
+    "semantic_hash": "7c04b8dee5026b8fe08b492628be151a"
+  },
+  "src/bin/devicelane-service.rs": {
+    "mtime": 1788785445.138831,
+    "seen": 1788786663.3673503,
+    "ast_hash": "0f28b5ff633b98dde940ef5425023c12",
+    "semantic_hash": "0f28b5ff633b98dde940ef5425023c12"
+  },
+  "src/bin/devicelane.rs": {
+    "mtime": 1788785445.139833,
+    "seen": 1788786663.3673503,
+    "ast_hash": "f477b19a53fc979fb9e336c779b6bd10",
+    "semantic_hash": "f477b19a53fc979fb9e336c779b6bd10"
+  },
+  "src/bin/mesh-agent.rs": {
+    "mtime": 1788785445.1408322,
+    "seen": 1788786663.3673503,
+    "ast_hash": "7985010cb4d20dfc551a3db550a9c626",
+    "semantic_hash": "7985010cb4d20dfc551a3db550a9c626"
+  },
+  "src/bin/mesh-agent/artifact_diagnostics.rs": {
+    "mtime": 1788785445.1408322,
+    "seen": 1788786663.3673503,
+    "ast_hash": "5b662535be8160366ec414635c4a63d7",
+    "semantic_hash": "5b662535be8160366ec414635c4a63d7"
+  },
+  "src/bin/mesh-cli.rs": {
+    "mtime": 1788785445.1408322,
+    "seen": 1788786663.3673503,
+    "ast_hash": "44b06b187604c9b3389f0e376d209063",
+    "semantic_hash": "44b06b187604c9b3389f0e376d209063"
+  },
+  "src/bin/mesh-registry.rs": {
+    "mtime": 1788785445.1418338,
+    "seen": 1788786663.3673503,
+    "ast_hash": "e30dc038f26c455d983841bcff26371c",
+    "semantic_hash": "e30dc038f26c455d983841bcff26371c"
+  },
+  "src/connection_config.rs": {
+    "mtime": 1788785445.1418338,
+    "seen": 1788786663.3673503,
+    "ast_hash": "d4da7aacaa0ba9daed03aa700fc8a292",
+    "semantic_hash": "d4da7aacaa0ba9daed03aa700fc8a292"
+  },
+  "src/dashboard/audit.rs": {
+    "mtime": 1788785445.1428335,
+    "seen": 1788786663.3673503,
+    "ast_hash": "ae9a7a62960c65a6213bc6107568d7d3",
+    "semantic_hash": "ae9a7a62960c65a6213bc6107568d7d3"
+  },
+  "src/dashboard/event_log.rs": {
+    "mtime": 1788785445.1428335,
+    "seen": 1788786663.3673503,
+    "ast_hash": "f13006a089ffc612dc8a1a2f78858fd5",
+    "semantic_hash": "f13006a089ffc612dc8a1a2f78858fd5"
+  },
+  "src/dashboard/managed_policy.rs": {
+    "mtime": 1788785445.143834,
+    "seen": 1788786663.3673503,
+    "ast_hash": "58a2eccd97563bc40060714bec149a54",
+    "semantic_hash": "58a2eccd97563bc40060714bec149a54"
+  },
+  "src/dashboard/mod.rs": {
+    "mtime": 1788785445.143834,
+    "seen": 1788786663.3673503,
+    "ast_hash": "0ca0c6cb28ab4f787d8208f502cd4d38",
+    "semantic_hash": "0ca0c6cb28ab4f787d8208f502cd4d38"
+  },
+  "src/dashboard/model.rs": {
+    "mtime": 1788785445.143834,
+    "seen": 1788786663.3673503,
+    "ast_hash": "934c023180ec44181f2e3b4bbe62b4cc",
+    "semantic_hash": "934c023180ec44181f2e3b4bbe62b4cc"
+  },
+  "src/dashboard/policy.rs": {
+    "mtime": 1788785445.1448338,
+    "seen": 1788786663.3673503,
+    "ast_hash": "59a886499343cd523c299e481f085861",
+    "semantic_hash": "59a886499343cd523c299e481f085861"
+  },
+  "src/dashboard/service.rs": {
+    "mtime": 1788785445.1448338,
+    "seen": 1788786663.3673503,
+    "ast_hash": "16430a2cfef71b4b33b802939e2f53e7",
+    "semantic_hash": "16430a2cfef71b4b33b802939e2f53e7"
+  },
+  "src/dashboard/topology.rs": {
+    "mtime": 1788785445.1448338,
+    "seen": 1788786663.3673503,
+    "ast_hash": "3352a7f7644a4464b6593a038b9f7c58",
+    "semantic_hash": "3352a7f7644a4464b6593a038b9f7c58"
+  },
+  "src/lib.rs": {
+    "mtime": 1788785445.1473515,
+    "seen": 1788786663.3673503,
+    "ast_hash": "503b62ae5011b62f2c86039c76c973df",
+    "semantic_hash": "503b62ae5011b62f2c86039c76c973df"
+  },
+  "src/local_ipc.rs": {
+    "mtime": 1788785445.1473515,
+    "seen": 1788786663.3673503,
+    "ast_hash": "473be77a9fa3292f9c67e32040e38450",
+    "semantic_hash": "473be77a9fa3292f9c67e32040e38450"
+  },
+  "src/local_runtime.rs": {
+    "mtime": 1788785445.1473515,
+    "seen": 1788786663.3673503,
+    "ast_hash": "d95ab4e866ed56ad6eba9064a65c6322",
+    "semantic_hash": "d95ab4e866ed56ad6eba9064a65c6322"
+  },
+  "src/mac_bootstrap.rs": {
+    "mtime": 1788785445.1487503,
+    "seen": 1788786663.3673503,
+    "ast_hash": "b15ce39a343c6783da26017341fec344",
+    "semantic_hash": "b15ce39a343c6783da26017341fec344"
+  },
+  "src/registry_event_store.rs": {
+    "mtime": 1788785445.1487503,
+    "seen": 1788786663.3673503,
+    "ast_hash": "9d2bb801db74b421636d241ad19adb6e",
+    "semantic_hash": "9d2bb801db74b421636d241ad19adb6e"
+  },
+  "src/registry_event_store/codec.rs": {
+    "mtime": 1788785445.14975,
+    "seen": 1788786663.3673503,
+    "ast_hash": "965d53cc982d064204a28c4b485626d1",
+    "semantic_hash": "965d53cc982d064204a28c4b485626d1"
+  },
+  "src/registry_event_store/events.rs": {
+    "mtime": 1788785445.14975,
+    "seen": 1788786663.3673503,
+    "ast_hash": "85f9679f9d0861ab1e3f094c34c12fe8",
+    "semantic_hash": "85f9679f9d0861ab1e3f094c34c12fe8"
+  },
+  "src/registry_event_store/fragments.rs": {
+    "mtime": 1788785445.1507497,
+    "seen": 1788786663.3673503,
+    "ast_hash": "3a9c920067b8bb5c2273d17338317c5f",
+    "semantic_hash": "3a9c920067b8bb5c2273d17338317c5f"
+  },
+  "src/registry_event_store/reader.rs": {
+    "mtime": 1788785445.1507497,
+    "seen": 1788786663.3673503,
+    "ast_hash": "44b38d70db6389bb70e657196dbd898b",
+    "semantic_hash": "44b38d70db6389bb70e657196dbd898b"
+  },
+  "src/registry_runtime.rs": {
+    "mtime": 1788785445.1517498,
+    "seen": 1788786663.3673503,
+    "ast_hash": "532de4b32c776ba338aef628b154806a",
+    "semantic_hash": "532de4b32c776ba338aef628b154806a"
+  },
+  "src/registry_runtime/lifecycle.rs": {
+    "mtime": 1788785445.1517498,
+    "seen": 1788786663.3673503,
+    "ast_hash": "7f36acff6fd00daffa4d83c486309501",
+    "semantic_hash": "7f36acff6fd00daffa4d83c486309501"
+  },
+  "src/secure_transport/pairing_tls.rs": {
+    "mtime": 1788785445.1527495,
+    "seen": 1788786663.3673503,
+    "ast_hash": "1f7e98f0e9eaffb9979bb0a89a658861",
+    "semantic_hash": "1f7e98f0e9eaffb9979bb0a89a658861"
+  },
+  "src/state_paths.rs": {
+    "mtime": 1788785445.1527495,
+    "seen": 1788786663.3673503,
+    "ast_hash": "75292ed79a5e7af508184a5ba608ccf1",
+    "semantic_hash": "75292ed79a5e7af508184a5ba608ccf1"
+  },
+  "src/state_paths/unix.rs": {
+    "mtime": 1788785445.1537497,
+    "seen": 1788786663.3673503,
+    "ast_hash": "6cc3eb1d04434383579934da013d22c0",
+    "semantic_hash": "6cc3eb1d04434383579934da013d22c0"
+  },
+  "src/state_paths/windows.rs": {
+    "mtime": 1788785445.1537497,
+    "seen": 1788786663.3673503,
+    "ast_hash": "4603615e1bb2939fa1d88c07d2bc47c5",
+    "semantic_hash": "4603615e1bb2939fa1d88c07d2bc47c5"
+  },
+  "src/state_paths/windows/tests.rs": {
+    "mtime": 1788785445.1547499,
+    "seen": 1788786663.3673503,
+    "ast_hash": "84a9a5fa74a0e9f71d1a63ce58727070",
+    "semantic_hash": "84a9a5fa74a0e9f71d1a63ce58727070"
+  },
+  "tests/agent_registry.rs": {
+    "mtime": 1788785445.1547499,
+    "seen": 1788786663.3673503,
+    "ast_hash": "27ea65cc7af49b159628d1c89545ec49",
+    "semantic_hash": "27ea65cc7af49b159628d1c89545ec49"
+  },
+  "tests/apple_build.rs": {
+    "mtime": 1788785445.1557498,
+    "seen": 1788786663.3673503,
+    "ast_hash": "b0f97eefb542ad8dcf6e5f01a9d4e0b2",
+    "semantic_hash": "b0f97eefb542ad8dcf6e5f01a9d4e0b2"
+  },
+  "tests/apple_diagnostics.rs": {
+    "mtime": 1788785445.1557498,
+    "seen": 1788786663.3673503,
+    "ast_hash": "a231b1fea88674b26f217940cae64d8e",
+    "semantic_hash": "a231b1fea88674b26f217940cae64d8e"
+  },
+  "tests/apple_discovery.rs": {
+    "mtime": 1788785445.1557498,
+    "seen": 1788786663.3673503,
+    "ast_hash": "b8d663b28743e6a1f9eafda2fbeabdfe",
+    "semantic_hash": "b8d663b28743e6a1f9eafda2fbeabdfe"
+  },
+  "tests/apple_physical_device.rs": {
+    "mtime": 1788785445.1557498,
+    "seen": 1788786663.3673503,
+    "ast_hash": "76881f609d6b3fa5c319efff1f96e02c",
+    "semantic_hash": "76881f609d6b3fa5c319efff1f96e02c"
+  },
+  "tests/apple_preflight.rs": {
+    "mtime": 1788785445.1567495,
+    "seen": 1788786663.3673503,
+    "ast_hash": "059c3cdd63ed714d677040f54a75a3b0",
+    "semantic_hash": "059c3cdd63ed714d677040f54a75a3b0"
+  },
+  "tests/apple_project_discovery.rs": {
+    "mtime": 1788785445.1567495,
+    "seen": 1788786663.3673503,
+    "ast_hash": "122411b6aae57378369c6cce1610ffa2",
+    "semantic_hash": "122411b6aae57378369c6cce1610ffa2"
+  },
+  "tests/apple_simulator.rs": {
+    "mtime": 1788785445.1567495,
+    "seen": 1788786663.3673503,
+    "ast_hash": "66025bc61f8e8be6208c420e37357959",
+    "semantic_hash": "66025bc61f8e8be6208c420e37357959"
+  },
+  "tests/apple_tool_runner.rs": {
+    "mtime": 1788785445.1567495,
+    "seen": 1788786663.3673503,
+    "ast_hash": "a49f93237e251312802d0aee7c4956b7",
+    "semantic_hash": "a49f93237e251312802d0aee7c4956b7"
+  },
+  "tests/apple_xctest.rs": {
+    "mtime": 1788785445.1577494,
+    "seen": 1788786663.3673503,
+    "ast_hash": "ee533dbf1182dece324140c80c374e63",
+    "semantic_hash": "ee533dbf1182dece324140c80c374e63"
+  },
+  "tests/artifacts.rs": {
+    "mtime": 1788785445.1577494,
+    "seen": 1788786663.3673503,
+    "ast_hash": "240f4f4a41bb2ed664f5fab1401f4f7e",
+    "semantic_hash": "240f4f4a41bb2ed664f5fab1401f4f7e"
+  },
+  "tests/bootstrap.rs": {
+    "mtime": 1788785445.158257,
+    "seen": 1788786663.3673503,
+    "ast_hash": "55aa2d82ba840be33f50be1686edfb0c",
+    "semantic_hash": "55aa2d82ba840be33f50be1686edfb0c"
+  },
+  "tests/connection_config.rs": {
+    "mtime": 1788785445.158257,
+    "seen": 1788786663.3673503,
+    "ast_hash": "bc3ae35e9be1a3e2e0850518a820612e",
+    "semantic_hash": "bc3ae35e9be1a3e2e0850518a820612e"
+  },
+  "tests/controller_session.rs": {
+    "mtime": 1788785445.1592662,
+    "seen": 1788786663.3673503,
+    "ast_hash": "b822e7bc8a6bb089bb94272238130d07",
+    "semantic_hash": "b822e7bc8a6bb089bb94272238130d07"
+  },
+  "tests/daemon_controller.rs": {
+    "mtime": 1788785445.1592662,
+    "seen": 1788786663.3673503,
+    "ast_hash": "fd65c8be645f4cbc86f8a2c327bf7219",
+    "semantic_hash": "fd65c8be645f4cbc86f8a2c327bf7219"
+  },
+  "tests/dashboard_audit.rs": {
+    "mtime": 1788785445.160266,
+    "seen": 1788786663.3673503,
+    "ast_hash": "0ee0f652910de3520198796ef28af259",
+    "semantic_hash": "0ee0f652910de3520198796ef28af259"
+  },
+  "tests/dashboard_cli.rs": {
+    "mtime": 1788785445.160266,
+    "seen": 1788786663.3673503,
+    "ast_hash": "66c72f9df7e8a2e5ff1c81c9b0fdda86",
+    "semantic_hash": "66c72f9df7e8a2e5ff1c81c9b0fdda86"
+  },
+  "tests/dashboard_contract.rs": {
+    "mtime": 1788785445.1612742,
+    "seen": 1788786663.3673503,
+    "ast_hash": "a2af401782574b13d5a090c1530f36bf",
+    "semantic_hash": "a2af401782574b13d5a090c1530f36bf"
+  },
+  "tests/dashboard_event_log.rs": {
+    "mtime": 1788785445.1612742,
+    "seen": 1788786663.3673503,
+    "ast_hash": "a1d074db2b8c85c2ece24a0631154c38",
+    "semantic_hash": "a1d074db2b8c85c2ece24a0631154c38"
+  },
+  "tests/dashboard_ipc.rs": {
+    "mtime": 1788785445.1612742,
+    "seen": 1788786663.3673503,
+    "ast_hash": "ecdb6a587dd83496a9b67300cb08c38a",
+    "semantic_hash": "ecdb6a587dd83496a9b67300cb08c38a"
+  },
+  "tests/dashboard_managed_policy.rs": {
+    "mtime": 1788785445.1622741,
+    "seen": 1788786663.3673503,
+    "ast_hash": "a4ac4e5eda377e9611d41c0178ca5af9",
+    "semantic_hash": "a4ac4e5eda377e9611d41c0178ca5af9"
+  },
+  "tests/dashboard_policy.rs": {
+    "mtime": 1788785445.1622741,
+    "seen": 1788786663.3673503,
+    "ast_hash": "969d3bc4fa8d07520782662e65d87595",
+    "semantic_hash": "969d3bc4fa8d07520782662e65d87595"
+  },
+  "tests/dashboard_registry_inventory.rs": {
+    "mtime": 1788785445.1622741,
+    "seen": 1788786663.3673503,
+    "ast_hash": "eede25ab0799ed60d988f3d50f704ee3",
+    "semantic_hash": "eede25ab0799ed60d988f3d50f704ee3"
+  },
+  "tests/dashboard_topology.rs": {
+    "mtime": 1788785445.1632743,
+    "seen": 1788786663.3673503,
+    "ast_hash": "355e74ab2a791fb40a08da0a7767fe21",
+    "semantic_hash": "355e74ab2a791fb40a08da0a7767fe21"
+  },
+  "tests/desktop_distribution.rs": {
+    "mtime": 1788785445.1632743,
+    "seen": 1788786663.3673503,
+    "ast_hash": "716a33e0c311cb1121fb9d92484316fe",
+    "semantic_hash": "716a33e0c311cb1121fb9d92484316fe"
+  },
+  "tests/desktop_sidecar_contract.rs": {
+    "mtime": 1788785445.164274,
+    "seen": 1788786663.3673503,
+    "ast_hash": "167b10d2e8df8b5607c9bf18fdcdcf4e",
+    "semantic_hash": "167b10d2e8df8b5607c9bf18fdcdcf4e"
+  },
+  "tests/device_adapter_contract.rs": {
+    "mtime": 1788785445.164274,
+    "seen": 1788786663.3673503,
+    "ast_hash": "ea9573f98e5653b5211db58f8edab7fd",
+    "semantic_hash": "ea9573f98e5653b5211db58f8edab7fd"
+  },
+  "tests/e2e_vertical_slice.rs": {
+    "mtime": 1788785445.164274,
+    "seen": 1788786663.3673503,
+    "ast_hash": "ac09eeaa712084f31fcb0c1fc760b757",
+    "semantic_hash": "ac09eeaa712084f31fcb0c1fc760b757"
+  },
+  "tests/fixtures/host_snapshot_v1.json": {
+    "mtime": 1788785445.1652741,
+    "seen": 1788786663.3673503,
+    "ast_hash": "2ecb2ba96a9806c5996a38280b655e5d",
+    "semantic_hash": "2ecb2ba96a9806c5996a38280b655e5d"
+  },
+  "tests/fixtures/v1/apple/devicectl-devices.json": {
+    "mtime": 1788785445.167274,
+    "seen": 1788786663.3673503,
+    "ast_hash": "b72c9eaaa55bda5ddb7e6f2823816de0",
+    "semantic_hash": "b72c9eaaa55bda5ddb7e6f2823816de0"
+  },
+  "tests/fixtures/v1/apple/devicectl-errors.json": {
+    "mtime": 1788785445.1682737,
+    "seen": 1788786663.3673503,
+    "ast_hash": "18fe2b1f5c109db57058430a34adebc8",
+    "semantic_hash": "18fe2b1f5c109db57058430a34adebc8"
+  },
+  "tests/fixtures/v1/apple/devicectl-plans.json": {
+    "mtime": 1788785445.1682737,
+    "seen": 1788786663.3673503,
+    "ast_hash": "847540e32a2640451afc753a4dda65a0",
+    "semantic_hash": "847540e32a2640451afc753a4dda65a0"
+  },
+  "tests/fixtures/v1/apple/simctl-devices.json": {
+    "mtime": 1788785445.1682737,
+    "seen": 1788786663.3673503,
+    "ast_hash": "17856987fef533ac139743f8be005655",
+    "semantic_hash": "17856987fef533ac139743f8be005655"
+  },
+  "tests/fixtures/v1/apple/xcodebuild-project-list.json": {
+    "mtime": 1788785445.1692739,
+    "seen": 1788786663.3673503,
+    "ast_hash": "e25ae2e275983467bd663c841c10598a",
+    "semantic_hash": "e25ae2e275983467bd663c841c10598a"
+  },
+  "tests/fixtures/v1/apple/xcodebuild-workspace-list.json": {
+    "mtime": 1788785445.1702738,
+    "seen": 1788786663.3673503,
+    "ast_hash": "6c1da15051c5eff2432207672657b4be",
+    "semantic_hash": "6c1da15051c5eff2432207672657b4be"
+  },
+  "tests/fixtures/v1/apple/xcresult-incompatible.json": {
+    "mtime": 1788785445.1702738,
+    "seen": 1788786663.3673503,
+    "ast_hash": "2d248a950ecb7cddc49ad69fd890cc8e",
+    "semantic_hash": "2d248a950ecb7cddc49ad69fd890cc8e"
+  },
+  "tests/fixtures/v1/apple/xcresult-partial.json": {
+    "mtime": 1788785445.1702738,
+    "seen": 1788786663.3673503,
+    "ast_hash": "c67ab3393fc5c866b9720244c67919a2",
+    "semantic_hash": "c67ab3393fc5c866b9720244c67919a2"
+  },
+  "tests/fixtures/v1/apple/xcresult-success.json": {
+    "mtime": 1788785445.1702738,
+    "seen": 1788786663.3673503,
+    "ast_hash": "ec405109cb65fa44714586ef288ea987",
+    "semantic_hash": "ec405109cb65fa44714586ef288ea987"
+  },
+  "tests/job_reconnect.rs": {
+    "mtime": 1788785445.172274,
+    "seen": 1788786663.3673503,
+    "ast_hash": "8ce7888a482fe97046ece915013bb68c",
+    "semantic_hash": "8ce7888a482fe97046ece915013bb68c"
+  },
+  "tests/lifecycle_smoke.rs": {
+    "mtime": 1788785445.172274,
+    "seen": 1788786663.3673503,
+    "ast_hash": "36ec1dd4c817962a3e81928a86c4701b",
+    "semantic_hash": "36ec1dd4c817962a3e81928a86c4701b"
+  },
+  "tests/linux_bootstrap.rs": {
+    "mtime": 1788785445.172274,
+    "seen": 1788786663.3673503,
+    "ast_hash": "1b69e40c240bb479569885da3d83f451",
+    "semantic_hash": "1b69e40c240bb479569885da3d83f451"
+  },
+  "tests/local_cli.rs": {
+    "mtime": 1788785445.1732738,
+    "seen": 1788786663.3673503,
+    "ast_hash": "7518bee277cedcb31d5e08b3626662b2",
+    "semantic_hash": "7518bee277cedcb31d5e08b3626662b2"
+  },
+  "tests/local_ipc.rs": {
+    "mtime": 1788785445.1742737,
+    "seen": 1788786663.3673503,
+    "ast_hash": "b68430506372f1dec51a3d6db54b918d",
+    "semantic_hash": "b68430506372f1dec51a3d6db54b918d"
+  },
+  "tests/local_runtime.rs": {
+    "mtime": 1788785445.1742737,
+    "seen": 1788786663.3673503,
+    "ast_hash": "aa58cfde56c54a5bcafd78a4d272a92d",
+    "semantic_hash": "aa58cfde56c54a5bcafd78a4d272a92d"
+  },
+  "tests/mac_bootstrap.rs": {
+    "mtime": 1788785445.1752741,
+    "seen": 1788786663.3673503,
+    "ast_hash": "d9ef50e260e579c7800702b434c17b62",
+    "semantic_hash": "d9ef50e260e579c7800702b434c17b62"
+  },
+  "tests/mac_hardware_gate.rs": {
+    "mtime": 1788785445.1752741,
+    "seen": 1788786663.3673503,
+    "ast_hash": "04310c0646ca1d1d2631acf9e70f4eac",
+    "semantic_hash": "04310c0646ca1d1d2631acf9e70f4eac"
+  },
+  "tests/mesh_dashboard_e2e.rs": {
+    "mtime": 1788785445.1757832,
+    "seen": 1788786663.3673503,
+    "ast_hash": "1988bf1481c21c0318c6c5c7ab62b15d",
+    "semantic_hash": "1988bf1481c21c0318c6c5c7ab62b15d"
+  },
+  "tests/mesh_dashboard_failure_matrix.rs": {
+    "mtime": 1788785445.1757832,
+    "seen": 1788786663.3673503,
+    "ast_hash": "cfe0b868f61a3cfb9e40d54df0fcb8dc",
+    "semantic_hash": "cfe0b868f61a3cfb9e40d54df0fcb8dc"
+  },
+  "tests/named_pipe_connect_diagnostics.rs": {
+    "mtime": 1788785445.1767926,
+    "seen": 1788786663.3673503,
+    "ast_hash": "da88fc66f345580d6039364c6f329fe2",
+    "semantic_hash": "da88fc66f345580d6039364c6f329fe2"
+  },
+  "tests/network_artifacts.rs": {
+    "mtime": 1788785445.1767926,
+    "seen": 1788786663.3673503,
+    "ast_hash": "bae296be3edc2bbc32c25695dc620901",
+    "semantic_hash": "bae296be3edc2bbc32c25695dc620901"
+  },
+  "tests/network_deadlines.rs": {
+    "mtime": 1788785445.1767926,
+    "seen": 1788786663.3673503,
+    "ast_hash": "b67cf30af3f74c1c49252c34f5ddffc2",
+    "semantic_hash": "b67cf30af3f74c1c49252c34f5ddffc2"
+  },
+  "tests/network_device_leases.rs": {
+    "mtime": 1788785445.1777923,
+    "seen": 1788786663.3673503,
+    "ast_hash": "44bdf00415ccd3357276e29bbe979062",
+    "semantic_hash": "44bdf00415ccd3357276e29bbe979062"
+  },
+  "tests/network_processes.rs": {
+    "mtime": 1788785445.1777923,
+    "seen": 1788786663.3673503,
+    "ast_hash": "c7b477212f28698c705adbd5181fc529",
+    "semantic_hash": "c7b477212f28698c705adbd5181fc529"
+  },
+  "tests/pairing.rs": {
+    "mtime": 1788785445.1787918,
+    "seen": 1788786663.3673503,
+    "ast_hash": "5bae8056d34a67f76e27c9f5d17426cc",
+    "semantic_hash": "5bae8056d34a67f76e27c9f5d17426cc"
+  },
+  "tests/pairing_listener.rs": {
+    "mtime": 1788785445.1787918,
+    "seen": 1788786663.3673503,
+    "ast_hash": "75f8b7c90a6f858c7b981660002ed195",
+    "semantic_hash": "75f8b7c90a6f858c7b981660002ed195"
+  },
+  "tests/pairing_tls.rs": {
+    "mtime": 1788785445.1787918,
+    "seen": 1788786663.3673503,
+    "ast_hash": "41b8e07cbd7b478d7c896b5fd06beb32",
+    "semantic_hash": "41b8e07cbd7b478d7c896b5fd06beb32"
+  },
+  "tests/policy_leases.rs": {
+    "mtime": 1788785445.1797924,
+    "seen": 1788786663.3673503,
+    "ast_hash": "bd442112371d21ed606badbf2d7839d4",
+    "semantic_hash": "bd442112371d21ed606badbf2d7839d4"
+  },
+  "tests/preflight.rs": {
+    "mtime": 1788785445.1797924,
+    "seen": 1788786663.3673503,
+    "ast_hash": "4ee4473622836498f231ded1249aadc2",
+    "semantic_hash": "4ee4473622836498f231ded1249aadc2"
+  },
+  "tests/process_execution.rs": {
+    "mtime": 1788785445.1797924,
+    "seen": 1788786663.3673503,
+    "ast_hash": "1636e3571dcd371062ef1804b8084bb2",
+    "semantic_hash": "1636e3571dcd371062ef1804b8084bb2"
+  },
+  "tests/protocol_contract.rs": {
+    "mtime": 1788785445.1807926,
+    "seen": 1788786663.3673503,
+    "ast_hash": "bd0b32a40a5773b1248c0badf2c173f6",
+    "semantic_hash": "bd0b32a40a5773b1248c0badf2c173f6"
+  },
+  "tests/quality_gate.rs": {
+    "mtime": 1788785445.1807926,
+    "seen": 1788786663.3673503,
+    "ast_hash": "f7979cca99499acf36ed500e7dc20a4e",
+    "semantic_hash": "f7979cca99499acf36ed500e7dc20a4e"
+  },
+  "tests/registry_runtime.rs": {
+    "mtime": 1788785445.1807926,
+    "seen": 1788786663.3673503,
+    "ast_hash": "bae961b4965f5ca7a32a4552b85ee03f",
+    "semantic_hash": "bae961b4965f5ca7a32a4552b85ee03f"
+  },
+  "tests/release_contract.rs": {
+    "mtime": 1788785445.1817925,
+    "seen": 1788786663.3673503,
+    "ast_hash": "b02390886d93f49129ad53a72256dad8",
+    "semantic_hash": "b02390886d93f49129ad53a72256dad8"
+  },
+  "tests/remote_apple_agent.rs": {
+    "mtime": 1788785445.1817925,
+    "seen": 1788786663.3673503,
+    "ast_hash": "c78895f8ed60726ad76f79f70c63a594",
+    "semantic_hash": "c78895f8ed60726ad76f79f70c63a594"
+  },
+  "tests/remote_apple_e2e.rs": {
+    "mtime": 1788785445.1823032,
+    "seen": 1788786663.3673503,
+    "ast_hash": "0a287819d5fa880ccf4ea081a53e1568",
+    "semantic_hash": "0a287819d5fa880ccf4ea081a53e1568"
+  },
+  "tests/remote_apple_protocol.rs": {
+    "mtime": 1788785445.1823032,
+    "seen": 1788786663.3680794,
+    "ast_hash": "2123d8aac36d40b7e43887f1cb36fe4d",
+    "semantic_hash": "2123d8aac36d40b7e43887f1cb36fe4d"
+  },
+  "tests/secure_transport.rs": {
+    "mtime": 1788785445.1823032,
+    "seen": 1788786663.3680794,
+    "ast_hash": "84f001c5d9fad7bed66b20faa0f5c0e6",
+    "semantic_hash": "84f001c5d9fad7bed66b20faa0f5c0e6"
+  },
+  "tests/workspaces.rs": {
+    "mtime": 1788785445.1833074,
+    "seen": 1788786663.3680794,
+    "ast_hash": "89088fbe520acd8514269bba529ee867",
+    "semantic_hash": "89088fbe520acd8514269bba529ee867"
+  }
+}
