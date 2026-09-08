@@ -6,8 +6,8 @@ loop:
   decisionPolicy: auto
   # STORY-37's workspace-level verification includes a cold MSVC build; allow
   # enough time for the isolated provider to finish without being killed by
-  # the default 30-minute supervision limit.
-  maxCallMinutes: 60
+  # the default 30-minute supervision limit or the 60-minute cold-build retry.
+  maxCallMinutes: 90
   progressTimeoutMinutes: 40
 runner:
   agent: codex
