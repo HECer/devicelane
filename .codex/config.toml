@@ -9,6 +9,7 @@ args = ["-m", "graphify.serve", "graphify-out/graph.json"]
 
 [mcp_servers.supabase]
 enabled = false
+url = "http://127.0.0.1:9/mcp"
 
 [mcp_servers.playwright]
 command = "npx"
