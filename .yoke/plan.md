@@ -422,3 +422,13 @@ verteilte Lease-Steuerung und die produktive Bootstrap-/Neustartpersistenz sind
 als eigene Pflichtstories vor das Hardware-Gate gezogen.
 
 Nicht-Ziele dieses Loops bleiben allgemeine iOS-Systemfernsteuerung, Steuerung fremder Apps, Umgehung von Signing/Trust/Developer Mode sowie eine Desktop-GUI. Private Signing-Schlüssel verlassen niemals den macOS-Keychain. Der Nutzer wird erst eingebunden, wenn Bootstrap und Hardware-Gate als ein konkreter Mac-Befehl bereitstehen.
+
+## STORY-37 Replan: reproducible Windows verification
+
+The registry-worker failure path is verified in the real supervisor/IPC tests.
+On Windows, the loop must run from the installed Visual Studio 2022 BuildTools
+developer shell (MSVC 14.44.35207 with `vcruntime.h` available); the VS 18
+Community shell is incomplete and is not an acceptable verification environment.
+`CODEX_HOME`, `TEMP`, `TMP`, and `CARGO_TARGET_DIR` are redirected to the E:
+volume for the isolated run. Acceptance requires all three STORY-37 criteria,
+the configured workspace verification command, and a final PRD result of 17/17.
