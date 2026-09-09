@@ -4,14 +4,14 @@ agents:
 loop:
   enabled: true
   decisionPolicy: auto
-  # STORY-37's workspace-level verification includes a cold MSVC build; allow
-  # enough time for the isolated provider to finish without being killed by
-  # the default 30-minute supervision limit or the 60-minute cold-build retry.
-  maxCallMinutes: 90
-  # The provider can spend several minutes in silent workspace tests; avoid
-  # the CLI's default 20-minute idle-output watchdog terminating that phase.
-  timeoutMinutes: 40
-  progressTimeoutMinutes: 40
+  # STORY-37's workspace-level verification includes a cold MSVC build and a
+  # full clippy pass; allow the isolated provider to finish without a hard
+  # process cutoff while retaining a bounded recovery window.
+  maxCallMinutes: 180
+  # The provider can spend several minutes in silent workspace tests; keep a
+  # generous idle/progress window so long verification phases can complete.
+  timeoutMinutes: 90
+  progressTimeoutMinutes: 90
 runner:
   agent: codex
 routing:
