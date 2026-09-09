@@ -432,3 +432,9 @@ Community shell is incomplete and is not an acceptable verification environment.
 `CODEX_HOME`, `TEMP`, `TMP`, and `CARGO_TARGET_DIR` are redirected to the E:
 volume for the isolated run. Acceptance requires all three STORY-37 criteria,
 the configured workspace verification command, and a final PRD result of 17/17.
+
+The isolated test environment must preserve the real Windows `USERPROFILE`
+(`C:\Users\HEC_e`) so ACL/owner checks observe the authenticated account. Only
+`TEMP`/`TMP` and `CARGO_TARGET_DIR` are redirected; replacing `USERPROFILE`
+with a temporary E: directory invalidates the existing state-path security
+suite and is an environment failure, not a product failure.
