@@ -365,6 +365,15 @@ fn windows_service_deployment_allows_scheduler_to_execute_hardened_binary() {
 }
 
 #[test]
+fn windows_service_deployment_assigns_current_user_as_state_owner() {
+    let setup = read("scripts/setup-windows.ps1");
+    assert!(
+        setup.contains("/setowner $UserId"),
+        "Windows service state directories must be owned by the interactive service user"
+    );
+}
+
+#[test]
 fn elevated_msi_gate_cannot_fall_back_to_administrative_extraction() {
     let workflow = read(".github/workflows/desktop-release.yml");
     let smoke = read("scripts/desktop-release-smoke.ps1");
