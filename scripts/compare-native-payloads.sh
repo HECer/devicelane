@@ -57,5 +57,26 @@ manifest() {
 }
 manifest "$root/a" "$root/a.manifest"
 manifest "$root/b" "$root/b.manifest"
-diff -u "$root/a.manifest" "$root/b.manifest"
+
+if ! diff -u "$root/a.manifest" "$root/b.manifest"; then
+  if [ "$kind" = dmg ]; then
+    for executable in devicelane devicelane-desktop devicelane-service; do
+      first_executable="$root/a/DeviceLane.app/Contents/MacOS/$executable"
+      second_executable="$root/b/DeviceLane.app/Contents/MacOS/$executable"
+      if [ -f "$first_executable" ] && [ -f "$second_executable" ] && ! cmp -s "$first_executable" "$second_executable"; then
+        echo "diagnostic: differing macOS executable $executable" >&2
+        shasum -a 256 "$first_executable" "$second_executable" >&2
+        cmp -l "$first_executable" "$second_executable" | head -n 32 >&2 || true
+        if command -v dwarfdump >/dev/null 2>&1; then
+          dwarfdump --uuid "$first_executable" "$second_executable" >&2 || true
+        fi
+        if command -v otool >/dev/null 2>&1; then
+          otool -l "$first_executable" | grep -A2 -B1 LC_UUID >&2 || true
+          otool -l "$second_executable" | grep -A2 -B1 LC_UUID >&2 || true
+        fi
+      fi
+    done
+  fi
+  exit 1
+fi
 echo "unsigned $kind normalized payloads are reproducible"

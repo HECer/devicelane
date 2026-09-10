@@ -273,6 +273,8 @@ fn production_environment_drift_and_unsigned_reproducibility_are_gated() {
     }
     assert!(comparison.contains("Compare-Object"));
     assert!(comparison.contains("diff -u"));
+    assert!(comparison.contains("cmp -l"));
+    assert!(comparison.contains("dwarfdump --uuid"));
     let readme = read("README.md");
     assert!(readme.contains("unsigned payloads and configuration"));
     assert!(readme.contains("signed envelope"));
