@@ -351,12 +351,12 @@ fn local_connection_update_requires_exact_grant_and_preserves_identity() {
     let root = tempfile::tempdir().unwrap();
     let identity = root.path().join("workstation");
     let logs = root.path().join("logs");
-    SecureTransport::load_or_create(&identity, "workstation").unwrap();
     #[cfg(windows)]
     {
         device_development_mesh::state_paths::prepare_private_state_directory(&identity).unwrap();
         device_development_mesh::state_paths::prepare_private_state_directory(&logs).unwrap();
     }
+    SecureTransport::load_or_create(&identity, "workstation").unwrap();
     let key = std::fs::read(identity.join("private-key.der")).unwrap();
     let runtime = root.path().join("runtime");
     #[cfg(windows)]
