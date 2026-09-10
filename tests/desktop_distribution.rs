@@ -294,6 +294,10 @@ fn macos_release_linker_uses_reproducible_output_mode() {
         cargo_config.contains("-Wl,-reproducible"),
         "macOS binaries must use the linker reproducibility mode"
     );
+    assert!(
+        cargo_config.contains("-Wl,-no_adhoc_codesign"),
+        "unsigned macOS binaries must not contain linker-generated ad-hoc signatures"
+    );
 }
 
 #[test]

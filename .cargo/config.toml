@@ -5,7 +5,7 @@ rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/Brepro"]
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/Brepro"]
 
 [target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-Wl,-reproducible"]
+rustflags = ["-C", "link-arg=-Wl,-reproducible", "-C", "link-arg=-Wl,-no_adhoc_codesign"]
 
 [target.x86_64-apple-darwin]
-rustflags = ["-C", "link-arg=-Wl,-reproducible"]
+rustflags = ["-C", "link-arg=-Wl,-reproducible", "-C", "link-arg=-Wl,-no_adhoc_codesign"]
