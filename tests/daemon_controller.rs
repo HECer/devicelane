@@ -127,7 +127,7 @@ fn daemon_controller_serves_inventory_with_its_existing_certificate() {
             match client.connect_tls(socket, "controller-fixture") {
                 Ok(tls) => {
                     drop(socket_deadline);
-                    break tls;
+                    break 'attempts (process, address, tls);
                 }
                 Err(TransportError::Tls) if Instant::now() < deadline => {
                     drop(socket_deadline);
