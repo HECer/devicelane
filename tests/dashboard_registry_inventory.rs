@@ -5,6 +5,7 @@ use device_development_mesh::local_ipc::{
 };
 use device_development_mesh::secure_transport::SecureTransport;
 use std::net::TcpListener;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,11 @@ impl Drop for Process {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+#[cfg(windows)]
+fn prepare_private_state_directory(path: &Path) {
+    device_development_mesh::state_paths::prepare_private_state_directory(path).unwrap();
 }
 
 fn spawn(binary: &str, args: &[&str]) -> Process {
@@ -33,6 +39,8 @@ fn local_snapshot_responds_before_blocked_authenticated_inventory_is_released() 
     use std::sync::mpsc;
     let root = tempfile::tempdir().unwrap();
     let identity = root.path().join("workstation");
+    #[cfg(windows)]
+    prepare_private_state_directory(&identity);
     let mut registry =
         SecureTransport::load_or_create(root.path().join("registry"), "registry").unwrap();
     let mut client = SecureTransport::load_or_create(&identity, "workstation").unwrap();
@@ -99,8 +107,16 @@ fn local_snapshot_responds_before_blocked_authenticated_inventory_is_released() 
     });
     let runtime = root.path().join("runtime");
     let logs = root.path().join("logs");
-    std::fs::create_dir_all(&runtime).unwrap();
-    std::fs::create_dir_all(&logs).unwrap();
+    #[cfg(windows)]
+    {
+        prepare_private_state_directory(&runtime);
+        prepare_private_state_directory(&logs);
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -174,6 +190,10 @@ fn actual_service_observes_registry_inventory_and_recovers_after_disconnect() {
     let client_path = root.path().join("workstation");
     let agent_path = root.path().join("agent");
     let hostile_path = root.path().join("hostile-agent");
+    #[cfg(windows)]
+    for path in [&registry_path, &client_path, &agent_path, &hostile_path] {
+        prepare_private_state_directory(path);
+    }
     let mut registry = SecureTransport::load_or_create(&registry_path, "registry").unwrap();
     for (path, id) in [
         (&client_path, "workstation"),
@@ -223,8 +243,16 @@ fn actual_service_observes_registry_inventory_and_recovers_after_disconnect() {
     );
     let runtime = root.path().join("runtime");
     let logs = root.path().join("logs");
-    std::fs::create_dir_all(&runtime).unwrap();
-    std::fs::create_dir_all(&logs).unwrap();
+    #[cfg(windows)]
+    {
+        prepare_private_state_directory(&runtime);
+        prepare_private_state_directory(&logs);
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

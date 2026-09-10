@@ -445,6 +445,17 @@ fn hash(bytes: &[u8]) -> String {
 }
 
 fn pair(left_path: &Path, left_id: &str, right_path: &Path, right_id: &str) {
+    #[cfg(windows)]
+    {
+        if !left_path.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(left_path)
+                .unwrap();
+        }
+        if !right_path.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(right_path)
+                .unwrap();
+        }
+    }
     let mut left = SecureTransport::load_or_create(left_path, left_id).unwrap();
     let mut right = SecureTransport::load_or_create(right_path, right_id).unwrap();
     let code = left.issue_pairing_code(Duration::from_secs(10));

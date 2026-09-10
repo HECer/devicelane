@@ -110,6 +110,19 @@ fn pair_process(
     registry_identity: &std::path::Path,
     peer_identity: &std::path::Path,
 ) {
+    #[cfg(windows)]
+    {
+        if !registry_identity.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(
+                registry_identity,
+            )
+            .unwrap();
+        }
+        if !peer_identity.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(peer_identity)
+                .unwrap();
+        }
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     let pairing_address = free_address();
     let mut pairing_server = ChildGuard(

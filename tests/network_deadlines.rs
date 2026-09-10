@@ -108,6 +108,19 @@ fn bounded_output(mut command: Command, timeout: Duration) -> Output {
 }
 
 fn pair(registry_identity: &std::path::Path, cli_identity: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        if !registry_identity.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(
+                registry_identity,
+            )
+            .unwrap();
+        }
+        if !cli_identity.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(cli_identity)
+                .unwrap();
+        }
+    }
     let address = free_address();
     let mut registry = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_mesh-registry"))

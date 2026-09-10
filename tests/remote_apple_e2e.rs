@@ -1007,8 +1007,12 @@ fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
 fn pair(registry: &Path, registry_id: &str, peer: &Path, peer_id: &str) {
     #[cfg(windows)]
     {
-        prepare_service_state_directory(registry);
-        prepare_service_state_directory(peer);
+        if !registry.exists() {
+            prepare_service_state_directory(registry);
+        }
+        if !peer.exists() {
+            prepare_service_state_directory(peer);
+        }
     }
     let mut left = SecureTransport::load_or_create(registry, registry_id).unwrap();
     let mut right = SecureTransport::load_or_create(peer, peer_id).unwrap();

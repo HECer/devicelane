@@ -1563,6 +1563,16 @@ fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
 }
 
 fn pair(registry: &Path, registry_id: &str, peer: &Path, peer_id: &str) {
+    #[cfg(windows)]
+    {
+        if !registry.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(registry)
+                .unwrap();
+        }
+        if !peer.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(peer).unwrap();
+        }
+    }
     let mut left = SecureTransport::load_or_create(registry, registry_id).unwrap();
     let mut right = SecureTransport::load_or_create(peer, peer_id).unwrap();
     let code = left.issue_pairing_code(Duration::from_secs(10));
