@@ -74,6 +74,16 @@ fn release_sidecar_build_uses_the_workspace_lockfile() {
 }
 
 #[test]
+fn debug_sidecar_build_does_not_inherit_release_only_linker_flags() {
+    let stage = read("desktop/scripts/stage-sidecar.mjs");
+    assert!(
+        stage.contains("debug && targetTriple.includes(\"apple-darwin\")")
+            && stage.contains("[\"--config\", `target.${targetTriple}.rustflags=[]`]"),
+        "debug sidecar builds must not inherit release-only linker flags"
+    );
+}
+
+#[test]
 fn unsigned_artifacts_can_never_be_published_as_production() {
     let workflow = read(".github/workflows/desktop-release.yml");
     assert!(workflow.contains("unsigned-ci"));

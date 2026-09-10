@@ -8,7 +8,6 @@ const repositoryDir = resolve(desktopDir, "..");
 const debug = process.argv.includes("--debug");
 const serviceBuildDescription = "cargo build --release --bin devicelane-service";
 const buildDescription = "cargo build --release --locked --bin devicelane --bin devicelane-service";
-const cargoArguments = ["build", ...(debug ? [] : ["--release"]), "--locked", "--bin", "devicelane", "--bin", "devicelane-service", "--message-format=json"];
 
 function checked(program, args) {
   const result = spawnSync(program, args, { cwd: repositoryDir, encoding: "utf8", shell: false });
@@ -20,6 +19,19 @@ const rustcInfo = checked("rustc", ["-vV"]);
 const targetTriple = rustcInfo.match(/^host: (.+)$/m)?.[1];
 if (!targetTriple) throw new Error("rustc did not report a host target triple");
 
+const cargoArguments = [
+  ...(debug && targetTriple.includes("apple-darwin")
+    ? ["--config", `target.${targetTriple}.rustflags=[]`]
+    : []),
+  "build",
+  ...(debug ? [] : ["--release"]),
+  "--locked",
+  "--bin",
+  "devicelane",
+  "--bin",
+  "devicelane-service",
+  "--message-format=json",
+];
 const messages = checked("cargo", cargoArguments).trim().split(/\r?\n/);
 const executableSuffix = targetTriple.includes("windows") ? ".exe" : "";
 for (const binary of ["devicelane-service", "devicelane"]) {
