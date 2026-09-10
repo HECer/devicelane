@@ -59,8 +59,10 @@ fn service() -> (
     Service,
 ) {
     let root = tempfile::tempdir().unwrap();
+    let identity = root.path().join("identity.json");
     let runtime = root.path().join("runtime");
     let logs = root.path().join("logs");
+    prepare_service_state_directory(&identity);
     prepare_service_state_directory(&runtime);
     prepare_service_state_directory(&logs);
     let text = endpoint_text(&runtime);
@@ -68,7 +70,7 @@ fn service() -> (
     let child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
         .args([
             "--identity",
-            root.path().join("identity.json").to_str().unwrap(),
+            identity.to_str().unwrap(),
             "--runtime-dir",
             runtime.to_str().unwrap(),
             "--role",

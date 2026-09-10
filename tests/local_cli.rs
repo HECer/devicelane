@@ -54,17 +54,16 @@ fn run_cli(endpoint: &str, args: &[&str]) -> Output {
 
 fn start_service() -> (tempfile::TempDir, String, LocalEndpoint, Service) {
     let root = tempfile::tempdir().unwrap();
+    let identity = root.path().join("identity.json");
     let runtime = root.path().join("runtime");
     let logs = root.path().join("logs");
+    prepare_service_state_directory(&identity);
     prepare_service_state_directory(&runtime);
     prepare_service_state_directory(&logs);
     let endpoint_text = endpoint_text(&runtime);
     let endpoint = local_endpoint(&runtime, &endpoint_text).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
-        .args([
-            "--identity",
-            root.path().join("identity.json").to_str().unwrap(),
-        ])
+        .args(["--identity", identity.to_str().unwrap()])
         .args(["--runtime-dir", runtime.to_str().unwrap()])
         .args(["--role", "workstation"])
         .args(["--registry", "registry.example:443"])
