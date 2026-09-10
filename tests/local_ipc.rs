@@ -552,13 +552,14 @@ fn workstation_service_does_not_require_remote_mesh_configuration() {
 fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
     let pipe = format!(r"\\.\pipe\devicelane-e2e-{}", std::process::id());
     let temp = tempfile::tempdir().unwrap();
-    prepare_service_state_directory(temp.path());
+    let state = temp.path().join("state");
+    prepare_service_state_directory(&state);
     let mut child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
         .args([
             "--identity",
-            temp.path().join("identity").to_str().unwrap(),
+            state.join("identity").to_str().unwrap(),
             "--runtime-dir",
-            temp.path().to_str().unwrap(),
+            state.to_str().unwrap(),
             "--role",
             "workstation",
             "--registry",
@@ -568,7 +569,7 @@ fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
             "--agent-peer",
             "mac-agent-1",
             "--log-dir",
-            temp.path().join("logs").to_str().unwrap(),
+            state.join("logs").to_str().unwrap(),
         ])
         .spawn()
         .unwrap();
@@ -1096,9 +1097,10 @@ fn slow_client_cannot_block_a_second_named_pipe_client() {
     }
     let pipe = format!(r"\\.\pipe\devicelane-slow-{}", std::process::id());
     let temp = tempfile::tempdir().unwrap();
-    let identity = temp.path().join("identity");
-    let logs = temp.path().join("logs");
-    prepare_service_state_directory(temp.path());
+    let state = temp.path().join("state");
+    let identity = state.join("identity");
+    let logs = state.join("logs");
+    prepare_service_state_directory(&state);
     prepare_service_state_directory(&logs);
     let mut child = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
@@ -1106,7 +1108,7 @@ fn slow_client_cannot_block_a_second_named_pipe_client() {
                 "--identity",
                 identity.to_str().unwrap(),
                 "--runtime-dir",
-                temp.path().to_str().unwrap(),
+                state.to_str().unwrap(),
                 "--role",
                 "workstation",
                 "--registry",
@@ -1163,16 +1165,17 @@ fn named_pipe_security_is_explicitly_current_user_and_system_only() {
 fn named_pipe_worker_pool_applies_bounded_backpressure() {
     let pipe = format!(r"\\.\pipe\devicelane-saturation-{}", std::process::id());
     let temp = tempfile::tempdir().unwrap();
-    let identity = temp.path().join("identity");
-    let logs = temp.path().join("logs");
-    prepare_service_state_directory(temp.path());
+    let state = temp.path().join("state");
+    let identity = state.join("identity");
+    let logs = state.join("logs");
+    prepare_service_state_directory(&state);
     prepare_service_state_directory(&logs);
     let mut child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
         .args([
             "--identity",
             identity.to_str().unwrap(),
             "--runtime-dir",
-            temp.path().to_str().unwrap(),
+            state.to_str().unwrap(),
             "--role",
             "workstation",
             "--registry",
@@ -1347,10 +1350,11 @@ fn unix_runtime_rejects_symlinks_and_insecure_permissions() {
 #[test]
 fn service_managed_policy_configuration_is_paired_and_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
-    prepare_service_state_directory(temp.path());
-    let identity = temp.path().join("identity");
-    let runtime = temp.path().join("runtime");
-    let logs = temp.path().join("logs");
+    let state = temp.path().join("state");
+    prepare_service_state_directory(&state);
+    let identity = state.join("identity");
+    let runtime = state.join("runtime");
+    let logs = state.join("logs");
     for path in [&identity, &runtime, &logs] {
         prepare_service_state_directory(path);
     }
@@ -1359,8 +1363,8 @@ fn service_managed_policy_configuration_is_paired_and_fails_closed() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let policy = temp.path().join("policy.json");
-    let trust = temp.path().join("admins.json");
+    let policy = state.join("policy.json");
+    let trust = state.join("admins.json");
     std::fs::write(&policy, b"{}").unwrap();
     std::fs::write(&trust, b"{}").unwrap();
     #[cfg(windows)]
