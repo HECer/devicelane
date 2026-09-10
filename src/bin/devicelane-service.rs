@@ -40,6 +40,35 @@ struct Args {
     policy_admin_sids: Vec<String>,
 }
 
+fn requested_log_dir() -> Option<PathBuf> {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(argument) = args.next() {
+        if argument == "--log-dir" {
+            return args.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+fn persist_startup_error(error: &str) {
+    let Some(log_dir) = requested_log_dir() else {
+        return;
+    };
+    if !log_dir.is_absolute() || validate_private_state_directory(&log_dir).is_err() {
+        return;
+    }
+    let path = log_dir.join("startup-error.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    use std::io::Write;
+    let _ = writeln!(file, "{error}");
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut parsed = Args::default();
     let mut args = std::env::args().skip(1);
@@ -346,6 +375,7 @@ fn main() {
     }
     if let Err(error) = run() {
         eprintln!("devicelane-service: {error}");
+        persist_startup_error(&error);
         std::process::exit(2);
     }
 }

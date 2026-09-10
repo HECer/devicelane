@@ -157,6 +157,8 @@ fn windows_service_repair_has_activation_health_and_rollback_operations() {
         "new DeviceLane service task did not remain running",
         "Get-ScheduledTaskInfo -TaskName $ServiceTaskName",
         "LastTaskResult",
+        "startup-error.log",
+        "Get-Content -LiteralPath $ServiceStartupLog",
     ] {
         assert!(
             setup.contains(required),

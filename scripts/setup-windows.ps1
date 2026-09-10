@@ -19,6 +19,7 @@ $ServiceRoot = Join-Path $env:LOCALAPPDATA "DeviceLane\service"
 $ServiceIdentityDir = Join-Path $env:LOCALAPPDATA "DeviceLane\service\identity"
 $ServiceRuntimeDir = Join-Path $env:LOCALAPPDATA "DeviceLane\service\runtime"
 $ServiceLogDir = Join-Path $env:LOCALAPPDATA "DeviceLane\service\logs"
+$ServiceStartupLog = Join-Path $ServiceLogDir "startup-error.log"
 
 for ($Index = 0; $Index -lt $args.Count; $Index++) {
     switch ($args[$Index]) {
@@ -69,7 +70,12 @@ function Invoke-ServiceActivation($ExistingTask, $Operations) {
         if ($ServiceState -ne "Running") {
             $ServiceInfo = Get-ScheduledTaskInfo -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
             $LastTaskResult = if ($null -ne $ServiceInfo) { $ServiceInfo.LastTaskResult } else { "unavailable" }
-            throw "new DeviceLane service task did not remain running (state=$ServiceState; last task result=$LastTaskResult)"
+            $StartupDiagnostics = "unavailable"
+            if (Test-Path -LiteralPath $ServiceStartupLog -PathType Leaf) {
+                $StartupDiagnostics = (Get-Content -LiteralPath $ServiceStartupLog -Tail 8 -ErrorAction SilentlyContinue) -join " | "
+                if ([string]::IsNullOrWhiteSpace($StartupDiagnostics)) { $StartupDiagnostics = "empty" }
+            }
+            throw "new DeviceLane service task did not remain running (state=$ServiceState; last task result=$LastTaskResult; startup diagnostics=$StartupDiagnostics)"
         }
     } catch {
         $ActivationError = $_

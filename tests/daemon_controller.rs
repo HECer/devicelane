@@ -1,5 +1,5 @@
 use device_development_mesh::network_processes::{Request, Response};
-use device_development_mesh::secure_transport::SecureTransport;
+use device_development_mesh::secure_transport::{SecureTransport, TransportError};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
@@ -89,14 +89,14 @@ fn daemon_controller_serves_inventory_with_its_existing_certificate() {
     drop(reservation);
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut process = Process::spawn(&mut command);
-    let socket = loop {
+    let mut tls = loop {
         process.assert_running();
         let timeout = match remaining(deadline) {
             Ok(timeout) => timeout,
             Err(error) => panic!("controller did not start at {address}: {error}"),
         };
-        match TcpStream::connect_timeout(&address, timeout) {
-            Ok(socket) => break socket,
+        let socket = match TcpStream::connect_timeout(&address, timeout) {
+            Ok(socket) => socket,
             Err(error) => {
                 process.assert_running();
                 assert!(
@@ -107,21 +107,38 @@ fn daemon_controller_serves_inventory_with_its_existing_certificate() {
                     Duration::from_millis(20)
                         .min(deadline.saturating_duration_since(Instant::now())),
                 );
+                continue;
+            }
+        };
+        process.assert_running();
+        socket
+            .set_read_timeout(Some(remaining(deadline).unwrap()))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(remaining(deadline).unwrap()))
+            .unwrap();
+        // Also interrupt a peer that trickles TLS records indefinitely between socket timeouts.
+        let socket_deadline = SocketDeadline::new(&socket, deadline);
+        match client.connect_tls(socket, "controller-fixture") {
+            Ok(tls) => {
+                drop(socket_deadline);
+                break tls;
+            }
+            Err(TransportError::Tls) if Instant::now() < deadline => {
+                drop(socket_deadline);
+                thread::sleep(
+                    Duration::from_millis(20)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => {
+                drop(socket_deadline);
+                panic!(
+                    "controller must complete normal mutual TLS with the trusted inventory client: {error:?}"
+                );
             }
         }
     };
-    process.assert_running();
-    socket
-        .set_read_timeout(Some(remaining(deadline).unwrap()))
-        .unwrap();
-    socket
-        .set_write_timeout(Some(remaining(deadline).unwrap()))
-        .unwrap();
-    // Also interrupt a peer that trickles TLS records indefinitely between socket timeouts.
-    let _socket_deadline = SocketDeadline::new(&socket, deadline);
-    let mut tls = client
-        .connect_tls(socket, "controller-fixture")
-        .expect("controller must complete normal mutual TLS with the trusted inventory client");
     let peer = tls.conn.peer_certificates().unwrap().first().unwrap();
     assert_eq!(
         peer.as_ref(),
@@ -161,7 +178,6 @@ fn daemon_controller_serves_inventory_with_its_existing_certificate() {
     );
     process.assert_running();
     drop(tls);
-    drop(_socket_deadline);
     let endpoint =
         device_development_mesh::local_ipc::local_endpoint(&runtime, &local_endpoint).unwrap();
     let (sender, receiver) = mpsc::channel();
@@ -301,6 +317,12 @@ fn daemon_controller_rejects_corrupt_state_before_becoming_ready() {
     assert!(
         diagnostics.contains("recovery_state_corrupt"),
         "startup failed for an unrelated reason: {diagnostics}"
+    );
+    assert!(
+        std::fs::read_to_string(logs.join("startup-error.log"))
+            .unwrap()
+            .contains("recovery_state_corrupt"),
+        "startup failure was not persisted to the service log"
     );
     assert!(
         !diagnostics.contains("devicelane-service: listening on"),

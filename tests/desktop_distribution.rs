@@ -280,6 +280,21 @@ fn production_environment_drift_and_unsigned_reproducibility_are_gated() {
 }
 
 #[test]
+fn macos_release_linker_uses_reproducible_output_mode() {
+    let cargo_config = read(".cargo/config.toml");
+    for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        assert!(
+            cargo_config.contains(&format!("[target.{target}]")),
+            "missing macOS target linker configuration: {target}"
+        );
+    }
+    assert!(
+        cargo_config.contains("-Wl,-reproducible"),
+        "macOS binaries must use the linker reproducibility mode"
+    );
+}
+
+#[test]
 fn elevated_msi_gate_cannot_fall_back_to_administrative_extraction() {
     let workflow = read(".github/workflows/desktop-release.yml");
     let smoke = read("scripts/desktop-release-smoke.ps1");
