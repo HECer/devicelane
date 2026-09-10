@@ -7,6 +7,11 @@ resolver = "2"
 [patch.crates-io]
 tauri-codegen = { git = "https://github.com/tauri-apps/tauri", rev = "29c87c3" }
 
+# Keep the patched codegen crate on the same registry `tauri-utils` instance
+# as the rest of the locked Tauri dependency graph.
+[patch."https://github.com/tauri-apps/tauri"]
+tauri-utils = { version = "2.9.3" }
+
 [package]
 name = "devicelane"
 version = "0.1.0"

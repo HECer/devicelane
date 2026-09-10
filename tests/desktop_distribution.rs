@@ -303,6 +303,19 @@ fn tauri_codegen_uses_the_upstream_deterministic_asset_fix() {
 }
 
 #[test]
+fn tauri_codegen_patch_reuses_the_registry_tauri_utils() {
+    let manifest = read("Cargo.toml");
+    assert!(manifest.contains("[patch.\"https://github.com/tauri-apps/tauri\"]"));
+    assert!(manifest.contains("tauri-utils = { version = \"2.9.3\" }"));
+
+    let lockfile = read("Cargo.lock");
+    assert!(
+        !lockfile.contains("tauri-utils 2.9.3 (git+https://github.com/tauri-apps/tauri)"),
+        "the codegen patch must not introduce a second tauri-utils source"
+    );
+}
+
+#[test]
 fn windows_service_activation_reports_the_registered_action_and_binary() {
     let setup = read("scripts/setup-windows.ps1");
     for declaration in [
