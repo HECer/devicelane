@@ -1974,6 +1974,84 @@ mod inventory_generation_tests {
             ConnectionState::Connecting
         );
     }
+
+    #[test]
+    fn persistent_mesh_rpc_allows_a_slow_authenticated_response() {
+        use crate::network_processes::{Request, Response};
+        use std::io::{BufReader, Write};
+        use std::net::TcpListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let registry_path = root.path().join("registry");
+        let client_path = root.path().join("client");
+        #[cfg(windows)]
+        {
+            crate::dashboard::audit::create_private_dir(&registry_path).unwrap();
+            crate::dashboard::audit::create_private_dir(&client_path).unwrap();
+        }
+        let mut registry = SecureTransport::load_or_create(&registry_path, "registry").unwrap();
+        let mut client = SecureTransport::load_or_create(&client_path, "client").unwrap();
+        registry.trust("client", client.certificate_der()).unwrap();
+        client
+            .trust("registry", registry.certificate_der())
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut stream = registry.accept_tls(socket).unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream).read_line(&mut request).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).unwrap(),
+                Request::List
+            ));
+            std::thread::sleep(Duration::from_millis(300));
+            serde_json::to_writer(
+                &mut stream,
+                &Response {
+                    accepted: true,
+                    hosts: Vec::new(),
+                    job_id: None,
+                    events: Vec::new(),
+                    audit: Vec::new(),
+                    artifact: None,
+                    error: None,
+                    operation: None,
+                    apple_operation: None,
+                    cancel_jobs: Vec::new(),
+                    artifact_metadata: None,
+                    artifact_chunk: None,
+                    confirmed_offset: None,
+                    lease_grant: None,
+                    lease_status: None,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+
+        let response = PersistentMeshRpcBoundary::default()
+            .call(
+                &RemoteExecutionConfig {
+                    registry_address: address,
+                    registry_peer_id: "registry".into(),
+                    identity_path: client_path,
+                    client_id: "client".into(),
+                },
+                &Request::List,
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert!(response.accepted);
+    }
 }
 
 fn open_mesh_session(
@@ -1989,10 +2067,10 @@ fn open_mesh_session(
     let stream = TcpStream::connect_timeout(&address, Duration::from_millis(500))
         .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
     stream
-        .set_read_timeout(Some(Duration::from_millis(250)))
+        .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
     stream
-        .set_write_timeout(Some(Duration::from_millis(250)))
+        .set_write_timeout(Some(Duration::from_secs(2)))
         .map_err(|_| LocalProtocolError::RemoteUnavailable)?;
     let stream = transport
         .connect_tls(stream, &config.registry_peer_id)
