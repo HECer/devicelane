@@ -74,16 +74,6 @@ fn release_sidecar_build_uses_the_workspace_lockfile() {
 }
 
 #[test]
-fn debug_sidecar_build_does_not_inherit_release_only_linker_flags() {
-    let stage = read("desktop/scripts/stage-sidecar.mjs");
-    assert!(
-        stage.contains("debug && targetTriple.includes(\"apple-darwin\")")
-            && stage.contains("[\"--config\", `target.${targetTriple}.rustflags=[]`]"),
-        "debug sidecar builds must not inherit release-only linker flags"
-    );
-}
-
-#[test]
 fn unsigned_artifacts_can_never_be_published_as_production() {
     let workflow = read(".github/workflows/desktop-release.yml");
     assert!(workflow.contains("unsigned-ci"));
@@ -293,20 +283,12 @@ fn production_environment_drift_and_unsigned_reproducibility_are_gated() {
 
 #[test]
 fn macos_release_linker_uses_reproducible_output_mode() {
-    let cargo_config = read(".cargo/config.toml");
-    for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
-        assert!(
-            cargo_config.contains(&format!("[target.{target}]")),
-            "missing macOS target linker configuration: {target}"
-        );
-    }
+    let workflow = read(".github/workflows/desktop-release.yml");
     assert!(
-        cargo_config.contains("-Wl,-reproducible"),
-        "macOS binaries must use the linker reproducibility mode"
-    );
-    assert!(
-        cargo_config.contains("-Wl,-no_adhoc_codesign"),
-        "unsigned macOS binaries must not contain linker-generated ad-hoc signatures"
+        workflow.contains("RUSTFLAGS=-C link-arg=-Wl,-reproducible")
+            && workflow.contains("-C link-arg=-Wl,-no_adhoc_codesign")
+            && workflow.contains("-C link-arg=-Wl,-no_uuid"),
+        "unsigned macOS binaries must use reproducible linker options"
     );
 }
 

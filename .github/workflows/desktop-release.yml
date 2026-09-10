@@ -37,6 +37,10 @@ jobs:
       - name: Deterministic build epoch
         shell: bash
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: Reproducible unsigned macOS linker
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo 'RUSTFLAGS=-C link-arg=-Wl,-reproducible -C link-arg=-Wl,-no_adhoc_codesign -C link-arg=-Wl,-no_uuid' >> "$GITHUB_ENV"
       - name: Reproducible unsigned payload gate
         working-directory: desktop
         shell: bash
