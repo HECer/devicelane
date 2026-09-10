@@ -91,6 +91,10 @@ mod tests {
         directory
     }
 
+    fn resolved_existing(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap()
+    }
+
     #[test]
     fn private_eligibility_rejects_filesystem_root_without_preparation() {
         let root = tempfile::tempdir().unwrap();
@@ -113,12 +117,14 @@ mod tests {
         std::fs::write(&sentinel, b"unchanged preflight").unwrap();
         assert_eq!(
             validate_private_state_directory(&directory).unwrap(),
-            directory
+            resolved_existing(&directory)
         );
         let requested = directory.join("missing").join("identity");
         assert_eq!(
             validate_private_state_directory(&requested).unwrap(),
-            requested
+            resolved_existing(&directory)
+                .join("missing")
+                .join("identity")
         );
         assert!(!directory.join("missing").exists());
         assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged preflight");
@@ -131,7 +137,7 @@ mod tests {
         let directory = owned_root(root.path());
         std::fs::write(directory.join("sentinel"), b"existing data").unwrap();
         let resolved = validate_state_directory(&directory).unwrap();
-        assert_eq!(resolved, directory);
+        assert_eq!(resolved, resolved_existing(&directory));
         assert_eq!(
             std::fs::read(resolved.join("sentinel")).unwrap(),
             b"existing data"
@@ -143,7 +149,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = owned_root(root.path());
         let requested = directory.join("missing").join("identity");
-        assert_eq!(validate_state_directory(&requested).unwrap(), requested);
+        assert_eq!(
+            validate_state_directory(&requested).unwrap(),
+            resolved_existing(&directory)
+                .join("missing")
+                .join("identity")
+        );
         assert!(!directory.join("missing").exists());
     }
 
@@ -153,7 +164,12 @@ mod tests {
         let directory = owned_root(root.path());
         let requested = directory.join("missing").join("identity");
         let resolved = prepare_private_state_directory(&requested).unwrap();
-        assert_eq!(resolved, requested);
+        assert_eq!(
+            resolved,
+            resolved_existing(&directory)
+                .join("missing")
+                .join("identity")
+        );
         for path in [directory.join("missing"), requested] {
             assert!(
                 path.is_dir(),
@@ -194,7 +210,7 @@ mod tests {
         let directory = owned_root(root.path());
         assert_eq!(
             validate_state_directory(&directory.join(".")).unwrap(),
-            directory
+            resolved_existing(&directory)
         );
     }
 

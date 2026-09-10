@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-const STICKY_BIT: u32 = libc::S_ISVTX as u32;
+const STICKY_BIT: u32 = 0o1000;
 
 #[derive(Default)]
 struct Redirects {

@@ -1338,10 +1338,9 @@ mod windows_private {
         GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-        DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetSecurityDescriptorDacl,
-        GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
@@ -1354,82 +1353,12 @@ mod windows_private {
 
     pub fn create_dir(path: &Path) -> Result<(), AuditError> {
         if path.exists() {
-            if is_exact_private_dir(path)? {
-                return Ok(());
-            }
             return tighten_existing_dir(path);
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         finish_directory_creation(path, create_new_directory(path))
-    }
-
-    fn is_exact_private_dir(path: &Path) -> Result<bool, AuditError> {
-        let mut wide = wide(path);
-        let mut owner = std::ptr::null_mut();
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        let status = unsafe {
-            GetNamedSecurityInfoW(
-                wide.as_mut_ptr(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner,
-                std::ptr::null_mut(),
-                &mut dacl,
-                std::ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        if status != 0 || owner.is_null() || descriptor.is_null() {
-            if !descriptor.is_null() {
-                unsafe { LocalFree(descriptor.cast()) };
-            }
-            return Err(AuditError::InsecureStorage);
-        }
-        let current = current_sid()?;
-        let owner_ok = sid_text(owner).is_some_and(|owner| owner.eq_ignore_ascii_case(&current));
-        if !owner_ok || dacl.is_null() {
-            unsafe { LocalFree(descriptor.cast()) };
-            return Ok(false);
-        }
-        let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
-        let info_ok = unsafe {
-            GetAclInformation(
-                dacl,
-                &mut info as *mut _ as _,
-                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-                AclSizeInformation,
-            )
-        } != 0;
-        if !info_ok || info.AceCount != 2 {
-            unsafe { LocalFree(descriptor.cast()) };
-            return Ok(false);
-        }
-        let mut found_current = false;
-        let mut found_system = false;
-        for index in 0..info.AceCount {
-            let mut raw = std::ptr::null_mut();
-            if unsafe { GetAce(dacl, index, &mut raw) } == 0 || raw.is_null() {
-                unsafe { LocalFree(descriptor.cast()) };
-                return Ok(false);
-            }
-            let ace = unsafe { &*(raw as *const ACCESS_ALLOWED_ACE) };
-            if ace.Header.AceType != 0 || ace.Mask != 0x001F_01FF {
-                unsafe { LocalFree(descriptor.cast()) };
-                return Ok(false);
-            }
-            let sid = (&ace.SidStart as *const u32).cast_mut().cast();
-            let Some(sid) = sid_text(sid) else {
-                unsafe { LocalFree(descriptor.cast()) };
-                return Ok(false);
-            };
-            found_current |= sid.eq_ignore_ascii_case(&current);
-            found_system |= sid.eq_ignore_ascii_case("S-1-5-18");
-        }
-        unsafe { LocalFree(descriptor.cast()) };
-        Ok(found_current && found_system)
     }
 
     pub(super) fn create_new_directory(path: &Path) -> Result<(), AuditError> {

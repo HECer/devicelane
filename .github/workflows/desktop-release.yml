@@ -83,7 +83,7 @@ jobs:
           cargo install cargo-cyclonedx --version 0.5.7 --locked
           cargo cyclonedx --all --format json
           find . -name '*.cdx.json' -type f -print0 | while IFS= read -r -d '' file; do rel=${file#./}; dest="desktop-dist/SBOM/$rel"; test ! -e "$dest" || { echo 'artifact path collision' >&2; exit 1; }; mkdir -p "$(dirname "$dest")"; cp "$file" "$dest"; done
-          (cd "$RUNNER_TEMP/repro-build-b/release/bundle" && find . -type f -print0 | while IFS= read -r -d '' file; do test ! -e "$GITHUB_WORKSPACE/desktop-dist/artifacts/$file" || { echo 'artifact path collision' >&2; exit 1; }; cp --parents "$file" "$GITHUB_WORKSPACE/desktop-dist/artifacts"; done)
+          (cd "$RUNNER_TEMP/repro-build-b/release/bundle" && find . -type f -print0 | while IFS= read -r -d '' file; do destination="$GITHUB_WORKSPACE/desktop-dist/artifacts/$file"; test ! -e "$destination" || { echo 'artifact path collision' >&2; exit 1; }; mkdir -p "$(dirname "$destination")"; cp "$file" "$destination"; done)
           cd desktop-dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: 'unsigned-ci-${{ runner.os }}', path: desktop-dist, if-no-files-found: error, retention-days: 7 }
@@ -317,7 +317,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p desktop-dist/artifacts; cd target/release/bundle
-          find . -type f -print0 | while IFS= read -r -d '' file; do test ! -e "$GITHUB_WORKSPACE/desktop-dist/artifacts/$file" || { echo 'artifact path collision' >&2; exit 1; }; cp --parents "$file" "$GITHUB_WORKSPACE/desktop-dist/artifacts"; done
+          find . -type f -print0 | while IFS= read -r -d '' file; do destination="$GITHUB_WORKSPACE/desktop-dist/artifacts/$file"; test ! -e "$destination" || { echo 'artifact path collision' >&2; exit 1; }; mkdir -p "$(dirname "$destination")"; cp "$file" "$destination"; done
       - name: Build inputs, SBOM, checksums, and signature
         shell: bash
         run: |
@@ -364,7 +364,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p desktop-dist/artifacts; cd target/release/bundle
-          find . -type f -print0 | while IFS= read -r -d '' file; do test ! -e "$GITHUB_WORKSPACE/desktop-dist/artifacts/$file" || { echo 'artifact path collision' >&2; exit 1; }; cp --parents "$file" "$GITHUB_WORKSPACE/desktop-dist/artifacts"; done
+          find . -type f -print0 | while IFS= read -r -d '' file; do destination="$GITHUB_WORKSPACE/desktop-dist/artifacts/$file"; test ! -e "$destination" || { echo 'artifact path collision' >&2; exit 1; }; mkdir -p "$(dirname "$destination")"; cp "$file" "$destination"; done
       - name: Build inputs, SBOM, checksums, and signature
         shell: bash
         run: |
