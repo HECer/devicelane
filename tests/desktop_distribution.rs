@@ -356,6 +356,15 @@ fn windows_service_task_declares_its_binary_working_directory() {
 }
 
 #[test]
+fn windows_service_deployment_allows_scheduler_to_execute_hardened_binary() {
+    let setup = read("scripts/setup-windows.ps1");
+    assert!(
+        setup.contains("/grant:r \"SYSTEM:(OI)(CI)RX\""),
+        "hardened Windows service directories must allow the scheduler to traverse and execute the binary"
+    );
+}
+
+#[test]
 fn elevated_msi_gate_cannot_fall_back_to_administrative_extraction() {
     let workflow = read(".github/workflows/desktop-release.yml");
     let smoke = read("scripts/desktop-release-smoke.ps1");

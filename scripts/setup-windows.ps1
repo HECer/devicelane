@@ -146,7 +146,7 @@ function Stop-ManagedServiceProcess([string]$Executable) {
 
 function Protect-ServiceDirectory([string]$Path) {
     New-Item -ItemType Directory -Force -Path $Path | Out-Null
-    & icacls $Path /inheritance:r /grant:r "$($UserId):F" | Out-Null
+    & icacls $Path /inheritance:r /grant:r "$($UserId):(OI)(CI)F" /grant:r "SYSTEM:(OI)(CI)RX" | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "could not protect DeviceLane service directory: $Path"
     }
