@@ -22,7 +22,8 @@ const NAME: &str = "mesh-agent";
 #[path = "mesh-agent/artifact_diagnostics.rs"]
 mod artifact_diagnostics;
 const DEFAULT_PEER_ID: &str = "agent";
-const REGISTRY_RPC_TIMEOUT: Duration = Duration::from_millis(250);
+const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const REGISTRY_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let peer_id = optional_value(&args, "--peer-id").unwrap_or_else(|| DEFAULT_PEER_ID.into());
@@ -892,6 +893,14 @@ fn rpc(
     let mut stream = transport
         .connect_tls(stream, "registry")
         .map_err(|_| RpcError::Tls)?;
+    stream
+        .get_mut()
+        .set_read_timeout(Some(REGISTRY_RPC_TIMEOUT))
+        .map_err(|_| RpcError::Io)?;
+    stream
+        .get_mut()
+        .set_write_timeout(Some(REGISTRY_RPC_TIMEOUT))
+        .map_err(|_| RpcError::Io)?;
     serde_json::to_writer(&mut stream, request).map_err(|_| RpcError::Protocol)?;
     stream.write_all(b"\n").map_err(|_| RpcError::Io)?;
     let mut line = String::new();
@@ -911,12 +920,12 @@ fn registry_stream(registry: &str) -> Result<TcpStream, RpcError> {
         .to_socket_addrs()
         .map_err(|_| RpcError::InvalidAddress)?;
     for address in addresses {
-        if let Ok(stream) = TcpStream::connect_timeout(&address, REGISTRY_RPC_TIMEOUT) {
+        if let Ok(stream) = TcpStream::connect_timeout(&address, REGISTRY_CONNECT_TIMEOUT) {
             stream
-                .set_read_timeout(Some(REGISTRY_RPC_TIMEOUT))
+                .set_read_timeout(Some(REGISTRY_CONNECT_TIMEOUT))
                 .map_err(|_| RpcError::Io)?;
             stream
-                .set_write_timeout(Some(REGISTRY_RPC_TIMEOUT))
+                .set_write_timeout(Some(REGISTRY_CONNECT_TIMEOUT))
                 .map_err(|_| RpcError::Io)?;
             return Ok(stream);
         }
@@ -955,6 +964,14 @@ fn send_apple_progress(
     for _ in 0..20 {
         if let Ok(stream) = registry_stream(registry)
             && let Ok(mut stream) = transport.connect_tls(stream, "registry")
+            && stream
+                .get_mut()
+                .set_read_timeout(Some(REGISTRY_RPC_TIMEOUT))
+                .is_ok()
+            && stream
+                .get_mut()
+                .set_write_timeout(Some(REGISTRY_RPC_TIMEOUT))
+                .is_ok()
             && serde_json::to_writer(
                 &mut stream,
                 &Request::AppleProgress {
@@ -1556,6 +1573,46 @@ mod tests {
             LeaseValidationError::ResponseTimeout.code(),
             "lease_validation_response_timeout"
         );
+    }
+
+    #[test]
+    fn registry_rpc_allows_a_slow_authenticated_response() {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry =
+            SecureTransport::load_or_create(root.path().join("registry"), "registry").unwrap();
+        let mut agent =
+            SecureTransport::load_or_create(root.path().join("agent"), "agent").unwrap();
+        registry.trust("agent", agent.certificate_der()).unwrap();
+        agent.trust("registry", registry.certificate_der()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let peer = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut stream = registry.accept_tls(socket).unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream).read_line(&mut request).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).unwrap(),
+                Request::List
+            ));
+            thread::sleep(Duration::from_millis(300));
+            stream
+                .write_all(
+                    br#"{"accepted":true,"hosts":[]}
+"#,
+                )
+                .unwrap();
+        });
+
+        let result = rpc(&address, &agent, &Request::List).unwrap();
+        peer.join().unwrap();
+        assert!(result.accepted);
     }
 
     #[test]
