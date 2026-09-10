@@ -349,6 +349,17 @@ fn windows_service_activation_reports_the_registered_action_and_binary() {
 }
 
 #[test]
+fn windows_service_task_declares_its_binary_working_directory() {
+    let setup = read("scripts/setup-windows.ps1");
+    assert!(
+        setup.contains(
+            "$ServiceAction = New-ScheduledTaskAction -Execute $ServiceExe -Argument $ServiceArguments -WorkingDirectory $ServiceDeployDir"
+        ),
+        "Windows service task must use an explicit working directory"
+    );
+}
+
+#[test]
 fn elevated_msi_gate_cannot_fall_back_to_administrative_extraction() {
     let workflow = read(".github/workflows/desktop-release.yml");
     let smoke = read("scripts/desktop-release-smoke.ps1");

@@ -224,7 +224,7 @@ if ($Mode -eq "service-install") {
     $ServiceExe = Join-Path $ServiceDeployDir "devicelane-service-$ServiceBuildId.exe"
     $ServiceStage = "$ServiceExe.stage"
     $ServiceArguments = "--identity `"$ServiceIdentityDir`" --runtime-dir `"$ServiceRuntimeDir`" --log-dir `"$ServiceLogDir`" --role workstation --foreground"
-    $ServiceAction = New-ScheduledTaskAction -Execute $ServiceExe -Argument $ServiceArguments
+    $ServiceAction = New-ScheduledTaskAction -Execute $ServiceExe -Argument $ServiceArguments -WorkingDirectory $ServiceDeployDir
     $ServiceTrigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
     $ServicePrincipal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
     $ServiceSettings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
