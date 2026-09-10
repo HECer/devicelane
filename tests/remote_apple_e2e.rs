@@ -592,6 +592,7 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         project.join("MeshApp.xcodeproj/project.pbxproj").is_file()
     });
 
+    let mut tool_output = Vec::new();
     for (index, operation) in vec![
         AppleOperation::DiscoverProject {
             container: "MeshApp.xcodeproj".into(),
@@ -660,6 +661,7 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
             format!("{:x}", Sha256::digest(&bytes))
         );
         assert!(!bytes.is_empty());
+        tool_output.extend_from_slice(&bytes);
         if let Some(lease_id) = lease_id {
             let released = cli_json(
                 &address,
@@ -725,6 +727,7 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
     agent.kill().unwrap();
     registry_process.kill().unwrap();
     let markers = std::fs::read_to_string(marker).unwrap();
+    let trace = format!("{markers}\n{}", String::from_utf8_lossy(&tool_output));
     assert!(markers.lines().all(|line| line.contains("agent-tool")));
     for alternatives in [
         &["-project MeshApp.xcodeproj -list"][..],
@@ -741,10 +744,8 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         ],
     ] {
         assert!(
-            alternatives
-                .iter()
-                .any(|expected| markers.contains(expected)),
-            "missing one of {alternatives:?}: {markers}"
+            alternatives.iter().any(|expected| trace.contains(expected)),
+            "missing one of {alternatives:?}: {trace}"
         );
     }
 }
