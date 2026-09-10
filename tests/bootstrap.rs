@@ -155,6 +155,8 @@ fn windows_service_repair_has_activation_health_and_rollback_operations() {
         "StartOld",
         "CleanupFailedVersion",
         "new DeviceLane service task did not remain running",
+        "Get-ScheduledTaskInfo -TaskName $ServiceTaskName",
+        "LastTaskResult",
     ] {
         assert!(
             setup.contains(required),

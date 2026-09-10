@@ -65,8 +65,11 @@ function Invoke-ServiceActivation($ExistingTask, $Operations) {
         $NewRegistered = $true
         & ($Operations["RegisterNew"])
         & ($Operations["StartNew"])
-        if ((& ($Operations["GetState"])) -ne "Running") {
-            throw "new DeviceLane service task did not remain running"
+        $ServiceState = & ($Operations["GetState"])
+        if ($ServiceState -ne "Running") {
+            $ServiceInfo = Get-ScheduledTaskInfo -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
+            $LastTaskResult = if ($null -ne $ServiceInfo) { $ServiceInfo.LastTaskResult } else { "unavailable" }
+            throw "new DeviceLane service task did not remain running (state=$ServiceState; last task result=$LastTaskResult)"
         }
     } catch {
         $ActivationError = $_
