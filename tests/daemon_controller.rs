@@ -711,8 +711,17 @@ fn occupied_registry_port_preserves_existing_identity_configuration_and_state() 
         !diagnostics.contains("devicelane-service: listening on"),
         "advertised readiness: {diagnostics}"
     );
+    let startup_error = std::fs::read_to_string(logs.join("startup-error.log"))
+        .expect("occupied-port startup must persist diagnostics");
+    assert!(
+        startup_error.contains("cannot bind registry listener:"),
+        "unexpected persisted startup failure: {startup_error}"
+    );
     assert_eq!(
-        fixture_tree(&absolute_root),
+        fixture_tree_excluding(
+            &absolute_root,
+            Some(std::path::Path::new("logs/startup-error.log"))
+        ),
         before,
         "occupied-port startup changed files or created stores/identities"
     );
