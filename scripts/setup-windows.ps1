@@ -15,6 +15,7 @@ $IdentityDir = $null
 $LogDir = $null
 $ServiceTaskName = "DeviceLane Service-$CurrentUserSid"
 $ServiceDeployDir = Join-Path $env:LOCALAPPDATA "DeviceLane\service\bin"
+$ServiceRoot = Join-Path $env:LOCALAPPDATA "DeviceLane\service"
 $ServiceIdentityDir = Join-Path $env:LOCALAPPDATA "DeviceLane\service\identity"
 $ServiceRuntimeDir = Join-Path $env:LOCALAPPDATA "DeviceLane\service\runtime"
 $ServiceLogDir = Join-Path $env:LOCALAPPDATA "DeviceLane\service\logs"
@@ -126,6 +127,14 @@ function Stop-ManagedServiceProcess([string]$Executable) {
     throw "DeviceLane service process did not stop before the deadline"
 }
 
+function Protect-ServiceDirectory([string]$Path) {
+    New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    & icacls $Path /inheritance:r /grant:r "$($UserId):F" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "could not protect DeviceLane service directory: $Path"
+    }
+}
+
 function Stop-ServiceTask($Task) {
     if ($null -eq $Task) { return }
     Stop-ScheduledTask -TaskName $Task.TaskName -ErrorAction SilentlyContinue
@@ -175,7 +184,15 @@ if ($Mode -eq "service-install") {
             throw "Bundled DeviceLane service must not be a reparse point."
         }
     }
-    New-Item -ItemType Directory -Force -Path $ServiceDeployDir, $ServiceIdentityDir, $ServiceRuntimeDir, $ServiceLogDir | Out-Null
+    foreach ($ServiceDirectory in @(
+        $ServiceRoot,
+        $ServiceDeployDir,
+        $ServiceIdentityDir,
+        $ServiceRuntimeDir,
+        $ServiceLogDir
+    )) {
+        Protect-ServiceDirectory $ServiceDirectory
+    }
     $ExistingServiceTask = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
     $ServiceBuildId = [guid]::NewGuid().ToString("N")
     $ServiceExe = Join-Path $ServiceDeployDir "devicelane-service-$ServiceBuildId.exe"

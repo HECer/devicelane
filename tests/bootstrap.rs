@@ -128,6 +128,17 @@ fn windows_user_service_has_complete_lifecycle() {
 }
 
 #[test]
+fn windows_service_install_protects_runtime_state_before_starting() {
+    let setup = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-windows.ps1"),
+    )
+    .unwrap();
+    assert!(setup.contains("Protect-ServiceDirectory"));
+    assert!(setup.contains("$ServiceRoot"));
+    assert!(setup.contains("icacls"));
+}
+
+#[test]
 fn windows_service_repair_has_activation_health_and_rollback_operations() {
     let setup = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-windows.ps1"),

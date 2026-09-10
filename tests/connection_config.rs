@@ -229,6 +229,9 @@ fn invalid_saved_settings_keep_local_diagnostics_available_without_overwriting_f
     let runtime = root.path().join("runtime");
     let logs = root.path().join("logs");
     for path in [&identity, &runtime, &logs] {
+        #[cfg(windows)]
+        device_development_mesh::state_paths::prepare_private_state_directory(path).unwrap();
+        #[cfg(not(windows))]
         std::fs::create_dir(path).unwrap();
     }
     #[cfg(unix)]
@@ -350,6 +353,9 @@ fn local_connection_update_requires_exact_grant_and_preserves_identity() {
     SecureTransport::load_or_create(&identity, "workstation").unwrap();
     let key = std::fs::read(identity.join("private-key.der")).unwrap();
     let runtime = root.path().join("runtime");
+    #[cfg(windows)]
+    device_development_mesh::state_paths::prepare_private_state_directory(&runtime).unwrap();
+    #[cfg(not(windows))]
     std::fs::create_dir(&runtime).unwrap();
     #[cfg(unix)]
     {
