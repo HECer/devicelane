@@ -65,7 +65,7 @@ fn daemon_controller_serves_inventory_with_its_existing_certificate() {
         .expect("fixture must provide a valid private local IPC endpoint");
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    let (mut process, address, mut tls) = 'attempts: loop {
+    let (mut process, mut tls) = 'attempts: loop {
         let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = reservation.local_addr().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_devicelane-service"));
@@ -127,7 +127,7 @@ fn daemon_controller_serves_inventory_with_its_existing_certificate() {
             match client.connect_tls(socket, "controller-fixture") {
                 Ok(tls) => {
                     drop(socket_deadline);
-                    break 'attempts (process, address, tls);
+                    break 'attempts (process, tls);
                 }
                 Err(TransportError::Tls) if Instant::now() < deadline => {
                     drop(socket_deadline);
