@@ -64,78 +64,84 @@ fn daemon_controller_serves_inventory_with_its_existing_certificate() {
     device_development_mesh::local_ipc::local_endpoint(&runtime, &local_endpoint)
         .expect("fixture must provide a valid private local IPC endpoint");
 
-    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = reservation.local_addr().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_devicelane-service"));
-    command
-        .arg("--identity")
-        .arg(&identity)
-        .arg("--runtime-dir")
-        .arg(&runtime)
-        .arg("--log-dir")
-        .arg(&logs)
-        .args([
-            "--role",
-            "registry",
-            "--registry-listen",
-            &address.to_string(),
-            "--agent-peer",
-            "fixture-agent",
-            "--listen",
-            &local_endpoint,
-            "--foreground",
-        ]);
-    // A competing bind is reported as a startup failure. Only our child is ever killed.
-    drop(reservation);
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut process = Process::spawn(&mut command);
-    let mut tls = loop {
-        process.assert_running();
-        let timeout = match remaining(deadline) {
-            Ok(timeout) => timeout,
-            Err(error) => panic!("controller did not start at {address}: {error}"),
-        };
-        let socket = match TcpStream::connect_timeout(&address, timeout) {
-            Ok(socket) => socket,
-            Err(error) => {
-                process.assert_running();
-                assert!(
-                    Instant::now() < deadline,
-                    "controller did not listen at {address}: {error}"
-                );
-                thread::sleep(
-                    Duration::from_millis(20)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-                continue;
+    let (mut process, address, mut tls) = 'attempts: loop {
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_devicelane-service"));
+        command
+            .arg("--identity")
+            .arg(&identity)
+            .arg("--runtime-dir")
+            .arg(&runtime)
+            .arg("--log-dir")
+            .arg(&logs)
+            .args([
+                "--role",
+                "registry",
+                "--registry-listen",
+                &address.to_string(),
+                "--agent-peer",
+                "fixture-agent",
+                "--listen",
+                &local_endpoint,
+                "--foreground",
+            ]);
+        // A competing bind is reported as a startup failure. Only our child is ever killed.
+        drop(reservation);
+        let mut process = Process::spawn(&mut command);
+        loop {
+            if process.retryable_bind_failure(deadline) {
+                continue 'attempts;
             }
-        };
-        process.assert_running();
-        socket
-            .set_read_timeout(Some(remaining(deadline).unwrap()))
-            .unwrap();
-        socket
-            .set_write_timeout(Some(remaining(deadline).unwrap()))
-            .unwrap();
-        // Also interrupt a peer that trickles TLS records indefinitely between socket timeouts.
-        let socket_deadline = SocketDeadline::new(&socket, deadline);
-        match client.connect_tls(socket, "controller-fixture") {
-            Ok(tls) => {
-                drop(socket_deadline);
-                break tls;
-            }
-            Err(TransportError::Tls) if Instant::now() < deadline => {
-                drop(socket_deadline);
-                thread::sleep(
-                    Duration::from_millis(20)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-            Err(error) => {
-                drop(socket_deadline);
-                panic!(
-                    "controller must complete normal mutual TLS with the trusted inventory client: {error:?}"
-                );
+            let timeout = match remaining(deadline) {
+                Ok(timeout) => timeout,
+                Err(error) => panic!("controller did not start at {address}: {error}"),
+            };
+            let socket = match TcpStream::connect_timeout(&address, timeout) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    if process.retryable_bind_failure(deadline) {
+                        continue 'attempts;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "controller did not listen at {address}: {error}"
+                    );
+                    thread::sleep(
+                        Duration::from_millis(20)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                    continue;
+                }
+            };
+            process.assert_running();
+            socket
+                .set_read_timeout(Some(remaining(deadline).unwrap()))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(remaining(deadline).unwrap()))
+                .unwrap();
+            // Also interrupt a peer that trickles TLS records indefinitely between socket timeouts.
+            let socket_deadline = SocketDeadline::new(&socket, deadline);
+            match client.connect_tls(socket, "controller-fixture") {
+                Ok(tls) => {
+                    drop(socket_deadline);
+                    break tls;
+                }
+                Err(TransportError::Tls) if Instant::now() < deadline => {
+                    drop(socket_deadline);
+                    thread::sleep(
+                        Duration::from_millis(20)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(error) => {
+                    drop(socket_deadline);
+                    panic!(
+                        "controller must complete normal mutual TLS with the trusted inventory client: {error:?}"
+                    );
+                }
             }
         }
     };
@@ -1204,6 +1210,24 @@ impl Process {
         let stderr = process.child.stderr.take().unwrap();
         process.readers.push(("stderr", drain(stderr)));
         process
+    }
+
+    fn collect_output(&mut self) -> String {
+        self.readers
+            .drain(..)
+            .map(|(_, reader)| String::from_utf8_lossy(&reader.join().unwrap()).into_owned())
+            .collect()
+    }
+
+    fn retryable_bind_failure(&mut self, deadline: Instant) -> bool {
+        let Some(status) = self.child.try_wait().expect("poll controller startup") else {
+            return false;
+        };
+        let diagnostics = self.collect_output();
+        if diagnostics.contains("cannot bind registry listener:") && Instant::now() < deadline {
+            return true;
+        }
+        panic!("devicelane-service exited before serving inventory: {status}; {diagnostics}");
     }
 
     fn assert_running(&mut self) {

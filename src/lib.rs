@@ -2978,17 +2978,17 @@ pub mod apple_simulator {
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::Terminal(TerminalStatus::Exited(0))))
             {
-                let stderr = events
+                let output = events
                     .iter()
-                    .filter(|event| matches!(event.kind, EventKind::Stderr))
+                    .filter(|event| matches!(event.kind, EventKind::Stdout | EventKind::Stderr))
                     .flat_map(|event| event.payload.iter().copied())
                     .collect::<Vec<_>>();
-                let stderr = String::from_utf8_lossy(&stderr);
-                return Err(if stderr.contains("runtime_missing") {
+                let output = String::from_utf8_lossy(&output);
+                return Err(if output.contains("runtime_missing") {
                     SimulatorError::RuntimeMissing
-                } else if stderr.contains("boot_failed") {
+                } else if output.contains("boot_failed") {
                     SimulatorError::BootFailed
-                } else if stderr.contains("detach") {
+                } else if output.contains("detach") {
                     SimulatorError::Detached
                 } else {
                     SimulatorError::Busy
