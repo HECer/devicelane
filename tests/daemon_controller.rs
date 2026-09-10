@@ -2,10 +2,22 @@ use device_development_mesh::network_processes::{Request, Response};
 use device_development_mesh::secure_transport::SecureTransport;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+fn prepare_service_state_directory(path: &Path) {
+    #[cfg(windows)]
+    device_development_mesh::state_paths::prepare_private_state_directory(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
 
 #[test]
 fn daemon_controller_serves_inventory_with_its_existing_certificate() {
@@ -19,6 +31,7 @@ fn daemon_controller_serves_inventory_with_its_existing_certificate() {
     let root = tempfile::tempdir().unwrap();
     let absolute_root = root.path().canonicalize().unwrap();
     let identity = absolute_root.join("identity");
+    prepare_service_state_directory(&identity);
     let mut daemon = SecureTransport::load_or_create(&identity, "controller-fixture").unwrap();
     let mut client =
         SecureTransport::load_or_create(absolute_root.join("client"), "fixture-client").unwrap();
@@ -38,12 +51,7 @@ fn daemon_controller_serves_inventory_with_its_existing_certificate() {
     let runtime = absolute_root.join("runtime");
     let logs = absolute_root.join("logs");
     for directory in [&runtime, &logs] {
-        std::fs::create_dir(directory).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        prepare_service_state_directory(directory);
     }
     #[cfg(unix)]
     let local_endpoint = runtime.join("controller.sock").to_str().unwrap().to_owned();
@@ -214,6 +222,7 @@ fn daemon_controller_rejects_corrupt_state_before_becoming_ready() {
     let root = tempfile::tempdir().unwrap();
     let absolute_root = root.path().canonicalize().unwrap();
     let identity = absolute_root.join("identity");
+    prepare_service_state_directory(&identity);
     let mut daemon = SecureTransport::load_or_create(&identity, "controller-fixture").unwrap();
     let peer = SecureTransport::load_or_create(absolute_root.join("peer"), "fixture-peer").unwrap();
     daemon
@@ -223,12 +232,7 @@ fn daemon_controller_rejects_corrupt_state_before_becoming_ready() {
     let runtime = absolute_root.join("runtime");
     let logs = absolute_root.join("logs");
     for directory in [&registry_state, &runtime, &logs] {
-        std::fs::create_dir(directory).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        prepare_service_state_directory(directory);
     }
     let corrupt_state = registry_state.join("vertical-slice.json");
     std::fs::write(&corrupt_state, b"{interrupted durable registry state").unwrap();
@@ -327,6 +331,7 @@ fn daemon_controller_rejects_invalid_manifest_without_poisoning_state() {
     let root = tempfile::tempdir().unwrap();
     let absolute_root = root.path().canonicalize().unwrap();
     let identity = absolute_root.join("identity");
+    prepare_service_state_directory(&identity);
     let mut authority = SecureTransport::load_or_create(&identity, "controller-fixture").unwrap();
     let mut client =
         SecureTransport::load_or_create(absolute_root.join("client"), "fixture-client").unwrap();
@@ -339,12 +344,7 @@ fn daemon_controller_rejects_invalid_manifest_without_poisoning_state() {
     let runtime = absolute_root.join("runtime");
     let logs = absolute_root.join("logs");
     for directory in [&runtime, &logs] {
-        std::fs::create_dir(directory).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        prepare_service_state_directory(directory);
     }
     #[cfg(unix)]
     let local_endpoint = runtime.join("controller.sock").to_str().unwrap().to_owned();
@@ -607,6 +607,7 @@ fn occupied_registry_port_preserves_existing_identity_configuration_and_state() 
     let root = tempfile::tempdir().unwrap();
     let absolute_root = root.path().canonicalize().unwrap();
     let identity = absolute_root.join("identity");
+    prepare_service_state_directory(&identity);
     let mut daemon = SecureTransport::load_or_create(&identity, "controller-fixture").unwrap();
     let peer = SecureTransport::load_or_create(absolute_root.join("peer"), "fixture-peer").unwrap();
     daemon
@@ -623,12 +624,7 @@ fn occupied_registry_port_preserves_existing_identity_configuration_and_state() 
     let runtime = absolute_root.join("runtime");
     let logs = absolute_root.join("logs");
     for directory in [&registry_state, &runtime, &logs] {
-        std::fs::create_dir(directory).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        prepare_service_state_directory(directory);
     }
     std::fs::write(
         registry_state.join("vertical-slice.json"),
@@ -831,6 +827,7 @@ fn standalone_relative_identity_preserves_certificate_and_serves_inventory() {
     let absolute_root = root.path().canonicalize().unwrap();
     let relative_identity = std::path::Path::new("mesh").join("identity");
     let identity = absolute_root.join(&relative_identity);
+    prepare_service_state_directory(&identity);
     let mut authority = SecureTransport::load_or_create(&identity, "controller-relative").unwrap();
     let mut client =
         SecureTransport::load_or_create(absolute_root.join("client"), "fixture-client").unwrap();
@@ -956,12 +953,7 @@ fn ancestor_identity_fixture(program: &str, service: bool) {
     let runtime = absolute_root.join("runtime");
     let logs = absolute_root.join("logs");
     for directory in [&target, &runtime, &logs] {
-        std::fs::create_dir(directory).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        prepare_service_state_directory(directory);
     }
     std::fs::write(target.join("preserve"), b"owned target sentinel").unwrap();
     // Snapshot only the real target subtree. The fixture root itself contains
