@@ -13,6 +13,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn prepare_service_state_directory(path: &Path) {
+    #[cfg(windows)]
+    device_development_mesh::state_paths::prepare_private_state_directory(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 #[test]
 #[cfg(windows)]
 fn child_guard_terminates_descendants() {
@@ -178,13 +189,8 @@ fn dashboard_job_preserves_live_inventory_during_real_mesh_execution() {
     );
     let runtime = root.path().join("runtime");
     let logs = root.path().join("logs");
-    std::fs::create_dir_all(&runtime).unwrap();
-    std::fs::create_dir_all(&logs).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    prepare_service_state_directory(&runtime);
+    prepare_service_state_directory(&logs);
     #[cfg(windows)]
     let listen = format!(r"\\.\pipe\devicelane-live-job-{}", std::process::id());
     #[cfg(unix)]
@@ -999,6 +1005,11 @@ fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
 }
 
 fn pair(registry: &Path, registry_id: &str, peer: &Path, peer_id: &str) {
+    #[cfg(windows)]
+    {
+        prepare_service_state_directory(registry);
+        prepare_service_state_directory(peer);
+    }
     let mut left = SecureTransport::load_or_create(registry, registry_id).unwrap();
     let mut right = SecureTransport::load_or_create(peer, peer_id).unwrap();
     let code = left.issue_pairing_code(Duration::from_secs(10));

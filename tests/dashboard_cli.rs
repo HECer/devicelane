@@ -25,6 +25,17 @@ impl Drop for Service {
     }
 }
 
+fn prepare_service_state_directory(path: &std::path::Path) {
+    #[cfg(windows)]
+    device_development_mesh::state_paths::prepare_private_state_directory(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 fn endpoint_text(_runtime: &std::path::Path) -> String {
     #[cfg(windows)]
     {
@@ -50,13 +61,8 @@ fn service() -> (
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("runtime");
     let logs = root.path().join("logs");
-    std::fs::create_dir_all(&runtime).unwrap();
-    std::fs::create_dir_all(&logs).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    prepare_service_state_directory(&runtime);
+    prepare_service_state_directory(&logs);
     let text = endpoint_text(&runtime);
     let endpoint = local_endpoint(&runtime, &text).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
@@ -166,12 +172,7 @@ fn observed_watch_service() -> (tempfile::TempDir, String, EventJournal) {
     static NEXT_SERVER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("runtime");
-    std::fs::create_dir_all(&runtime).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    prepare_service_state_directory(&runtime);
     let text = format!(
         "{}-observed-{}",
         endpoint_text(&runtime),

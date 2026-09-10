@@ -5,6 +5,17 @@ use device_development_mesh::dashboard::service::{AdminMutation, ExistingJobs};
 use device_development_mesh::dashboard::{
     ActivityId, HostId, OperationId, PrincipalId, ResourceClass, policy::AccessRequest,
 };
+
+fn prepare_service_state_directory(path: &std::path::Path) {
+    #[cfg(windows)]
+    device_development_mesh::state_paths::prepare_private_state_directory(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
 #[cfg(windows)]
 use device_development_mesh::dashboard::{
     ActivityState, ApprovalDecision, DashboardScope, EventCursor, PolicyEffect, PolicyOrigin,
@@ -541,6 +552,7 @@ fn workstation_service_does_not_require_remote_mesh_configuration() {
 fn production_named_pipe_serves_state_and_recovers_after_bad_frames() {
     let pipe = format!(r"\\.\pipe\devicelane-e2e-{}", std::process::id());
     let temp = tempfile::tempdir().unwrap();
+    prepare_service_state_directory(temp.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
         .args([
             "--identity",
@@ -936,7 +948,9 @@ fn production_service_restart_reconciles_one_durable_activity_id() {
     let identity = temp.path().join("identity");
     let runtime = temp.path().join("runtime");
     let logs = temp.path().join("logs");
-    std::fs::create_dir(&runtime).unwrap();
+    prepare_service_state_directory(&identity);
+    prepare_service_state_directory(&runtime);
+    prepare_service_state_directory(&logs);
     let args = [
         "--identity",
         identity.to_str().unwrap(),
@@ -1011,7 +1025,9 @@ fn failed_decision_checkpoint_keeps_pending_policy_and_activity_unchanged() {
     let identity = temp.path().join("identity");
     let runtime = temp.path().join("runtime");
     let logs = temp.path().join("logs");
-    std::fs::create_dir(&runtime).unwrap();
+    prepare_service_state_directory(&identity);
+    prepare_service_state_directory(&runtime);
+    prepare_service_state_directory(&logs);
     let args = [
         "--identity",
         identity.to_str().unwrap(),
@@ -1082,6 +1098,8 @@ fn slow_client_cannot_block_a_second_named_pipe_client() {
     let temp = tempfile::tempdir().unwrap();
     let identity = temp.path().join("identity");
     let logs = temp.path().join("logs");
+    prepare_service_state_directory(temp.path());
+    prepare_service_state_directory(&logs);
     let mut child = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
             .args([
@@ -1147,6 +1165,8 @@ fn named_pipe_worker_pool_applies_bounded_backpressure() {
     let temp = tempfile::tempdir().unwrap();
     let identity = temp.path().join("identity");
     let logs = temp.path().join("logs");
+    prepare_service_state_directory(temp.path());
+    prepare_service_state_directory(&logs);
     let mut child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
         .args([
             "--identity",
@@ -1327,11 +1347,12 @@ fn unix_runtime_rejects_symlinks_and_insecure_permissions() {
 #[test]
 fn service_managed_policy_configuration_is_paired_and_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
+    prepare_service_state_directory(temp.path());
     let identity = temp.path().join("identity");
     let runtime = temp.path().join("runtime");
     let logs = temp.path().join("logs");
     for path in [&identity, &runtime, &logs] {
-        std::fs::create_dir(path).unwrap();
+        prepare_service_state_directory(path);
     }
     #[cfg(unix)]
     {

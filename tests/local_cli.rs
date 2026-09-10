@@ -14,6 +14,17 @@ impl Drop for Service {
     }
 }
 
+fn prepare_service_state_directory(path: &std::path::Path) {
+    #[cfg(windows)]
+    device_development_mesh::state_paths::prepare_private_state_directory(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 fn endpoint_text(_runtime_dir: &std::path::Path) -> String {
     #[cfg(windows)]
     {
@@ -45,13 +56,8 @@ fn start_service() -> (tempfile::TempDir, String, LocalEndpoint, Service) {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("runtime");
     let logs = root.path().join("logs");
-    std::fs::create_dir_all(&runtime).unwrap();
-    std::fs::create_dir_all(&logs).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    prepare_service_state_directory(&runtime);
+    prepare_service_state_directory(&logs);
     let endpoint_text = endpoint_text(&runtime);
     let endpoint = local_endpoint(&runtime, &endpoint_text).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_devicelane-service"))
@@ -402,8 +408,7 @@ mod installed_unix_runtime {
             let identity = base.join(&identity_name);
             let logs = base.join("logs");
             for path in [&home, &xdg, &runtime, &identity, &logs] {
-                std::fs::create_dir_all(path).unwrap();
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                prepare_service_state_directory(path);
             }
             local_endpoint(&runtime, "").unwrap();
             let endpoint = runtime.join("devicelane.sock");
