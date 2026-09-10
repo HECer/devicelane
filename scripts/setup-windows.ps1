@@ -135,6 +135,15 @@ function Protect-ServiceDirectory([string]$Path) {
     }
 }
 
+function Wait-ServiceTaskRunning {
+    for ($Attempt = 0; $Attempt -lt 100; $Attempt++) {
+        $Task = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
+        if ($null -ne $Task -and $Task.State -eq "Running") { return }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "DeviceLane service task did not reach Running before the deadline"
+}
+
 function Stop-ServiceTask($Task) {
     if ($null -eq $Task) { return }
     Stop-ScheduledTask -TaskName $Task.TaskName -ErrorAction SilentlyContinue
@@ -207,13 +216,13 @@ if ($Mode -eq "service-install") {
         StopOld = { Stop-ServiceTask $ExistingServiceTask }
         ActivateBinary = { Move-Item -LiteralPath $ServiceStage -Destination $ServiceExe }
         RegisterNew = { Register-ScheduledTask -TaskName $ServiceTaskName -Action $ServiceAction -Trigger $ServiceTrigger -Principal $ServicePrincipal -Settings $ServiceSettings -Description "Per-user DeviceLane service" -Force | Out-Null }
-        StartNew = { Start-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop; Start-Sleep -Milliseconds 500 }
+        StartNew = { Start-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop; Wait-ServiceTaskRunning }
         GetState = { (Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop).State.ToString() }
         StopFailedNew = { Stop-ServiceTask (Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop) }
         UnregisterFailedNew = { Unregister-ScheduledTask -TaskName $ServiceTaskName -Confirm:$false -ErrorAction Stop }
         VerifyAbsent = { if ($null -ne (Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue)) { throw "failed DeviceLane service task remains registered" } }
         RestoreOld = { param($OldTask); Register-ScheduledTask -InputObject $OldTask -TaskName $ServiceTaskName -Force | Out-Null }
-        StartOld = { Start-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop; Start-Sleep -Milliseconds 500 }
+        StartOld = { Start-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop; Wait-ServiceTaskRunning }
         CleanupStage = { if (Test-Path -LiteralPath $ServiceStage) { Remove-Item -LiteralPath $ServiceStage -Force } }
         CleanupFailedVersion = { if (Test-Path -LiteralPath $ServiceExe) { Remove-Item -LiteralPath $ServiceExe -Force } }
     }

@@ -163,6 +163,17 @@ fn windows_service_repair_has_activation_health_and_rollback_operations() {
     }
 }
 
+#[test]
+fn windows_service_install_waits_for_cold_start_before_health_check() {
+    let setup = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-windows.ps1"),
+    )
+    .unwrap();
+    assert!(setup.contains("Wait-ServiceTaskRunning"));
+    assert!(setup.contains("StartNew = { Start-ScheduledTask"));
+    assert!(setup.contains("StartOld = { Start-ScheduledTask"));
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_service_partial_registration_is_unregistered_before_restore() {
