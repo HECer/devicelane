@@ -55,7 +55,7 @@ describe("PolicyRules", () => {
     expect(put.mock.calls[0][0]).toMatchObject({ id: "rule-user", revision: "8" });
     resolve();
     await waitFor(() => expect(refresh).toHaveBeenCalledOnce());
-    expect(screen.getByRole("status")).toHaveTextContent("Regel gespeichert");
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Regel gespeichert"));
   });
 
   it("requires confirmation before deletion and includes the observed revision", async () => {
