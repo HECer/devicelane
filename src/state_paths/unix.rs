@@ -8,6 +8,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+const STICKY_BIT: u32 = libc::S_ISVTX as u32;
+
 #[derive(Default)]
 struct Redirects {
     count: usize,
@@ -115,7 +117,7 @@ fn walk_resolved(path: &Path, mode: WalkMode, redirects: &mut Redirects) -> io::
         let metadata = final_directory.metadata()?;
         if parts.is_empty()
             || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & libc::S_ISVTX != 0
+            || metadata.mode() & STICKY_BIT != 0
         {
             return Err(insecure());
         }
@@ -139,9 +141,7 @@ fn validate_node(metadata: &Metadata) -> io::Result<()> {
 
 fn validate_parent(metadata: &Metadata) -> io::Result<()> {
     validate_node(metadata)?;
-    if metadata.mode() & 0o022 != 0
-        && !(metadata.uid() == 0 && metadata.mode() & libc::S_ISVTX != 0)
-    {
+    if metadata.mode() & 0o022 != 0 && !(metadata.uid() == 0 && metadata.mode() & STICKY_BIT != 0) {
         Err(insecure())
     } else {
         Ok(())
@@ -240,7 +240,7 @@ mod tests {
         let parent = fs::metadata(&tmp).unwrap();
         assert_eq!(parent.uid(), 0, "fixture requires root-owned /tmp");
         assert_ne!(
-            parent.mode() & libc::S_ISVTX,
+            parent.mode() & STICKY_BIT,
             0,
             "fixture requires sticky /tmp"
         );

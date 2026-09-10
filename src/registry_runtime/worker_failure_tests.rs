@@ -317,7 +317,6 @@ fn test_tempdir() -> tempfile::TempDir {
         .filter(|parent| parent.is_dir())
     {
         let root = tempfile::tempdir_in(parent).unwrap();
-        crate::dashboard::audit::create_private_dir(root.path()).unwrap();
         return root;
     }
     tempfile::tempdir().unwrap()

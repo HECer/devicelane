@@ -41,12 +41,16 @@ jobs:
         working-directory: desktop
         shell: bash
         run: |
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/repro-build-a"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/repro-build"
           cargo build --release --locked --bin devicelane --bin devicelane-service
           npm exec tauri build -- --no-sign --bundles ${{ matrix.bundles }} -- --locked
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/repro-build-b"
+          mkdir -p "$RUNNER_TEMP/repro-build-a/release"
+          cp -a "$CARGO_TARGET_DIR/release/bundle" "$RUNNER_TEMP/repro-build-a/release/"
+          cargo clean --release
           cargo build --release --locked --bin devicelane --bin devicelane-service
           npm exec tauri build -- --no-sign --bundles ${{ matrix.bundles }} -- --locked
+          mkdir -p "$RUNNER_TEMP/repro-build-b/release"
+          cp -a "$CARGO_TARGET_DIR/release/bundle" "$RUNNER_TEMP/repro-build-b/release/"
       - name: Compare normalized Windows payloads
         if: runner.os == 'Windows'
         shell: pwsh

@@ -27,8 +27,22 @@ make_fake_systemctl() {
 #!/bin/sh
 set -eu
 state=${FAKE_SYSTEMCTL_STATE:?}; [ "${1:-}" = --user ] && shift; command=${1:-}; shift || true
-stop_service() { if [ -f "$state/pid" ]; then kill "$(cat "$state/pid")" >/dev/null 2>&1 || true; wait "$(cat "$state/pid")" 2>/dev/null || true; rm -f "$state/pid"; fi; }
-start_service() { exec_line=$(sed -n 's/^ExecStart=//p' "$HOME/.config/systemd/user/devicelane.service"); sh -c "$exec_line" >>"$state/service.log" 2>&1 & echo $! > "$state/pid"; }
+stop_service() {
+  if [ -f "$state/pid" ]; then
+    pid=$(cat "$state/pid")
+    kill "$pid" >/dev/null 2>&1 || true
+    attempt=0
+    while [ "$attempt" -lt 20 ] && kill -0 "$pid" >/dev/null 2>&1; do
+      attempt=$((attempt + 1)); sleep 0.05
+    done
+    kill -9 "$pid" >/dev/null 2>&1 || true
+    rm -f "$state/pid"
+  fi
+}
+start_service() {
+  exec_line=$(sed -n 's/^ExecStart=//p' "$HOME/.config/systemd/user/devicelane.service")
+  sh -c "exec $exec_line" >>"$state/service.log" 2>&1 & echo $! > "$state/pid"
+}
 case "$command" in
  show-environment|daemon-reload) exit 0 ;; is-active) [ -f "$state/pid" ] && kill -0 "$(cat "$state/pid")" 2>/dev/null ;;
  is-enabled) [ -f "$state/enabled" ] && { echo enabled; exit 0; }; echo disabled; exit 1 ;;
