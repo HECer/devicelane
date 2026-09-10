@@ -355,7 +355,10 @@ fn dashboard_job_preserves_live_inventory_during_real_mesh_execution() {
         "{response:?}"
     );
     let execution_started = Instant::now();
-    let deadline = execution_started + Duration::from_secs(15);
+    // Keep the assertion beyond the daemon's 30-second remote execution
+    // timeout. Windows CI can spend several seconds starting the synthetic
+    // command environment before the install gate is reached.
+    let deadline = execution_started + Duration::from_secs(35);
     let mut gate_entered = None;
     let mut released = false;
     let mut released_at_ms = None;

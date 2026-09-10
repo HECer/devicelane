@@ -303,15 +303,26 @@ fn tauri_codegen_uses_the_upstream_deterministic_asset_fix() {
 }
 
 #[test]
-fn tauri_codegen_patch_reuses_the_registry_tauri_utils() {
+fn tauri_codegen_and_utils_share_the_deterministic_revision() {
     let manifest = read("Cargo.toml");
-    assert!(manifest.contains("[patch.\"https://github.com/tauri-apps/tauri\"]"));
-    assert!(manifest.contains("tauri-utils = { version = \"2.9.3\" }"));
+    assert!(manifest.contains("[patch.crates-io]"));
+    assert!(manifest.contains(
+        "tauri-utils = { git = \"https://github.com/tauri-apps/tauri\", rev = \"29c87c3\" }"
+    ));
 
     let lockfile = read("Cargo.lock");
+    assert_eq!(
+        lockfile.matches("name = \"tauri-utils\"").count(),
+        1,
+        "the deterministic Tauri graph must resolve one tauri-utils package"
+    );
+    let tauri_utils = lockfile
+        .split("[[package]]")
+        .find(|package| package.contains("name = \"tauri-utils\""))
+        .expect("tauri-utils package missing from the lockfile");
     assert!(
-        !lockfile.contains("tauri-utils 2.9.3 (git+https://github.com/tauri-apps/tauri)"),
-        "the codegen patch must not introduce a second tauri-utils source"
+        tauri_utils.contains("source = \"git+https://github.com/tauri-apps/tauri?rev=29c87c3"),
+        "tauri-utils must use the deterministic upstream revision"
     );
 }
 
