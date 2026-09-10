@@ -68,6 +68,14 @@ function Invoke-ServiceActivation($ExistingTask, $Operations) {
         & ($Operations["StartNew"])
         $ServiceState = & ($Operations["GetState"])
         if ($ServiceState -ne "Running") {
+            $RegisteredServiceTask = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
+            $RegisteredExecutable = "unavailable"
+            $RegisteredArguments = "unavailable"
+            if ($null -ne $RegisteredServiceTask -and $RegisteredServiceTask.Actions.Count -gt 0) {
+                $RegisteredExecutable = [string]$RegisteredServiceTask.Actions[0].Execute
+                $RegisteredArguments = [string]$RegisteredServiceTask.Actions[0].Arguments
+            }
+            $ServiceExecutablePresent = Test-Path -LiteralPath $ServiceExe -PathType Leaf
             $ServiceInfo = Get-ScheduledTaskInfo -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
             $LastTaskResult = if ($null -ne $ServiceInfo) { $ServiceInfo.LastTaskResult } else { "unavailable" }
             $StartupDiagnostics = "unavailable"
@@ -75,7 +83,7 @@ function Invoke-ServiceActivation($ExistingTask, $Operations) {
                 $StartupDiagnostics = (Get-Content -LiteralPath $ServiceStartupLog -Tail 8 -ErrorAction SilentlyContinue) -join " | "
                 if ([string]::IsNullOrWhiteSpace($StartupDiagnostics)) { $StartupDiagnostics = "empty" }
             }
-            throw "new DeviceLane service task did not remain running (state=$ServiceState; last task result=$LastTaskResult; startup diagnostics=$StartupDiagnostics)"
+            throw "new DeviceLane service task did not remain running (state=$ServiceState; last task result=$LastTaskResult; executable present=$ServiceExecutablePresent; registered executable=$RegisteredExecutable; registered arguments=$RegisteredArguments; startup diagnostics=$StartupDiagnostics)"
         }
     } catch {
         $ActivationError = $_

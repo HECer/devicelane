@@ -2,6 +2,11 @@
 members = [".", "desktop/src-tauri"]
 resolver = "2"
 
+# The locked Tauri release still emits embedded assets through HashMap iteration.
+# Pin the upstream deterministic codegen fix until it is available on crates.io.
+[patch.crates-io]
+tauri-codegen = { git = "https://github.com/tauri-apps/tauri", rev = "29c87c3" }
+
 [package]
 name = "devicelane"
 version = "0.1.0"

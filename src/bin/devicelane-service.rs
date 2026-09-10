@@ -54,7 +54,22 @@ fn persist_startup_error(error: &str) {
     let Some(log_dir) = requested_log_dir() else {
         return;
     };
-    if !log_dir.is_absolute() || validate_private_state_directory(&log_dir).is_err() {
+    if !log_dir.is_absolute() {
+        return;
+    }
+    #[cfg(windows)]
+    let log_dir_is_allowed = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|local_app_data| {
+            local_app_data
+                .join("DeviceLane")
+                .join("service")
+                .join("logs")
+        })
+        .is_some_and(|expected| expected == log_dir && log_dir.is_dir());
+    #[cfg(not(windows))]
+    let log_dir_is_allowed = validate_private_state_directory(&log_dir).is_ok();
+    if !log_dir_is_allowed {
         return;
     }
     let path = log_dir.join("startup-error.log");

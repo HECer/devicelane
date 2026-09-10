@@ -295,6 +295,30 @@ fn macos_release_linker_uses_reproducible_output_mode() {
 }
 
 #[test]
+fn tauri_codegen_uses_the_upstream_deterministic_asset_fix() {
+    let manifest = read("Cargo.toml");
+    assert!(manifest.contains("[patch.crates-io]"));
+    assert!(manifest.contains("tauri-codegen"));
+    assert!(manifest.contains("29c87c3"));
+}
+
+#[test]
+fn windows_service_activation_reports_the_registered_action_and_binary() {
+    let setup = read("scripts/setup-windows.ps1");
+    for declaration in [
+        "$RegisteredServiceTask",
+        "$RegisteredServiceTask.Actions[0].Execute",
+        "$RegisteredServiceTask.Actions[0].Arguments",
+        "Test-Path -LiteralPath $ServiceExe -PathType Leaf",
+    ] {
+        assert!(
+            setup.contains(declaration),
+            "missing Windows service startup diagnostic: {declaration}"
+        );
+    }
+}
+
+#[test]
 fn elevated_msi_gate_cannot_fall_back_to_administrative_extraction() {
     let workflow = read(".github/workflows/desktop-release.yml");
     let smoke = read("scripts/desktop-release-smoke.ps1");
