@@ -1414,8 +1414,6 @@ mod windows_private {
         if !owner_is_current(path)? {
             return Err(AuditError::InsecureStorage);
         }
-        let mut children = Vec::new();
-        collect_existing_children(path, &mut children)?;
         let security = Security::current_user()?;
         let mut present = 0;
         let mut defaulted = 0;
@@ -1428,33 +1426,8 @@ mod windows_private {
         {
             return Err(AuditError::InsecureStorage);
         }
-        for child in children {
-            set_private_dacl(&child, dacl)?;
-        }
         set_private_dacl(path, dacl)?;
         validate(path, true)
-    }
-
-    fn collect_existing_children(
-        path: &Path,
-        children: &mut Vec<std::path::PathBuf>,
-    ) -> Result<(), AuditError> {
-        use std::os::windows::fs::MetadataExt;
-
-        for entry in fs::read_dir(path).map_err(|_| AuditError::InsecureStorage)? {
-            let child = entry.map_err(|_| AuditError::InsecureStorage)?.path();
-            let metadata = fs::symlink_metadata(&child).map_err(|_| AuditError::InsecureStorage)?;
-            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Err(AuditError::InsecureStorage);
-            }
-            if metadata.is_dir() {
-                collect_existing_children(&child, children)?;
-            } else if !metadata.is_file() {
-                return Err(AuditError::InsecureStorage);
-            }
-            children.push(child);
-        }
-        Ok(())
     }
 
     fn set_private_dacl(path: &Path, dacl: *mut ACL) -> Result<(), AuditError> {

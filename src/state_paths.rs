@@ -92,6 +92,9 @@ mod tests {
     }
 
     fn resolved_existing(path: &Path) -> PathBuf {
+        #[cfg(windows)]
+        return path.to_owned();
+        #[cfg(unix)]
         std::fs::canonicalize(path).unwrap()
     }
 
