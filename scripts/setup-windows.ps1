@@ -99,6 +99,42 @@ function Wait-ServiceTaskStopped {
     throw "DeviceLane service task did not stop before the deadline"
 }
 
+function Get-ManagedServiceProcesses([string]$Executable) {
+    $ExpectedExecutable = [IO.Path]::GetFullPath($Executable)
+    $ExecutableName = [IO.Path]::GetFileName($ExpectedExecutable)
+    @(Get-CimInstance -ClassName Win32_Process -Filter ("Name = '{0}'" -f $ExecutableName) -ErrorAction Stop |
+        Where-Object {
+            if ([string]::IsNullOrWhiteSpace($_.ExecutablePath) -or [string]::IsNullOrWhiteSpace($_.CommandLine)) {
+                return $false
+            }
+            try { $CandidateExecutable = [IO.Path]::GetFullPath([string]$_.ExecutablePath) } catch { return $false }
+            $CandidateExecutable.Equals($ExpectedExecutable, [StringComparison]::OrdinalIgnoreCase) -and
+                $_.CommandLine.IndexOf("--identity", [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                $_.CommandLine.IndexOf($ServiceIdentityDir, [StringComparison]::OrdinalIgnoreCase) -ge 0
+        })
+}
+
+function Stop-ManagedServiceProcess([string]$Executable) {
+    for ($Attempt = 0; $Attempt -lt 100; $Attempt++) {
+        $Processes = @(Get-ManagedServiceProcesses $Executable)
+        if ($Processes.Count -eq 0) { return }
+        foreach ($Process in $Processes) {
+            Stop-Process -Id ([int]$Process.ProcessId) -Force -ErrorAction Stop
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "DeviceLane service process did not stop before the deadline"
+}
+
+function Stop-ServiceTask($Task) {
+    if ($null -eq $Task) { return }
+    Stop-ScheduledTask -TaskName $Task.TaskName -ErrorAction SilentlyContinue
+    $Executable = [string]$Task.Actions[0].Execute
+    if ([string]::IsNullOrWhiteSpace($Executable)) { throw "DeviceLane service task has no executable" }
+    Stop-ManagedServiceProcess $Executable
+    Wait-ServiceTaskStopped
+}
+
 if ($Mode -eq "service-status") {
     $ServiceTask = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
     if ($null -eq $ServiceTask) { Write-Output "DeviceLane service is not installed."; exit 1 }
@@ -109,8 +145,8 @@ if ($Mode -eq "service-autostart-enable") { Enable-ScheduledTask -TaskName $Serv
 if ($Mode -eq "service-autostart-disable") { Stop-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue; Disable-ScheduledTask -TaskName $ServiceTaskName | Out-Null; exit 0 }
 if ($Mode -eq "service-logs") { Write-Output $ServiceLogDir; exit 0 }
 if ($Mode -eq "service-uninstall") {
-    Stop-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
-    Wait-ServiceTaskStopped
+    $ServiceTask = Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue
+    Stop-ServiceTask $ServiceTask
     Unregister-ScheduledTask -TaskName $ServiceTaskName -Confirm:$false -ErrorAction SilentlyContinue
     foreach ($Version in @(Get-ChildItem -LiteralPath $ServiceDeployDir -Filter "devicelane-service-*.exe" -ErrorAction SilentlyContinue)) {
         for ($Attempt = 0; $Attempt -lt 50; $Attempt++) {
@@ -151,12 +187,12 @@ if ($Mode -eq "service-install") {
     $ServiceSettings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
     $ServiceOperations = @{
         StageBinary = { Copy-Item -LiteralPath $BuiltServiceExe -Destination $ServiceStage }
-        StopOld = { Stop-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop }
+        StopOld = { Stop-ServiceTask $ExistingServiceTask }
         ActivateBinary = { Move-Item -LiteralPath $ServiceStage -Destination $ServiceExe }
         RegisterNew = { Register-ScheduledTask -TaskName $ServiceTaskName -Action $ServiceAction -Trigger $ServiceTrigger -Principal $ServicePrincipal -Settings $ServiceSettings -Description "Per-user DeviceLane service" -Force | Out-Null }
         StartNew = { Start-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop; Start-Sleep -Milliseconds 500 }
         GetState = { (Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop).State.ToString() }
-        StopFailedNew = { Stop-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop }
+        StopFailedNew = { Stop-ServiceTask (Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction Stop) }
         UnregisterFailedNew = { Unregister-ScheduledTask -TaskName $ServiceTaskName -Confirm:$false -ErrorAction Stop }
         VerifyAbsent = { if ($null -ne (Get-ScheduledTask -TaskName $ServiceTaskName -ErrorAction SilentlyContinue)) { throw "failed DeviceLane service task remains registered" } }
         RestoreOld = { param($OldTask); Register-ScheduledTask -InputObject $OldTask -TaskName $ServiceTaskName -Force | Out-Null }

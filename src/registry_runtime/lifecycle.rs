@@ -25,28 +25,80 @@ impl RegistryStatus {
 
 // Publish before returning to socket shutdown and worker joins. Catch listener
 // panics here so the owner still runs cleanup and observers never retain Running.
+#[cfg(test)]
 fn supervise(
     status: &RegistryStatus,
     operation: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    let failure_code = Mutex::new(None);
+    supervise_with(&failure_code, status, operation, || {})
+}
+
+fn supervise_with(
+    failure_code: &Mutex<Option<&'static str>>,
+    status: &RegistryStatus,
+    operation: impl FnOnce() -> std::io::Result<()>,
+    before_publish: impl FnOnce(),
+) -> std::io::Result<()> {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
-    let (state, result) = match outcome {
-        Ok(Ok(())) => (RegistryRuntimeState::Stopped, Ok(())),
-        Ok(Err(error)) => (
-            RegistryRuntimeState::Failed {
-                code: "registry_listener_failed",
-            },
-            Err(error),
+    before_publish();
+    let failure_code = failure_code
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    let (state, result) = match failure_code {
+        Some(code) => (
+            RegistryRuntimeState::Failed { code },
+            Err(std::io::Error::other(code)),
         ),
-        Err(_) => (
-            RegistryRuntimeState::Failed {
-                code: "registry_listener_panicked",
-            },
-            Err(std::io::Error::other("registry listener panicked")),
-        ),
+        None => match outcome {
+            Ok(Ok(())) => (RegistryRuntimeState::Stopped, Ok(())),
+            Ok(Err(error)) => (
+                RegistryRuntimeState::Failed {
+                    code: "registry_listener_failed",
+                },
+                Err(error),
+            ),
+            Err(_) => (
+                RegistryRuntimeState::Failed {
+                    code: "registry_listener_panicked",
+                },
+                Err(std::io::Error::other("registry listener panicked")),
+            ),
+        },
     };
-    *status.0.lock().unwrap_or_else(|error| error.into_inner()) = state;
+    let mut current = status.0.lock().unwrap_or_else(|error| error.into_inner());
+    if let RegistryRuntimeState::Failed { code } = *current {
+        return Err(std::io::Error::other(code));
+    }
+    *current = state;
     result
+}
+
+fn supervise_dispatcher(
+    status: &RegistryStatus,
+    failure_code: &Mutex<Option<&'static str>>,
+    stopping: &AtomicBool,
+    admission: &Mutex<()>,
+    operation: impl FnOnce(),
+) -> std::io::Result<()> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let _admission = admission.lock().unwrap_or_else(|error| error.into_inner());
+            stopping.store(true, Ordering::Release);
+            *failure_code
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some("registry_worker_panicked");
+            let mut state = status.0.lock().unwrap_or_else(|error| error.into_inner());
+            if matches!(*state, RegistryRuntimeState::Stopped) {
+                *state = RegistryRuntimeState::Failed {
+                    code: "registry_worker_panicked",
+                };
+            }
+            Err(std::io::Error::other("registry worker panicked"))
+        }
+    }
 }
 
 pub enum RegistryRecoveryPolicy {
@@ -76,8 +128,11 @@ pub struct RegistryRuntime {
 struct ConnectionWorker {
     socket: TcpStream,
     deadline: Instant,
-    worker: thread::JoinHandle<()>,
+    worker: thread::JoinHandle<std::io::Result<()>>,
 }
+
+#[cfg(test)]
+type DispatchHook = Arc<dyn Fn(&TcpStream, &Mutex<DurableState>) + Send + Sync>;
 
 fn open_state_lock(path: &Path) -> std::io::Result<std::fs::File> {
     let validate = |metadata: &std::fs::Metadata| -> std::io::Result<()> {
@@ -144,6 +199,17 @@ fn open_state_lock(path: &Path) -> std::io::Result<std::fs::File> {
 
 impl RegistryRuntime {
     pub fn start(config: RegistryRuntimeConfig) -> std::io::Result<Self> {
+        Self::start_inner(
+            config,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn start_inner(
+        config: RegistryRuntimeConfig,
+        #[cfg(test)] dispatch_hook: Option<DispatchHook>,
+    ) -> std::io::Result<Self> {
         let RegistryRuntimeConfig {
             listener,
             transport,
@@ -157,6 +223,7 @@ impl RegistryRuntime {
             std::io::Error::other(format!("invalid registry identity: {error:?}"))
         })?;
         listener.set_nonblocking(true)?;
+        let listener = Arc::new(Mutex::new(Some(listener)));
         let state_root = crate::state_paths::prepare_private_state_directory(&state_root)?;
         let state_lock = open_state_lock(&state_root.join("registry.lock"))?;
         fs2::FileExt::try_lock_exclusive(&state_lock)?;
@@ -183,98 +250,162 @@ impl RegistryRuntime {
         let leases = Arc::new(Mutex::new(loaded_leases));
         let agent_peers = Arc::new(agent_peers);
         let stopping = Arc::new(AtomicBool::new(false));
+        let admission = Arc::new(Mutex::new(()));
+        let failure_code = Arc::new(Mutex::new(None));
         let status = RegistryStatus::running();
         let worker_status = status.clone();
         let stop = Arc::clone(&stopping);
+        let worker_admission = Arc::clone(&admission);
+        let worker_failure_code = Arc::clone(&failure_code);
+        let listener_for_loop = Arc::clone(&listener);
+        let listener_for_close = Arc::clone(&listener);
         let worker = thread::Builder::new()
             .name("registry-listener".into())
             .spawn(move || {
                 // Keep exclusive state ownership until all dispatch workers are joined.
                 let _state_lock = state_lock;
                 let mut workers: Vec<ConnectionWorker> = Vec::new();
-                let result = supervise(&worker_status, || {
-                    loop {
-                        if stop.load(Ordering::Acquire) {
-                            break Ok(());
-                        }
-                        let mut index = 0;
-                        while index < workers.len() {
-                            if Instant::now() >= workers[index].deadline {
-                                let _ = workers[index].socket.shutdown(Shutdown::Both);
-                            }
-                            if workers[index].worker.is_finished() {
-                                let worker = workers.swap_remove(index);
-                                let _ = worker.worker.join();
-                            } else {
-                                index += 1;
-                            }
-                        }
-                        match listener.accept() {
-                            Ok((socket, _)) => {
-                                if workers.len() >= 64 {
-                                    drop(socket);
-                                    continue;
+                let mut result = supervise_with(
+                    &failure_code,
+                    &worker_status,
+                    || {
+                        loop {
+                            let mut index = 0;
+                            while index < workers.len() {
+                                if Instant::now() >= workers[index].deadline {
+                                    let _ = workers[index].socket.shutdown(Shutdown::Both);
                                 }
-                                // Windows accepted sockets inherit the listener's mode;
-                                // the TLS dispatcher performs blocking, timed I/O.
-                                if let Err(error) = socket.set_nonblocking(false) {
-                                    break Err(error);
+                                if workers[index].worker.is_finished() {
+                                    let worker = workers.swap_remove(index);
+                                    worker.worker.join().unwrap_or_else(|_| {
+                                        Err(std::io::Error::other("registry worker panicked"))
+                                    })?;
+                                } else {
+                                    index += 1;
                                 }
-                                let tracked = match socket.try_clone() {
-                                    Ok(socket) => socket,
-                                    Err(error) => break Err(error),
+                            }
+                            if stop.load(Ordering::Acquire) {
+                                break Ok(());
+                            }
+                            let mut idle = false;
+                            {
+                                let _admission =
+                                    admission.lock().unwrap_or_else(|error| error.into_inner());
+                                if stop.load(Ordering::Acquire) {
+                                    break Ok(());
+                                }
+                                let listener = listener_for_loop
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                let accepted = match listener.as_ref() {
+                                    Some(listener) => listener.accept(),
+                                    None => {
+                                        break Err(std::io::Error::other(
+                                            "registry listener already closed",
+                                        ));
+                                    }
                                 };
-                                let transport = Arc::clone(&transport);
-                                let entries = Arc::clone(&entries);
-                                let state = Arc::clone(&state);
-                                let artifacts = Arc::clone(&artifacts);
-                                let leases = Arc::clone(&leases);
-                                let agent_peers = Arc::clone(&agent_peers);
-                                let state_path = state_path.clone();
-                                let stop = Arc::clone(&stop);
-                                let worker = match thread::Builder::new()
-                                    .name("registry-rpc".into())
-                                    .spawn(move || {
-                                        handle(
-                                            socket,
-                                            &transport,
-                                            offline_after,
-                                            entries,
-                                            state,
-                                            artifacts,
-                                            leases,
-                                            agent_peers,
-                                            &state_path,
-                                            &stop,
-                                        );
-                                    }) {
-                                    Ok(worker) => worker,
+                                match accepted {
+                                    Ok((socket, _)) => {
+                                        if workers.len() >= 64 {
+                                            drop(socket);
+                                            continue;
+                                        }
+                                        // Windows accepted sockets inherit the listener's mode;
+                                        // the TLS dispatcher performs blocking, timed I/O.
+                                        if let Err(error) = socket.set_nonblocking(false) {
+                                            break Err(error);
+                                        }
+                                        let tracked = match socket.try_clone() {
+                                            Ok(socket) => socket,
+                                            Err(error) => break Err(error),
+                                        };
+                                        let transport = Arc::clone(&transport);
+                                        let entries = Arc::clone(&entries);
+                                        let state = Arc::clone(&state);
+                                        let artifacts = Arc::clone(&artifacts);
+                                        let leases = Arc::clone(&leases);
+                                        let agent_peers = Arc::clone(&agent_peers);
+                                        let state_path = state_path.clone();
+                                        let stop = Arc::clone(&stop);
+                                        let status = worker_status.clone();
+                                        let admission = Arc::clone(&worker_admission);
+                                        let failure_code = Arc::clone(&worker_failure_code);
+                                        #[cfg(test)]
+                                        let dispatch_hook = dispatch_hook.clone();
+                                        let worker = match thread::Builder::new()
+                                            .name("registry-rpc".into())
+                                            .spawn(move || {
+                                                supervise_dispatcher(
+                                                    &status,
+                                                    &failure_code,
+                                                    &stop,
+                                                    &admission,
+                                                    || {
+                                                        #[cfg(test)]
+                                                        if let Some(hook) = dispatch_hook {
+                                                            hook(&socket, &state);
+                                                        }
+                                                        handle(
+                                                            socket,
+                                                            &transport,
+                                                            offline_after,
+                                                            entries,
+                                                            state,
+                                                            artifacts,
+                                                            leases,
+                                                            agent_peers,
+                                                            &state_path,
+                                                            &stop,
+                                                        );
+                                                    },
+                                                )
+                                            }) {
+                                            Ok(worker) => worker,
+                                            Err(error) => break Err(error),
+                                        };
+                                        // Legacy synchronous runs wait up to 15 seconds for agents.
+                                        workers.push(ConnectionWorker {
+                                            socket: tracked,
+                                            deadline: Instant::now() + Duration::from_secs(30),
+                                            worker,
+                                        });
+                                    }
+                                    Err(error)
+                                        if error.kind() == std::io::ErrorKind::WouldBlock =>
+                                    {
+                                        idle = true;
+                                    }
+                                    Err(error)
+                                        if error.kind() == std::io::ErrorKind::Interrupted =>
+                                    {
+                                        continue;
+                                    }
                                     Err(error) => break Err(error),
-                                };
-                                // Legacy synchronous runs wait up to 15 seconds for agents.
-                                workers.push(ConnectionWorker {
-                                    socket: tracked,
-                                    deadline: Instant::now() + Duration::from_secs(30),
-                                    worker,
-                                });
+                                }
                             }
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                thread::sleep(Duration::from_millis(10))
+                            if idle {
+                                thread::sleep(Duration::from_millis(10));
                             }
-                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                                continue;
-                            }
-                            Err(error) => break Err(error),
                         }
-                    }
-                });
+                    },
+                    || {
+                        stop.store(true, Ordering::Release);
+                        listener_for_close
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take();
+                    },
+                );
                 stop.store(true, Ordering::Release);
                 drop(listener);
                 for worker in &workers {
                     let _ = worker.socket.shutdown(Shutdown::Both);
                 }
                 for worker in workers {
-                    let _ = worker.worker.join();
+                    result = result.and(worker.worker.join().unwrap_or_else(|_| {
+                        Err(std::io::Error::other("registry worker panicked"))
+                    }));
                 }
                 result
             })?;
@@ -320,6 +451,10 @@ impl Drop for RegistryRuntime {
         let _ = self.shutdown();
     }
 }
+
+#[cfg(test)]
+#[path = "worker_failure_tests.rs"]
+mod worker_failure_tests;
 
 #[cfg(test)]
 mod root_privacy_tests {
@@ -961,7 +1096,7 @@ mod terminal_status_tests {
         assert_degraded(&mut daemon, "registry_listener_stopped");
     }
 
-    fn assert_degraded(daemon: &mut DaemonState, code: &str) {
+    pub(super) fn assert_degraded(daemon: &mut DaemonState, code: &str) {
         let LocalResponse::Snapshot(snapshot) = daemon
             .handle(LocalRequest::Status {
                 version: LocalProtocolVersion::CURRENT,
@@ -992,7 +1127,7 @@ mod terminal_status_tests {
         );
     }
 
-    fn daemon() -> DaemonState {
+    pub(super) fn daemon() -> DaemonState {
         DaemonState::new(
             DaemonSnapshot {
                 public_identity: "controller-fixture".into(),

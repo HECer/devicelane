@@ -523,6 +523,7 @@ pub struct DaemonState {
     snapshot: DaemonSnapshot,
     diagnostics: Vec<DiagnosticItem>,
     autostart_adapter: Option<Arc<dyn AutostartAdapter>>,
+    autostart_status_overridden: bool,
     dashboard_policy: Option<DashboardPolicyRuntime>,
     dashboard: Option<DashboardService>,
     remote_execution: Option<RemoteExecutionConfig>,
@@ -788,6 +789,7 @@ impl DaemonState {
             snapshot,
             diagnostics,
             autostart_adapter: None,
+            autostart_status_overridden: false,
             dashboard_policy: None,
             dashboard: None,
             remote_execution: None,
@@ -808,6 +810,7 @@ impl DaemonState {
             snapshot,
             diagnostics,
             autostart_adapter: Some(Arc::new(PlatformAutostartAdapter)),
+            autostart_status_overridden: false,
             dashboard_policy: None,
             dashboard: None,
             remote_execution: None,
@@ -829,6 +832,7 @@ impl DaemonState {
             snapshot,
             diagnostics,
             autostart_adapter: Some(autostart_adapter),
+            autostart_status_overridden: false,
             dashboard_policy: None,
             dashboard: None,
             remote_execution: None,
@@ -841,6 +845,12 @@ impl DaemonState {
 
     pub fn snapshot(&self) -> &DaemonSnapshot {
         &self.snapshot
+    }
+
+    pub fn set_autostart_status(&mut self, enabled: bool) {
+        if !self.autostart_status_overridden {
+            self.snapshot.autostart = enabled;
+        }
     }
 
     pub fn enable_dashboard_policy(&mut self, local_host_id: HostId, engine: PolicyEngine) {
@@ -1117,6 +1127,7 @@ impl DaemonState {
                 if let Some(adapter) = &self.autostart_adapter {
                     adapter.set_enabled(enabled)?;
                 }
+                self.autostart_status_overridden = true;
                 self.snapshot.autostart = enabled;
                 Ok(LocalResponse::Acknowledged)
             }
@@ -1774,6 +1785,20 @@ mod inventory_generation_tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn stale_autostart_probe_cannot_override_explicit_request() {
+        let state = state();
+        let mut daemon = state.lock().unwrap();
+        daemon
+            .handle(LocalRequest::SetAutostart {
+                version: LocalProtocolVersion::CURRENT,
+                enabled: true,
+            })
+            .unwrap();
+        daemon.set_autostart_status(false);
+        assert!(daemon.snapshot().autostart);
     }
 
     fn state() -> Arc<Mutex<DaemonState>> {

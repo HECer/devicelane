@@ -236,7 +236,10 @@ fn run() -> Result<(), String> {
             remote_protocol: "1.0".into(),
             warnings,
             remote_access_paused: false,
-            autostart: platform_autostart_enabled(),
+            // Querying the platform scheduler can start a cold PowerShell process
+            // on Windows. The service must bind IPC before that optional status
+            // refresh completes.
+            autostart: false,
             log_location: args.log_dir.display().to_string(),
             features: vec![
                 "dashboard_v1".into(),
@@ -315,6 +318,15 @@ fn run() -> Result<(), String> {
             .attach_registry_status(runtime.status());
     }
     start_registry_inventory_observer(&state);
+    let autostart_state = Arc::clone(&state);
+    let _ = std::thread::Builder::new()
+        .name("autostart-status".into())
+        .spawn(move || {
+            let enabled = platform_autostart_enabled();
+            if let Ok(mut daemon_state) = autostart_state.lock() {
+                daemon_state.set_autostart_status(enabled);
+            }
+        });
     if args.foreground {
         eprintln!("devicelane-service: listening on {}", args.listen);
     }
