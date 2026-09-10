@@ -35,6 +35,17 @@ struct FakeTransport {
     response: LocalResponse,
 }
 
+fn prepare_service_state_directory(path: &Path) {
+    #[cfg(windows)]
+    device_development_mesh::state_paths::prepare_private_state_directory(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 #[test]
 fn connection_write_uses_exact_typed_settings_and_requires_acknowledgement() {
     use device_development_mesh::connection_config::ConnectionConfig;
@@ -254,6 +265,14 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     let service_identity = root.path().join("service").join("mac-agent");
     let agent_identity = root.path().join("mesh-agent");
     let windows_identity = root.path().join("windows-client");
+    for path in [
+        &registry_identity,
+        &service_identity,
+        &agent_identity,
+        &windows_identity,
+    ] {
+        prepare_service_state_directory(path);
+    }
     pair_process_as(
         &workspace_binary("mesh-cli"),
         &registry_identity,
@@ -329,13 +348,8 @@ fn paired_process_execution_is_identical_through_ipc_cli_and_tauri_bridge() {
     let _release_on_failure = InstallGateRelease(install_gate.clone());
     let runtime = root.path().join("runtime");
     let logs = root.path().join("logs");
-    std::fs::create_dir_all(&runtime).unwrap();
-    std::fs::create_dir_all(&logs).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    prepare_service_state_directory(&runtime);
+    prepare_service_state_directory(&logs);
     #[cfg(windows)]
     let listen = format!(r"\\.\pipe\devicelane-mesh-e2e-{}", std::process::id());
     #[cfg(not(windows))]

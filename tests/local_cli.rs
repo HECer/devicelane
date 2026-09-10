@@ -314,7 +314,6 @@ mod installed_unix_runtime {
     use super::*;
     use device_development_mesh::local_ipc::{DaemonRole, DaemonSnapshot};
     use std::io::Read;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     fn capture(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {

@@ -5,6 +5,7 @@ use device_development_mesh::local_ipc::{
 };
 use device_development_mesh::secure_transport::SecureTransport;
 use std::net::TcpListener;
+#[cfg(windows)]
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
