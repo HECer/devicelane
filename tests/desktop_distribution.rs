@@ -284,10 +284,14 @@ fn production_environment_drift_and_unsigned_reproducibility_are_gated() {
 #[test]
 fn macos_release_linker_uses_reproducible_output_mode() {
     let workflow = read(".github/workflows/desktop-release.yml");
+    let wrapper = read("scripts/reproducible-macos-rustc.sh");
     assert!(
-        workflow.contains("RUSTFLAGS=-C link-arg=-Wl,-reproducible")
-            && workflow.contains("-C link-arg=-Wl,-no_adhoc_codesign")
-            && workflow.contains("-C link-arg=-Wl,-no_uuid"),
+        workflow.contains("RUSTC_WRAPPER=$GITHUB_WORKSPACE/scripts/reproducible-macos-rustc.sh")
+            && wrapper.contains("-Wl,-reproducible")
+            && wrapper.contains("-Wl,-no_adhoc_codesign")
+            && wrapper.contains("-Wl,-no_uuid")
+            && wrapper.contains("devicelane_service")
+            && wrapper.contains("devicelane_desktop"),
         "unsigned macOS binaries must use reproducible linker options"
     );
 }

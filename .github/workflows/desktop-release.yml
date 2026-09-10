@@ -40,7 +40,7 @@ jobs:
       - name: Reproducible unsigned macOS linker
         if: runner.os == 'macOS'
         shell: bash
-        run: echo 'RUSTFLAGS=-C link-arg=-Wl,-reproducible -C link-arg=-Wl,-no_adhoc_codesign -C link-arg=-Wl,-no_uuid' >> "$GITHUB_ENV"
+        run: echo "RUSTC_WRAPPER=$GITHUB_WORKSPACE/scripts/reproducible-macos-rustc.sh" >> "$GITHUB_ENV"
       - name: Reproducible unsigned payload gate
         working-directory: desktop
         shell: bash
