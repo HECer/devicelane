@@ -12,8 +12,12 @@
   "engines": { "node": ">=20" },
   "bin": {
     "devicelane": "bin/devicelane.mjs",
+    "devicelane-service": "bin/devicelane-service.mjs",
     "devicelane-agent": "bin/devicelane-agent.mjs",
-    "devicelane-registry": "bin/devicelane-registry.mjs"
+    "devicelane-registry": "bin/devicelane-registry.mjs",
+    "mesh-cli": "bin/mesh-cli.mjs",
+    "mesh-agent": "bin/mesh-agent.mjs",
+    "mesh-registry": "bin/mesh-registry.mjs"
   },
   "files": ["bin", "lib", "README.md", "LICENSE"],
   "scripts": { "test": "node --test test/*.test.mjs" }

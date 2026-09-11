@@ -1,5 +1,32 @@
 # Device Development Mesh – Systemdesign und Masterplan
 
+## Active handoff: controller runtime, 2026-09-06
+
+AI-assisted implementation checkpoint, not a release or completion claim.
+The approved next Yoke task is STORY-37: truthful failure supervision for registry
+workers. Use the existing runtime design and plan in docs/superpowers/ as context.
+Preserve all credentials, installed binaries, configuration and autostart; do not
+deploy, migrate trust or claim native Mac verification in this task.
+
+Current evidence: the malformed-Run rejection and test-fixture corrections passed
+independent scoped specification/quality review. The latest Windows and Linux runs
+each passed 8 daemon-controller tests, 1 vertical-slice test and 4 runtime tests.
+The Linux library run passed 87 tests; the Windows library run passed 110 tests.
+These are scoped checks, not a full workspace or release gate.
+
+The local checkpoint retains unfinished runtime work so isolated Yoke workers can
+continue from the real source state. STORY-37 must first demonstrate a failing
+behavioral regression, then implement and independently review the correction.
+Do not weaken the existing workspace verification command to make it green.
+
+The full product objective remains open: secure live pairing and revocation,
+controller inventory/UI integration, resource/activity visibility, approvals,
+policies and audit, desktop/CLI parity, Windows/macOS/Linux packaging and autostart,
+and actual Windows/Mac UI and native build end-to-end verification. The historical
+hardware story is retained and must not pass from mocks or simulator evidence.
+After this bounded runtime task, reconcile the full remaining backlog against the
+current design and actual source before claiming that all product work is queued.
+
 Stand: 2026-07-30  
 Status: Phase 1 verifiziert; Phase 2 (Mac/iOS) in Umsetzung
 
@@ -395,3 +422,19 @@ verteilte Lease-Steuerung und die produktive Bootstrap-/Neustartpersistenz sind
 als eigene Pflichtstories vor das Hardware-Gate gezogen.
 
 Nicht-Ziele dieses Loops bleiben allgemeine iOS-Systemfernsteuerung, Steuerung fremder Apps, Umgehung von Signing/Trust/Developer Mode sowie eine Desktop-GUI. Private Signing-Schlüssel verlassen niemals den macOS-Keychain. Der Nutzer wird erst eingebunden, wenn Bootstrap und Hardware-Gate als ein konkreter Mac-Befehl bereitstehen.
+
+## STORY-37 Replan: reproducible Windows verification
+
+The registry-worker failure path is verified in the real supervisor/IPC tests.
+On Windows, the loop must run from the installed Visual Studio 2022 BuildTools
+developer shell (MSVC 14.44.35207 with `vcruntime.h` available); the VS 18
+Community shell is incomplete and is not an acceptable verification environment.
+`CODEX_HOME`, `TEMP`, `TMP`, and `CARGO_TARGET_DIR` are redirected to the E:
+volume for the isolated run. Acceptance requires all three STORY-37 criteria,
+the configured workspace verification command, and a final PRD result of 17/17.
+
+The isolated test environment must preserve the real Windows `USERPROFILE`
+(`C:\Users\HEC_e`) so ACL/owner checks observe the authenticated account. Only
+`TEMP`/`TMP` and `CARGO_TARGET_DIR` are redirected; replacing `USERPROFILE`
+with a temporary E: directory invalidates the existing state-path security
+suite and is an environment failure, not a product failure.

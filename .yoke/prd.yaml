@@ -294,7 +294,7 @@
   area: production-bootstrap
 - id: STORY-36
   title: Reales Mac-und-iPhone-Hardware-Gate bestehen
-  priority: 16
+  priority: 17
   acceptance:
     - scripts/mac-hardware-gate.sh läuft auf einem echten Mac ohne
       Mock-Toolpfade und erfasst Xcode-, SDK-, Tool- und Geräteversionen in
@@ -312,3 +312,30 @@
   needs:
     - STORY-35
   area: apple-hardware-gate
+- id: STORY-37
+  title: Publish registry worker failures and stop admission truthfully
+  priority: 16
+  area: controller-runtime
+  assessment:
+    taskClass: debugging
+    difficulty: medium
+    uncertainty: low
+    risk: high
+    scope: low
+    testability: high
+    reason: Finished dispatcher join errors are currently discarded, leaving a poisoned controller advertised as running.
+    approach: Reproduce with a privately injected panicking worker using the actual supervision path, propagate failure before cleanup, retain joined shutdown and exclusive writer ownership, and verify typed IPC degradation. No public fault injection API or silent recovery of poisoned durable state.
+  acceptance:
+    - id: registry_worker_panic_stops_admission
+      text: An unexpected dispatcher panic publishes an observable failed controller status and stops new admission through the real supervisor path; controlled private fault injection proves it without a public panic API.
+      verify:
+        - cargo test -p devicelane --lib registry_worker_panic_stops_admission --locked
+    - id: registry_worker_panic_joins_cleanup
+      text: Failure closes tracked sockets and joins remaining workers before releasing the state writer lock; shutdown reports failure without stranding the test process.
+      verify:
+        - cargo test -p devicelane --lib registry_worker_panic_joins_cleanup --locked
+    - id: registry_worker_panic_degrades_ipc
+      text: Native daemon status and diagnostics expose controller failure rather than healthy readiness after an unexpected worker panic; ordinary invalid manifest rejection keeps the controller usable and is not classified as an internal panic.
+      verify:
+        - cargo test -p devicelane --lib registry_worker_panic_degrades_ipc --locked
+  passes: false

@@ -4,8 +4,49 @@ agents:
 loop:
   enabled: true
   decisionPolicy: auto
+  # STORY-37's workspace-level verification includes a cold MSVC build and a
+  # full clippy pass; allow the isolated provider to finish without a hard
+  # process cutoff while retaining a bounded recovery window.
+  maxCallMinutes: 180
+  # The provider can spend several minutes in silent workspace tests; keep a
+  # generous idle/progress window so long verification phases can complete.
+  timeoutMinutes: 90
+  progressTimeoutMinutes: 90
 runner:
   agent: codex
+routing:
+  enabled: true
+  strategy: capability
+  maxCandidates: 3
+  workers:
+    - id: codex-light
+      agent: codex
+      model: gpt-5.6-luna
+      reasoningEffort: low
+      tier: light
+      costTier: low
+      capabilities: [mechanical, tests]
+    - id: codex-standard
+      agent: codex
+      model: gpt-5.6-terra
+      reasoningEffort: medium
+      tier: standard
+      costTier: low
+      capabilities: [implementation]
+    - id: codex-strong
+      agent: codex
+      model: gpt-5.6-sol
+      reasoningEffort: high
+      tier: strong
+      costTier: medium
+      capabilities: [debugging]
+    - id: codex-frontier
+      agent: codex
+      model: gpt-6-astra
+      reasoningEffort: high
+      tier: frontier
+      costTier: high
+      capabilities: [architecture]
 codeGraph: graphify
 verify:
   command: cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check

@@ -1,22 +1,192 @@
 use device_development_mesh::{
     network_processes::{
-        DeviceSnapshot, HostSnapshot, LeaseGrant, LeaseRequest, NetworkEvent, Request,
+        DeviceSnapshot, HostSnapshot, LeaseGrant, LeaseRequest, NetworkEvent, Request, Response,
     },
     remote_apple_protocol::{AppleOperation, AppleRequest, RemoteProtocolVersion},
     secure_transport::SecureTransport,
 };
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 const DEVICE: &str = "sim-1";
 static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn cli_capture_drains_both_large_output_streams() {
+    const MARKER: &[u8] = b"DEVICELANE_STDOUT_PAYLOAD\n";
+    const PAYLOAD_BYTES: usize = 128 * 1024;
+
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "cli_pipe_output_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("DEVICELANE_PIPE_TEST_CHILD", "1");
+    let output = bounded_cli_output(child, "cli pipe output child");
+
+    assert!(
+        output.status.success(),
+        "child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let marker_positions: Vec<_> = output
+        .stdout
+        .windows(MARKER.len())
+        .enumerate()
+        .filter_map(|(index, bytes)| (bytes == MARKER).then_some(index))
+        .collect();
+    assert_eq!(marker_positions.len(), 1, "stdout={:?}", output.stdout);
+    assert_eq!(
+        &output.stdout[marker_positions[0] + MARKER.len()..],
+        vec![b'o'; PAYLOAD_BYTES]
+    );
+    assert_eq!(output.stderr, vec![b'e'; PAYLOAD_BYTES]);
+}
+
+#[test]
+#[ignore = "invoked as a bounded subprocess fixture"]
+fn cli_pipe_output_child() {
+    if std::env::var("DEVICELANE_PIPE_TEST_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(b"DEVICELANE_STDOUT_PAYLOAD\n").unwrap();
+    stdout.write_all(&vec![b'o'; 128 * 1024]).unwrap();
+    stdout.flush().unwrap();
+    let mut stderr = std::io::stderr().lock();
+    stderr.write_all(&vec![b'e'; 128 * 1024]).unwrap();
+    stderr.flush().unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+fn cli_drains_large_authenticated_events_output_before_waiting_for_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = root.path().join("registry");
+    let client = root.path().join("client");
+    pair(&registry, "registry", &client, "client");
+
+    let payload = "x".repeat(128 * 1024);
+    let response = Response {
+        accepted: true,
+        hosts: vec![],
+        job_id: Some("large-events-job".into()),
+        events: vec![NetworkEvent {
+            sequence: 1,
+            kind: "stdout".into(),
+            payload: payload.clone(),
+        }],
+        audit: vec![],
+        artifact: None,
+        error: None,
+        operation: None,
+        apple_operation: None,
+        cancel_jobs: vec![],
+        artifact_metadata: None,
+        artifact_chunk: None,
+        confirmed_offset: None,
+        lease_grant: None,
+        lease_status: None,
+    };
+    let response_frame = serde_json::to_vec(&response).unwrap();
+    let mut expected_stdout = response_frame.clone();
+    expected_stdout.push(b'\n');
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let registry_transport = SecureTransport::load_or_create(&registry, "registry").unwrap();
+    let fully_flushed_replies = Arc::new(AtomicUsize::new(0));
+    let server_flushed_replies = Arc::clone(&fully_flushed_replies);
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "fixture timed out accepting mesh-cli"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("fixture failed accepting mesh-cli: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = registry_transport.accept_tls(stream).unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream).read_line(&mut request).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).unwrap(),
+                Request::Events { ref job_id, after: 0 } if job_id == "large-events-job"
+            ));
+            stream.write_all(&response_frame).unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            server_flushed_replies.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    let body = serde_json::json!({"job_id": "large-events-job", "after": 0});
+    let scenario = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let control = cli_with_concurrent_drain(&address, &client, "events", &body);
+        eprintln!(
+            "control status={} stdout_bytes={}",
+            control.status,
+            control.stdout.len()
+        );
+        assert!(
+            control.status.success(),
+            "control mesh-cli failed: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+        assert_eq!(control.stdout, expected_stdout);
+        let control_response: serde_json::Value = serde_json::from_slice(&control.stdout).unwrap();
+        assert_eq!(control_response["events"][0]["payload"], payload);
+
+        cli(&address, &client, "events", &body)
+    }));
+    let server_result = server.join();
+    eprintln!(
+        "fully_flushed_replies={}",
+        fully_flushed_replies.load(Ordering::SeqCst)
+    );
+    if let Err(panic) = server_result {
+        std::panic::resume_unwind(panic);
+    }
+    let output = match scenario {
+        Ok(output) => output,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert!(
+        output.status.success(),
+        "mesh-cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, expected_stdout);
+}
 
 #[test]
 fn lease_rpc_covers_acquire_renew_queue_release_revoke_and_one_writer() {
@@ -310,7 +480,7 @@ fn authorized_agent_detach_promotes_the_waiting_client() {
 
 #[test]
 fn agent_detach_recovers_a_writer_after_terminal_progress_is_lost() {
-    let mut harness = Harness::start(Duration::from_millis(800));
+    let mut harness = Harness::start_gated();
     let owned = acquire(&harness, &harness.client_a, 30_000);
     assert_eq!(
         lease(
@@ -323,20 +493,57 @@ fn agent_detach_recovers_a_writer_after_terminal_progress_is_lost() {
         )["lease_status"],
         "queued"
     );
-    cli_json(
+    let job = cli_json(
         &harness.address,
         &harness.client_a,
         "apple-run",
         &apple_request("lost-terminal", &grant_id(&owned)),
     );
-    wait_until("mutating tool start", || {
-        mutation_lines(&harness.marker).contains(&"mutation-start".into())
-    });
+    let job_id = job["job_id"].as_str().unwrap().to_owned();
+    wait_for_mutation(
+        &mut harness,
+        "mutation-start",
+        "mutating tool start",
+        true,
+        Some(&job_id),
+    );
+    harness._registry.kill().unwrap();
+    harness._registry.wait().unwrap();
+    std::fs::write(
+        harness.mutation_gate.as_ref().unwrap(),
+        b"release mutation\n",
+    )
+    .unwrap();
+    wait_for_mutation(
+        &mut harness,
+        "mutation-end",
+        "tool completion while terminal delivery is unavailable",
+        false,
+        None,
+    );
     harness._agent.kill().unwrap();
     harness._agent.wait().unwrap();
-    wait_until("orphaned tool completion", || {
-        mutation_lines(&harness.marker).contains(&"mutation-end".into())
-    });
+    harness._registry = start_registry(&harness.address, &harness._root.path().join("registry"));
+    wait_for_listener(&harness.address);
+    let snapshot = cli_json(
+        &harness.address,
+        &harness.client_a,
+        "events",
+        &serde_json::json!({"job_id": job_id, "after": 0}),
+    );
+    assert_eq!(snapshot["accepted"], true, "{snapshot}");
+    assert_eq!(snapshot["job_id"], job_id, "{snapshot}");
+    assert!(
+        snapshot["events"].as_array().is_none_or(|events| {
+            events.iter().all(|event| {
+                !matches!(
+                    event["kind"].as_str(),
+                    Some("completed" | "rejected" | "cancelled")
+                )
+            })
+        }),
+        "agent delivered a terminal event before the detach recovery boundary: {snapshot}"
+    );
 
     let detached_inventory = rpc(
         &harness.address,
@@ -489,7 +696,7 @@ fn detached_device_without_a_writer_can_migrate_to_another_agent() {
 
 #[test]
 fn reconnected_device_keeps_its_agent_owner_after_writer_terminal() {
-    let mut harness = Harness::start_with_heartbeat(Duration::from_millis(2_000), 4_000);
+    let mut harness = Harness::start_gated_with_heartbeat(4_000);
     let owned = acquire(&harness, &harness.client_a, 30_000);
     let job = cli_json(
         &harness.address,
@@ -497,9 +704,13 @@ fn reconnected_device_keeps_its_agent_owner_after_writer_terminal() {
         "apple-run",
         &apple_request("transient-detach", &grant_id(&owned)),
     );
-    wait_until("mutating tool start", || {
-        mutation_lines(&harness.marker).contains(&"mutation-start".into())
-    });
+    wait_for_mutation(
+        &mut harness,
+        "mutation-start",
+        "mutating tool start",
+        true,
+        job["job_id"].as_str(),
+    );
     for devices in [
         Vec::new(),
         vec![DeviceSnapshot {
@@ -526,6 +737,11 @@ fn reconnected_device_keeps_its_agent_owner_after_writer_terminal() {
             true
         );
     }
+    std::fs::write(
+        harness.mutation_gate.as_ref().unwrap(),
+        b"release mutation\n",
+    )
+    .unwrap();
     wait_for_terminal(
         &harness.address,
         &harness.client_a,
@@ -615,8 +831,25 @@ fn forged_workspace_lease_and_grant_cannot_run_a_mutation_but_observer_reads_eve
 
 #[test]
 fn expired_writer_finishes_before_the_promoted_writer_starts() {
-    let harness = Harness::start(Duration::from_millis(1_200));
-    let first = acquire(&harness, &harness.client_a, 800);
+    let harness = Harness::start(Duration::from_millis(5_000));
+    let first = acquire(&harness, &harness.client_a, 30_000);
+    let first_id = grant_id(&first);
+    let first_job = cli_json(
+        &harness.address,
+        &harness.client_a,
+        "apple-run",
+        &apple_request("slow-a", &first_id),
+    )["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_until("first mutating tool start", || {
+        mutation_lines(&harness.marker)
+            .iter()
+            .filter(|line| *line == "mutation-start")
+            .count()
+            == 1
+    });
     assert_eq!(
         lease(
             &harness.address,
@@ -629,24 +862,17 @@ fn expired_writer_finishes_before_the_promoted_writer_starts() {
         "queued"
     );
 
-    let first_job = cli_json(
+    let renewed = lease(
         &harness.address,
         &harness.client_a,
-        "apple-run",
-        &apple_request("slow-a", &grant_id(&first)),
-    )["job_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    wait_until("first mutating tool start", || {
-        mutation_lines(&harness.marker)
-            .iter()
-            .filter(|line| *line == "mutation-start")
-            .count()
-            == 1
-    });
+        &LeaseRequest::Renew {
+            lease_id: first_id,
+            lifetime_ms: 2_000,
+        },
+    );
+    assert_eq!(renewed["lease_status"], "renewed", "{renewed}");
 
-    thread::sleep(Duration::from_millis(850));
+    thread::sleep(Duration::from_millis(2_050));
     let promoted = wait_for_current_grant(&harness, &harness.client_b);
     let second_job = cli_json(
         &harness.address,
@@ -727,6 +953,7 @@ struct Harness {
     agent: PathBuf,
     agent_b: PathBuf,
     marker: PathBuf,
+    mutation_gate: Option<PathBuf>,
     _registry: ChildGuard,
     _agent: ChildGuard,
     _network_test_lock: MutexGuard<'static, ()>,
@@ -734,10 +961,22 @@ struct Harness {
 
 impl Harness {
     fn start(mutation_delay: Duration) -> Self {
-        Self::start_with_heartbeat(mutation_delay, 50)
+        Self::start_with_options(mutation_delay, 50, false)
     }
 
-    fn start_with_heartbeat(mutation_delay: Duration, heartbeat_ms: u64) -> Self {
+    fn start_gated() -> Self {
+        Self::start_with_options(Duration::ZERO, 50, true)
+    }
+
+    fn start_gated_with_heartbeat(heartbeat_ms: u64) -> Self {
+        Self::start_with_options(Duration::ZERO, heartbeat_ms, true)
+    }
+
+    fn start_with_options(
+        mutation_delay: Duration,
+        heartbeat_ms: u64,
+        gate_mutation: bool,
+    ) -> Self {
         let network_test_lock = NETWORK_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -759,9 +998,11 @@ impl Harness {
         let project = workspace_root.join("mac-1/project");
         std::fs::create_dir_all(project.join(".leases")).unwrap();
         let marker = root.path().join("apple-tools.log");
-        let xcodebuild = fake_tool(root.path(), "xcodebuild", &marker, mutation_delay);
-        let devicectl = fake_tool(root.path(), "devicectl", &marker, mutation_delay);
-        let simctl = fake_tool(root.path(), "simctl", &marker, mutation_delay);
+        let mutation_gate = root.path().join("mutation-release");
+        let gate = gate_mutation.then_some(mutation_gate.as_path());
+        let xcodebuild = fake_tool(root.path(), "xcodebuild", &marker, mutation_delay, gate);
+        let devicectl = fake_tool(root.path(), "devicectl", &marker, mutation_delay, gate);
+        let simctl = fake_tool(root.path(), "simctl", &marker, mutation_delay, gate);
 
         let client_transport = SecureTransport::load_or_create(&client_a, "client-a").unwrap();
         let mut forged_grant = LeaseGrant {
@@ -827,6 +1068,7 @@ impl Harness {
             agent,
             agent_b,
             marker,
+            mutation_gate: gate_mutation.then_some(mutation_gate),
             _registry: registry_process,
             _agent: agent_process,
             _network_test_lock: network_test_lock,
@@ -937,6 +1179,63 @@ fn mutation_lines(marker: &Path) -> Vec<String> {
         .collect()
 }
 
+fn wait_for_mutation(
+    harness: &mut Harness,
+    expected: &str,
+    label: &str,
+    registry_should_run: bool,
+    job_id: Option<&str>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let markers = mutation_lines(&harness.marker);
+        let agent_status = harness._agent.try_wait().unwrap();
+        let registry_status = harness._registry.try_wait().unwrap();
+        assert!(
+            agent_status.is_none(),
+            "agent exited before {label}; agent_status={agent_status:?}; registry_status={registry_status:?}; markers={markers:?}"
+        );
+        assert_eq!(
+            registry_status.is_none(),
+            registry_should_run,
+            "registry state changed before {label}; agent_status={agent_status:?}; registry_status={registry_status:?}; markers={markers:?}"
+        );
+        if markers.iter().any(|line| line == expected) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let event_snapshot = job_id.map_or(serde_json::Value::Null, |job_id| {
+                rpc(
+                    &harness.address,
+                    &harness.client_a,
+                    &Request::Events {
+                        job_id: job_id.into(),
+                        after: 0,
+                    },
+                )
+            });
+            let hosts = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
+                .args([
+                    "--registry",
+                    &harness.address,
+                    "--identity",
+                    harness.client_a.to_str().unwrap(),
+                    "list",
+                    "--json",
+                ])
+                .output()
+                .unwrap();
+            panic!(
+                "timed out waiting for {label}; agent_status={agent_status:?}; registry_status={registry_status:?}; markers={markers:?}; event_snapshot={event_snapshot}; host_status={}; host_stdout={}; host_stderr={}",
+                hosts.status,
+                String::from_utf8_lossy(&hosts.stdout),
+                String::from_utf8_lossy(&hosts.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn start_registry(address: &str, identity: &Path) -> ChildGuard {
     spawn(
         env!("CARGO_BIN_EXE_mesh-registry"),
@@ -946,7 +1245,7 @@ fn start_registry(address: &str, identity: &Path) -> ChildGuard {
             "--identity",
             identity.to_str().unwrap(),
             "--offline-after-ms",
-            "500",
+            "5000",
             "--agent-peer",
             "agent",
             "--agent-peer",
@@ -955,16 +1254,136 @@ fn start_registry(address: &str, identity: &Path) -> ChildGuard {
     )
 }
 
-fn fake_tool(root: &Path, name: &str, marker: &Path, mutation_delay: Duration) -> PathBuf {
+#[cfg(windows)]
+#[test]
+fn windows_lease_fixture_delay_works_with_cleared_environment() {
+    assert_windows_lease_fixture(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_lease_fixture_gate_works_with_cleared_environment() {
+    assert_windows_lease_fixture(true);
+}
+
+#[cfg(windows)]
+fn assert_windows_lease_fixture(gated: bool) {
+    use device_development_mesh::process_execution::{
+        CancellationToken, EventKind, ProcessExecutor, ProcessRequest, TerminalStatus,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("fixture.log");
+    let gate = root.path().join("release");
+    let delay = if gated {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(1)
+    };
+    let tool = fake_tool(
+        root.path(),
+        "simctl",
+        &marker,
+        delay,
+        gated.then_some(gate.as_path()),
+    );
+    let executor = ProcessExecutor::new(root.path(), [tool.clone()], []).unwrap();
+    let started = Instant::now();
+    let events = thread::scope(|scope| {
+        let release = gated.then(|| {
+            scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !std::fs::read_to_string(&marker)
+                    .is_ok_and(|text| text.contains("mutation-start"))
+                {
+                    assert!(Instant::now() < deadline, "fixture did not enter mutation");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                thread::sleep(Duration::from_millis(200));
+                assert!(
+                    !std::fs::read_to_string(&marker)
+                        .unwrap()
+                        .contains("mutation-end"),
+                    "fixture completed before explicit release"
+                );
+                std::fs::write(&gate, b"release").unwrap();
+            })
+        });
+        let events = executor
+            .execute(
+                ProcessRequest {
+                    program: tool,
+                    args: vec!["install".into(), DEVICE.into(), "build/App.app".into()],
+                    working_directory: ".".into(),
+                    environment: Default::default(),
+                },
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .unwrap();
+        if let Some(release) = release {
+            release.join().unwrap();
+        }
+        events
+    });
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == EventKind::Terminal(TerminalStatus::Exited(0))),
+        "fixture did not exit successfully"
+    );
+    let stderr_bytes: usize = events
+        .iter()
+        .filter(|event| event.kind == EventKind::Stderr)
+        .map(|event| event.payload.len())
+        .sum();
+    assert_eq!(
+        stderr_bytes, 0,
+        "fixture wrote stderr with cleared environment"
+    );
+    let marker = std::fs::read_to_string(marker).unwrap();
+    assert!(marker.contains("mutation-start") && marker.contains("mutation-end"));
+    if !gated {
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "fixture skipped its requested delay"
+        );
+    }
+}
+
+fn fake_tool(
+    root: &Path,
+    name: &str,
+    marker: &Path,
+    mutation_delay: Duration,
+    mutation_gate: Option<&Path>,
+) -> PathBuf {
     #[cfg(windows)]
     {
         let path = root.join(format!("{name}.cmd"));
+        let ping = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/ping.exe");
+        let delay_command = if mutation_delay.is_zero() {
+            "rem no mutation delay".to_owned()
+        } else {
+            let ping_count = mutation_delay.as_millis().div_ceil(1_000) + 1;
+            format!("\"{}\" -n {ping_count} 127.0.0.1 >nul", ping.display())
+        };
+        let gate_command = mutation_gate.map_or_else(
+            || "rem no mutation gate".to_owned(),
+            |gate| {
+                format!(
+                    ":wait_gate\r\nif not exist \"{}\" (\r\n  \"{}\" -n 2 127.0.0.1 >nul\r\n  goto wait_gate\r\n)",
+                    gate.display(), ping.display()
+                )
+            },
+        );
         std::fs::write(
             &path,
             format!(
-                "@echo off\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"install\" goto mutation\r\nif \"%1\"==\"-version\" goto version\r\nif \"{name}\"==\"devicectl\" if \"%1\"==\"list\" goto devices\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"list\" goto simulators\r\necho tool-output {name} %*\r\nexit /b 0\r\n:mutation\r\necho mutation-start>>\"{}\"\r\npowershell.exe -NoProfile -Command \"Start-Sleep -Milliseconds {}\"\r\necho mutation-end>>\"{}\"\r\necho installed\r\nexit /b 0\r\n:version\r\necho Xcode 16\r\nexit /b 0\r\n:devices\r\necho {{\"result\":{{\"devices\":[]}}}}\r\nexit /b 0\r\n:simulators\r\necho {{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}\r\nexit /b 0\r\n",
+                "@echo off\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"install\" goto mutation\r\nif \"%1\"==\"-version\" goto version\r\nif \"{name}\"==\"devicectl\" if \"%1\"==\"list\" goto devices\r\nif \"{name}\"==\"simctl\" if \"%1\"==\"list\" goto simulators\r\necho tool-output {name} %*\r\nexit /b 0\r\n:mutation\r\necho mutation-start>>\"{}\"\r\n{}\r\n{}\r\necho mutation-end>>\"{}\"\r\necho installed\r\nexit /b 0\r\n:version\r\necho Xcode 16\r\nexit /b 0\r\n:devices\r\necho {{\"result\":{{\"devices\":[]}}}}\r\nexit /b 0\r\n:simulators\r\necho {{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}\r\nexit /b 0\r\n",
                 marker.display(),
-                mutation_delay.as_millis(),
+                gate_command,
+                delay_command,
                 marker.display()
             ),
         )
@@ -975,11 +1394,18 @@ fn fake_tool(root: &Path, name: &str, marker: &Path, mutation_delay: Duration) -
     {
         use std::os::unix::fs::PermissionsExt;
         let path = root.join(name);
+        let gate_command = mutation_gate.map_or_else(String::new, |gate| {
+            format!(
+                "  while [ ! -f '{}' ]; do sleep 0.05; done\n",
+                gate.display()
+            )
+        });
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\nif [ '{name}' = simctl ] && [ \"$1\" = install ]; then\n  echo mutation-start >> '{}'\n  sleep {}\n  echo mutation-end >> '{}'\n  echo installed\n  exit 0\nfi\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && [ \"$1\" = list ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && [ \"$1\" = list ] && echo '{{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}' && exit 0\necho \"tool-output {name} $*\"\n",
+                "#!/bin/sh\nif [ '{name}' = simctl ] && [ \"$1\" = install ]; then\n  echo mutation-start >> '{}'\n{}  sleep {}\n  echo mutation-end >> '{}'\n  echo installed\n  exit 0\nfi\n[ \"$1\" = -version ] && echo 'Xcode 16' && exit 0\n[ '{name}' = devicectl ] && [ \"$1\" = list ] && echo '{{\"result\":{{\"devices\":[]}}}}' && exit 0\n[ '{name}' = simctl ] && [ \"$1\" = list ] && echo '{{\"devices\":{{\"com.apple.CoreSimulator.SimRuntime.iOS-17-0\":[{{\"udid\":\"sim-1\",\"name\":\"iPhone\",\"state\":\"Booted\",\"isAvailable\":true}}]}}}}' && exit 0\necho \"tool-output {name} $*\"\n",
                 marker.display(),
+                gate_command,
                 mutation_delay.as_secs_f64(),
                 marker.display()
             ),
@@ -991,30 +1417,69 @@ fn fake_tool(root: &Path, name: &str, marker: &Path, mutation_delay: Duration) -
 }
 
 fn cli<T: serde::Serialize>(address: &str, identity: &Path, command: &str, body: &T) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
-        .args([
-            "--registry",
-            address,
-            "--identity",
-            identity.to_str().unwrap(),
-            command,
-            "--json-request",
-            &serde_json::to_string(body).unwrap(),
-        ])
+    cli_with_concurrent_drain(address, identity, command, body)
+}
+
+fn cli_with_concurrent_drain<T: serde::Serialize>(
+    address: &str,
+    identity: &Path,
+    command: &str,
+    body: &T,
+) -> Output {
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_mesh-cli"));
+    cli.args([
+        "--registry",
+        address,
+        "--identity",
+        identity.to_str().unwrap(),
+        command,
+        "--json-request",
+        &serde_json::to_string(body).unwrap(),
+    ]);
+    bounded_cli_output(cli, &format!("mesh-cli {command}"))
+}
+
+fn bounded_cli_output(mut command: Command, label: &str) -> Output {
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stdout).read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stderr).read_to_end(&mut bytes).unwrap();
+        bytes
+    });
     let deadline = Instant::now() + Duration::from_secs(5);
-    while child.try_wait().unwrap().is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if Instant::now() >= deadline {
             child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("mesh-cli timed out");
+            let status = child.wait().unwrap();
+            let stdout = stdout_reader.join().unwrap();
+            let stderr = stderr_reader.join().unwrap();
+            panic!(
+                "concurrently drained {label} timed out after five seconds; status={status}; stdout_bytes={}; stderr={}",
+                stdout.len(),
+                String::from_utf8_lossy(&stderr)
+            );
         }
         thread::sleep(Duration::from_millis(10));
+    };
+    Output {
+        status,
+        stdout: stdout_reader.join().unwrap(),
+        stderr: stderr_reader.join().unwrap(),
     }
-    child.wait_with_output().unwrap()
 }
 
 fn cli_json<T: serde::Serialize>(
@@ -1050,8 +1515,9 @@ fn rpc(address: &str, identity: &Path, request: &Request) -> serde_json::Value {
 }
 
 fn wait_for_host(address: &str, identity: &Path) {
-    wait_until("host", || {
-        Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
             .args([
                 "--registry",
                 address,
@@ -1061,10 +1527,27 @@ fn wait_for_host(address: &str, identity: &Path) {
                 "--json",
             ])
             .output()
-            .is_ok_and(|output| {
-                output.status.success() && String::from_utf8_lossy(&output.stdout).contains("mac-1")
+            .unwrap();
+        let snapshot = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
+        if output.status.success()
+            && snapshot.as_ref().is_some_and(|hosts| {
+                hosts.as_array().is_some_and(|hosts| {
+                    hosts
+                        .iter()
+                        .any(|host| host["id"] == "mac-1" && host["status"] == "online")
+                })
             })
-    });
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "registry never exposed online mac-1; status={}; stderr={}; snapshot={snapshot:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_for_listener(address: &str) {
@@ -1080,6 +1563,16 @@ fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
 }
 
 fn pair(registry: &Path, registry_id: &str, peer: &Path, peer_id: &str) {
+    #[cfg(windows)]
+    {
+        if !registry.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(registry)
+                .unwrap();
+        }
+        if !peer.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(peer).unwrap();
+        }
+    }
     let mut left = SecureTransport::load_or_create(registry, registry_id).unwrap();
     let mut right = SecureTransport::load_or_create(peer, peer_id).unwrap();
     let code = left.issue_pairing_code(Duration::from_secs(10));

@@ -11,7 +11,7 @@ use std::{
     collections::HashSet,
     fs,
     io::{BufRead, BufReader, Write},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
     path::{Component, Path},
     process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -61,8 +61,10 @@ fn main() {
         return;
     }
     if a.first().map(String::as_str) == Some("pair") {
-        let mut identity = SecureTransport::load_or_create(value(&a, "--identity"), "cli").unwrap();
-        let mut reader = BufReader::new(connect(&value(&a, "--address")));
+        let peer_id = optional_value(&a, "--peer-id").unwrap_or_else(|| "cli".into());
+        let mut identity =
+            SecureTransport::load_or_create(value(&a, "--identity"), peer_id).unwrap();
+        let mut reader = BufReader::new(connect_or_exit(&value(&a, "--address")));
         let mut challenge = String::new();
         reader.read_line(&mut challenge).unwrap();
         let challenge: serde_json::Value = serde_json::from_str(&challenge).unwrap();
@@ -75,7 +77,8 @@ fn main() {
         identity.trust("registry", &certificate).unwrap();
         return;
     }
-    let transport = SecureTransport::load_or_create(value(&a, "--identity"), "cli").unwrap();
+    let peer_id = optional_value(&a, "--peer-id").unwrap_or_else(|| "cli".into());
+    let transport = SecureTransport::load_or_create(value(&a, "--identity"), peer_id).unwrap();
     let address = value(&a, "--registry");
     if a.iter().any(|item| item == "hardware-gate") {
         run_hardware_gate(&a, &address, &transport);
@@ -84,15 +87,21 @@ fn main() {
     if a.iter().any(|item| item == "artifact-download") {
         let body: serde_json::Value = serde_json::from_str(&value(&a, "--json-request")).unwrap();
         let artifact_id = body["artifact_id"].as_str().unwrap();
-        let metadata = registry_rpc(
+        let response = registry_rpc(
             &address,
             &transport,
             Request::ArtifactInfo {
                 artifact_id: artifact_id.into(),
             },
-        )
-        .artifact_metadata
-        .unwrap();
+        );
+        let metadata = response.artifact_metadata.unwrap_or_else(|| {
+            exit_with_error(
+                response
+                    .error
+                    .as_deref()
+                    .unwrap_or("artifact_metadata_unavailable"),
+            )
+        });
         let mut bytes = Vec::new();
         while bytes.len() < metadata.total_size as usize {
             let response = registry_rpc(
@@ -106,16 +115,29 @@ fn main() {
                     sha256: metadata.sha256.clone(),
                 },
             );
-            bytes.extend(response.artifact_chunk.unwrap().bytes);
+            let chunk = response.artifact_chunk.unwrap_or_else(|| {
+                exit_with_error(
+                    response
+                        .error
+                        .as_deref()
+                        .unwrap_or("artifact_chunk_unavailable"),
+                )
+            });
+            if chunk.offset != bytes.len() as u64 || chunk.bytes.is_empty() {
+                exit_with_error("artifact_chunk_invalid");
+            }
+            bytes.extend(chunk.bytes);
         }
-        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), metadata.sha256);
+        if format!("{:x}", Sha256::digest(&bytes)) != metadata.sha256 {
+            exit_with_error("artifact_hash_mismatch");
+        }
         println!(
             "{}",
             serde_json::json!({"bytes": bytes, "sha256": metadata.sha256})
         );
         return;
     }
-    let stream = connect(&address);
+    let stream = connect_or_exit(&address);
     stream
         // A legacy Run RPC may wait up to fifteen seconds for a busy agent.
         // Keep the client deadline beyond the server deadline so
@@ -188,12 +210,19 @@ fn main() {
 }
 
 fn registry_rpc(address: &str, transport: &SecureTransport, request: Request) -> Response {
-    let mut stream = transport.connect_tls(connect(address), "registry").unwrap();
+    let mut stream = transport
+        .connect_tls(connect_or_exit(address), "registry")
+        .unwrap();
     serde_json::to_writer(&mut stream, &request).unwrap();
     stream.write_all(b"\n").unwrap();
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).unwrap();
     serde_json::from_str(&line).unwrap()
+}
+
+fn exit_with_error(code: &str) -> ! {
+    eprintln!("{}", serde_json::json!({"error": code}));
+    std::process::exit(1)
 }
 
 fn run_hardware_gate(args: &[String], address: &str, transport: &SecureTransport) {
@@ -629,14 +658,48 @@ fn trusted_openssl() -> Result<std::path::PathBuf, String> {
     }
     Err("trusted system OpenSSL is unavailable".into())
 }
-fn connect(address: &str) -> TcpStream {
-    for _ in 0..100 {
-        if let Ok(stream) = TcpStream::connect(address) {
-            return stream;
+fn connect_or_exit(address: &str) -> TcpStream {
+    connect(address).unwrap_or_else(|code| exit_with_error(code))
+}
+
+fn connect(address: &str) -> Result<TcpStream, &'static str> {
+    let addresses = address
+        .to_socket_addrs()
+        .map_err(|_| "connection_invalid_address")?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err("connection_invalid_address");
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut last_code = "connection_failed";
+    loop {
+        for address in &addresses {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(last_code);
+            }
+            match TcpStream::connect_timeout(address, remaining.min(Duration::from_millis(100))) {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last_code = connection_error_code(error.kind()),
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(last_code);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    TcpStream::connect(address).unwrap()
+}
+
+fn connection_error_code(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut => {
+            "connection_unavailable"
+        }
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::InvalidInput => {
+            "connection_invalid_address"
+        }
+        _ => "connection_failed",
+    }
 }
 fn value(a: &[String], n: &str) -> String {
     a.iter()

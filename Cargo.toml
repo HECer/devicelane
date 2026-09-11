@@ -1,6 +1,13 @@
 [workspace]
-members = ["."]
+members = [".", "desktop/src-tauri"]
 resolver = "2"
+
+# The locked Tauri release still emits embedded assets through HashMap iteration.
+# Pin the upstream deterministic codegen and config-serialization fixes until
+# they are available on crates.io.
+[patch.crates-io]
+tauri-codegen = { git = "https://github.com/tauri-apps/tauri", rev = "29c87c3" }
+tauri-utils = { git = "https://github.com/tauri-apps/tauri", rev = "29c87c3" }
 
 [package]
 name = "devicelane"
@@ -22,6 +29,14 @@ exclude = [".agents/**", ".codex/**", ".yoke/**", "AGENTS.md", "RTK.md"]
 name = "device_development_mesh"
 path = "src/lib.rs"
 
+[[bin]]
+name = "devicelane-service"
+path = "src/bin/devicelane-service.rs"
+
+[[bin]]
+name = "devicelane"
+path = "src/bin/devicelane.rs"
+
 [dependencies]
 cap-std = "3"
 command-group = "5"
@@ -33,7 +48,14 @@ ring = "0.17"
 rustls = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+fs2 = "0.4"
 x509-parser = "0.17"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"

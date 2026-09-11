@@ -1,3 +1,467 @@
+pub mod local_runtime;
+
+pub mod controller_session {
+    use crate::dashboard::model::{HostId, PrincipalId};
+    use crate::dashboard::policy::AccessRequest;
+    use crate::secure_transport::{SecureTransport, TransportError};
+    use rand::{RngCore, rngs::OsRng};
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ControllerSessionPayload {
+        pub controller_endpoint: String,
+        pub controller_peer_id: String,
+        pub principal_id: String,
+        pub source_host_id: String,
+        pub session_id: String,
+        pub challenge: String,
+        pub issued_at_ms: u64,
+        pub expires_at_ms: u64,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ControllerSessionAssertion {
+        pub payload: ControllerSessionPayload,
+        pub signature: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    pub struct VerifiedControllerSession {
+        pub controller_endpoint: String,
+        pub controller_peer_id: String,
+        pub principal_id: String,
+        pub source_host_id: String,
+        pub session_id: String,
+        pub expires_at_ms: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum ControllerSessionError {
+        InvalidInput,
+        PrincipalUnavailable,
+        InvalidSignature,
+        ControllerEndpointMismatch,
+        ControllerPeerMismatch,
+        ChallengeMismatch,
+        Expired,
+        ReplayDetected,
+        ReplayCacheUnavailable,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct ControllerSessionReplayCache {
+        path: PathBuf,
+        max_entries: usize,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReplayState {
+        version: u16,
+        entries: Vec<ReplayEntry>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReplayEntry {
+        key_sha256: String,
+        expires_at_ms: u64,
+    }
+
+    impl ControllerSessionReplayCache {
+        pub fn open(
+            path: impl AsRef<Path>,
+            max_entries: usize,
+        ) -> Result<Self, ControllerSessionError> {
+            let path = path.as_ref().to_owned();
+            if max_entries == 0 || max_entries > 65_536 || path.file_name().is_none() {
+                return Err(ControllerSessionError::InvalidInput);
+            }
+            let parent = path.parent().ok_or(ControllerSessionError::InvalidInput)?;
+            fs::create_dir_all(parent)
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?;
+            Ok(Self { path, max_entries })
+        }
+
+        fn consume(
+            &self,
+            session_id: &str,
+            challenge: &str,
+            expires_at_ms: u64,
+            now_ms: u64,
+        ) -> Result<(), ControllerSessionError> {
+            use fs2::FileExt;
+            let lock_path = self.path.with_extension("lock");
+            let lock = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?;
+            lock.lock_exclusive()
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?;
+            let result = self.consume_locked(session_id, challenge, expires_at_ms, now_ms);
+            let _ = FileExt::unlock(&lock);
+            result
+        }
+
+        fn consume_locked(
+            &self,
+            session_id: &str,
+            challenge: &str,
+            expires_at_ms: u64,
+            now_ms: u64,
+        ) -> Result<(), ControllerSessionError> {
+            let mut state = if self.path.exists() {
+                serde_json::from_slice::<ReplayState>(
+                    &fs::read(&self.path)
+                        .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?,
+                )
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?
+            } else {
+                ReplayState {
+                    version: 1,
+                    entries: Vec::new(),
+                }
+            };
+            if state.version != 1 {
+                return Err(ControllerSessionError::ReplayCacheUnavailable);
+            }
+            state.entries.retain(|entry| entry.expires_at_ms >= now_ms);
+            let key_sha256 = replay_key(session_id, challenge);
+            if state
+                .entries
+                .iter()
+                .any(|entry| entry.key_sha256 == key_sha256)
+            {
+                return Err(ControllerSessionError::ReplayDetected);
+            }
+            if state.entries.len() >= self.max_entries {
+                return Err(ControllerSessionError::ReplayCacheUnavailable);
+            }
+            state.entries.push(ReplayEntry {
+                key_sha256,
+                expires_at_ms,
+            });
+            let encoded = serde_json::to_vec(&state)
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?;
+            let temp = self
+                .path
+                .with_extension(format!("tmp-{}", std::process::id()));
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)
+                .map_err(|_| ControllerSessionError::ReplayCacheUnavailable)?;
+            let write_result = output.write_all(&encoded).and_then(|_| output.sync_all());
+            if write_result.is_err() {
+                let _ = fs::remove_file(&temp);
+                return Err(ControllerSessionError::ReplayCacheUnavailable);
+            }
+            drop(output);
+            if atomic_replace(&temp, &self.path).is_err() {
+                let _ = fs::remove_file(&temp);
+                return Err(ControllerSessionError::ReplayCacheUnavailable);
+            }
+            Ok(())
+        }
+    }
+
+    fn replay_key(session_id: &str, challenge: &str) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"devicelane.controller-session.replay.v1\0");
+        digest.update(session_id.as_bytes());
+        digest.update([0]);
+        digest.update(challenge.as_bytes());
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[cfg(not(windows))]
+    fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+        fs::rename(source, target)
+    }
+
+    #[cfg(windows)]
+    fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+        let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+        let moved = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        (moved != 0)
+            .then_some(())
+            .ok_or_else(std::io::Error::last_os_error)
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct MeshApprovalPayload {
+        pub access: AccessRequest,
+        pub registry_peer_id: String,
+        pub controller_peer_id: String,
+        pub os_principal_id: String,
+        pub session_id: String,
+        pub issued_at_ms: u64,
+        pub expires_at_ms: u64,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct MeshApprovalAssertion {
+        pub payload: MeshApprovalPayload,
+        pub signature: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct MeshAccessClaim {
+        pub access: AccessRequest,
+        pub controller_peer_id: String,
+        pub os_principal_id: String,
+    }
+
+    pub fn sign_mesh_access_claim(
+        controller: &SecureTransport,
+        mut access: AccessRequest,
+    ) -> Result<(MeshAccessClaim, Vec<u8>), ControllerSessionError> {
+        let controller_peer_id = controller
+            .identity_id()
+            .map_err(|_| ControllerSessionError::InvalidInput)?;
+        let os_principal_id = current_os_principal()?;
+        access.principal_id = PrincipalId::parse(os_principal_id.clone())
+            .map_err(|_| ControllerSessionError::InvalidInput)?;
+        access.source_host_id = HostId::parse(controller_peer_id.clone())
+            .map_err(|_| ControllerSessionError::InvalidInput)?;
+        let claim = MeshAccessClaim {
+            access,
+            controller_peer_id,
+            os_principal_id,
+        };
+        let signature = controller
+            .sign(&serde_json::to_vec(&claim).map_err(|_| ControllerSessionError::InvalidInput)?)
+            .map_err(map_signature)?;
+        Ok((claim, signature))
+    }
+
+    pub fn issue_mesh_approval(
+        registry: &SecureTransport,
+        authenticated_controller_peer: &str,
+        claim: MeshAccessClaim,
+        client_signature: &[u8],
+        issued_at_ms: u64,
+        lifetime_ms: u64,
+    ) -> Result<MeshApprovalAssertion, ControllerSessionError> {
+        if lifetime_ms == 0 || lifetime_ms > 60_000 {
+            return Err(ControllerSessionError::InvalidInput);
+        }
+        let controller = authenticated_controller_peer.to_owned();
+        if claim.controller_peer_id != controller
+            || claim.access.source_host_id.as_str() != controller
+            || claim.access.principal_id.as_str() != claim.os_principal_id
+            || claim.os_principal_id.is_empty()
+        {
+            return Err(ControllerSessionError::InvalidInput);
+        }
+        registry
+            .verify_peer_signature(
+                authenticated_controller_peer,
+                &serde_json::to_vec(&claim).map_err(|_| ControllerSessionError::InvalidInput)?,
+                client_signature,
+            )
+            .map_err(map_signature)?;
+        let registry_peer_id = registry
+            .identity_id()
+            .map_err(|_| ControllerSessionError::InvalidInput)?;
+        let mut random = [0_u8; 32];
+        OsRng.fill_bytes(&mut random);
+        let payload = MeshApprovalPayload {
+            access: claim.access,
+            registry_peer_id,
+            controller_peer_id: controller,
+            os_principal_id: claim.os_principal_id,
+            session_id: random.iter().map(|byte| format!("{byte:02x}")).collect(),
+            issued_at_ms,
+            expires_at_ms: issued_at_ms
+                .checked_add(lifetime_ms)
+                .ok_or(ControllerSessionError::InvalidInput)?,
+        };
+        let signature = registry
+            .sign(&serde_json::to_vec(&payload).map_err(|_| ControllerSessionError::InvalidInput)?)
+            .map_err(map_signature)?;
+        Ok(MeshApprovalAssertion { payload, signature })
+    }
+
+    pub fn verify_mesh_approval(
+        verifier: &SecureTransport,
+        assertion: &MeshApprovalAssertion,
+        expected_registry_peer: &str,
+        expected_target_host: &HostId,
+        now_ms: u64,
+    ) -> Result<AccessRequest, ControllerSessionError> {
+        let payload = &assertion.payload;
+        if payload.registry_peer_id != expected_registry_peer {
+            return Err(ControllerSessionError::ControllerPeerMismatch);
+        }
+        if payload.access.target_host_id != *expected_target_host
+            || payload.access.principal_id.as_str() != payload.os_principal_id
+            || payload.access.source_host_id.as_str() != payload.controller_peer_id
+            || payload.os_principal_id.is_empty()
+        {
+            return Err(ControllerSessionError::InvalidInput);
+        }
+        if now_ms < payload.issued_at_ms || now_ms > payload.expires_at_ms {
+            return Err(ControllerSessionError::Expired);
+        }
+        verifier
+            .verify_peer_signature(
+                expected_registry_peer,
+                &serde_json::to_vec(payload).map_err(|_| ControllerSessionError::InvalidInput)?,
+                &assertion.signature,
+            )
+            .map_err(map_signature)?;
+        Ok(payload.access.clone())
+    }
+
+    fn canonical(payload: &ControllerSessionPayload) -> Result<Vec<u8>, ControllerSessionError> {
+        serde_json::to_vec(payload).map_err(|_| ControllerSessionError::InvalidInput)
+    }
+
+    fn map_signature(error: TransportError) -> ControllerSessionError {
+        let _ = error;
+        ControllerSessionError::InvalidSignature
+    }
+
+    #[cfg(windows)]
+    pub fn current_os_principal() -> Result<String, ControllerSessionError> {
+        crate::local_ipc::current_process_principal()
+            .map_err(|_| ControllerSessionError::PrincipalUnavailable)
+    }
+
+    #[cfg(unix)]
+    pub fn current_os_principal() -> Result<String, ControllerSessionError> {
+        Ok(format!("uid-{}", unsafe { libc::geteuid() }))
+    }
+
+    pub fn issue_controller_session(
+        controller: &SecureTransport,
+        controller_endpoint: &str,
+        challenge: &str,
+        issued_at_ms: u64,
+        lifetime_ms: u64,
+    ) -> Result<ControllerSessionAssertion, ControllerSessionError> {
+        if controller_endpoint.is_empty()
+            || challenge.len() < 16
+            || lifetime_ms == 0
+            || lifetime_ms > 5 * 60 * 1_000
+        {
+            return Err(ControllerSessionError::InvalidInput);
+        }
+        let controller_peer_id = controller
+            .identity_id()
+            .map_err(|_| ControllerSessionError::InvalidInput)?;
+        let mut random = [0_u8; 32];
+        OsRng.fill_bytes(&mut random);
+        let session_id = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let payload = ControllerSessionPayload {
+            controller_endpoint: controller_endpoint.to_owned(),
+            controller_peer_id: controller_peer_id.clone(),
+            principal_id: current_os_principal()?,
+            source_host_id: controller_peer_id,
+            session_id,
+            challenge: challenge.to_owned(),
+            issued_at_ms,
+            expires_at_ms: issued_at_ms
+                .checked_add(lifetime_ms)
+                .ok_or(ControllerSessionError::InvalidInput)?,
+        };
+        let signature = controller
+            .sign(&canonical(&payload)?)
+            .map_err(map_signature)?;
+        Ok(ControllerSessionAssertion { payload, signature })
+    }
+
+    pub fn verify_controller_session(
+        verifier: &SecureTransport,
+        assertion: &ControllerSessionAssertion,
+        expected_endpoint: &str,
+        expected_peer_id: &str,
+        expected_challenge: &str,
+        now_ms: u64,
+    ) -> Result<VerifiedControllerSession, ControllerSessionError> {
+        let payload = &assertion.payload;
+        if payload.controller_endpoint != expected_endpoint {
+            return Err(ControllerSessionError::ControllerEndpointMismatch);
+        }
+        if payload.controller_peer_id != expected_peer_id
+            || payload.source_host_id != expected_peer_id
+        {
+            return Err(ControllerSessionError::ControllerPeerMismatch);
+        }
+        if payload.challenge != expected_challenge {
+            return Err(ControllerSessionError::ChallengeMismatch);
+        }
+        if now_ms < payload.issued_at_ms || now_ms > payload.expires_at_ms {
+            return Err(ControllerSessionError::Expired);
+        }
+        verifier
+            .verify_peer_signature(expected_peer_id, &canonical(payload)?, &assertion.signature)
+            .map_err(map_signature)?;
+        Ok(VerifiedControllerSession {
+            controller_endpoint: payload.controller_endpoint.clone(),
+            controller_peer_id: payload.controller_peer_id.clone(),
+            principal_id: payload.principal_id.clone(),
+            source_host_id: payload.source_host_id.clone(),
+            session_id: payload.session_id.clone(),
+            expires_at_ms: payload.expires_at_ms,
+        })
+    }
+
+    pub fn verify_and_consume_controller_session(
+        verifier: &SecureTransport,
+        cache: &ControllerSessionReplayCache,
+        assertion: &ControllerSessionAssertion,
+        expected_endpoint: &str,
+        expected_peer_id: &str,
+        expected_challenge: &str,
+        now_ms: u64,
+    ) -> Result<VerifiedControllerSession, ControllerSessionError> {
+        let verified = verify_controller_session(
+            verifier,
+            assertion,
+            expected_endpoint,
+            expected_peer_id,
+            expected_challenge,
+            now_ms,
+        )?;
+        cache.consume(
+            &verified.session_id,
+            expected_challenge,
+            verified.expires_at_ms,
+            now_ms,
+        )?;
+        Ok(verified)
+    }
+}
+
 pub mod protocol {
     use prost::{Enumeration, Message};
 
@@ -451,6 +915,7 @@ pub mod process_execution {
                     Ok(length) => {
                         let _ = sender.send(Some((kind.clone(), buffer[..length].to_vec())));
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
@@ -470,6 +935,45 @@ pub mod process_execution {
                 Ok(())
             }
             Err(_) => Err(ProcessError::Io),
+        }
+    }
+
+    #[cfg(test)]
+    mod stream_read_tests {
+        use super::*;
+
+        struct InterruptedOutput(u8);
+        impl Read for InterruptedOutput {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let step = self.0;
+                self.0 += 1;
+                let bytes: &[u8] = match step {
+                    0 | 2 => return Err(std::io::ErrorKind::Interrupted.into()),
+                    1 => b"runtime_",
+                    3 => b"missing\n",
+                    _ => return Ok(0),
+                };
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+
+        #[test]
+        fn interrupted_reads_preserve_output_until_actual_eof() {
+            for kind in [EventKind::Stdout, EventKind::Stderr] {
+                let (sender, receiver) = mpsc::channel();
+                let reader = read_stream(InterruptedOutput(0), kind.clone(), sender);
+                reader.join().unwrap();
+                let events = receiver.into_iter().collect::<Vec<_>>();
+                assert_eq!(
+                    events,
+                    vec![
+                        Some((kind.clone(), b"runtime_".to_vec())),
+                        Some((kind, b"missing\n".to_vec())),
+                        None,
+                    ]
+                );
+            }
         }
     }
 }
@@ -617,6 +1121,7 @@ pub mod identity {
 }
 
 pub mod secure_transport {
+    pub mod pairing_tls;
     use rand::{RngCore, rngs::OsRng};
     use ring::{rand::SystemRandom, signature};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
@@ -695,20 +1200,33 @@ pub mod secure_transport {
             secure_directory(&root.join("trust"))?;
             let certificate_path = root.join("certificate.der");
             let key_path = root.join("private-key.der");
-            let (certificate, private_key) = if certificate_path.exists() && key_path.exists() {
-                (
-                    fs::read(&certificate_path).map_err(|_| TransportError::Io)?,
-                    fs::read(&key_path).map_err(|_| TransportError::Io)?,
-                )
-            } else {
-                let generated = rcgen::generate_simple_self_signed(vec![id.clone()])
-                    .map_err(|_| TransportError::InvalidCertificate)?;
-                let certificate = generated.cert.der().to_vec();
-                let private_key = generated.key_pair.serialize_der();
-                write_secret(&certificate_path, &certificate)?;
-                write_secret(&key_path, &private_key)?;
-                (certificate, private_key)
+            let (certificate, private_key) = match (
+                read_identity_file(&certificate_path)?,
+                read_identity_file(&key_path)?,
+            ) {
+                (Some(certificate), Some(private_key)) => (certificate, private_key),
+                (None, None) => {
+                    let generated = rcgen::generate_simple_self_signed(vec![id.clone()])
+                        .map_err(|_| TransportError::InvalidCertificate)?;
+                    let certificate = generated.cert.der().to_vec();
+                    let private_key = generated.key_pair.serialize_der();
+                    create_identity_file(&certificate_path, &certificate)?;
+                    create_identity_file(&key_path, &private_key)?;
+                    (certificate, private_key)
+                }
+                _ => return Err(TransportError::InvalidCertificate),
             };
+            // Both files may exist after an interrupted write or a competing
+            // creator. Parse them and require a proven certificate/key match
+            // before exposing this identity, without modifying either file.
+            let provider = ServerConfig::builder().crypto_provider().clone();
+            rustls::sign::CertifiedKey::from_der(
+                vec![CertificateDer::from(certificate.clone())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key.clone())),
+                &provider,
+            )
+            .and_then(|identity| identity.keys_match())
+            .map_err(|_| TransportError::InvalidCertificate)?;
             let mut trusted = HashMap::new();
             for entry in fs::read_dir(root.join("trust")).map_err(|_| TransportError::Io)? {
                 let entry = entry.map_err(|_| TransportError::Io)?;
@@ -772,10 +1290,34 @@ pub mod secure_transport {
             signature_bytes: &[u8],
         ) -> Result<(), TransportError> {
             use x509_parser::prelude::FromDer;
+            if self.revoked.contains(peer_id) {
+                self.reject("revoked_peer");
+                return Err(TransportError::RevokedPeer);
+            }
             let certificate = self
                 .trusted
                 .get(peer_id)
                 .ok_or(TransportError::UntrustedPeer)?;
+            let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate)
+                .map_err(|_| TransportError::InvalidCertificate)?;
+            signature::UnparsedPublicKey::new(
+                &signature::ECDSA_P256_SHA256_ASN1,
+                parsed.public_key().subject_public_key.data.as_ref(),
+            )
+            .verify(message, signature_bytes)
+            .map_err(|_| TransportError::InvalidCertificate)
+        }
+
+        pub fn verify_certificate_signature(
+            signer_id: &str,
+            certificate: &[u8],
+            message: &[u8],
+            signature_bytes: &[u8],
+        ) -> Result<(), TransportError> {
+            use x509_parser::prelude::FromDer;
+            if certificate_dns_name(certificate)? != signer_id {
+                return Err(TransportError::InvalidCertificate);
+            }
             let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate)
                 .map_err(|_| TransportError::InvalidCertificate)?;
             signature::UnparsedPublicKey::new(
@@ -899,8 +1441,7 @@ pub mod secure_transport {
                 .with_root_certificates(self.roots()?)
                 .with_client_auth_cert(self.cert_chain(), self.key()?)
                 .map_err(|_| TransportError::InvalidCertificate)?;
-            let name = ServerName::try_from(server_name.to_owned())
-                .map_err(|_| TransportError::InvalidCertificate)?;
+            let name = peer_server_name(server_name)?;
             let mut connection =
                 ClientConnection::new(Arc::new(config), name).map_err(|_| TransportError::Tls)?;
             connection.complete_io(&mut stream).map_err(|_| {
@@ -997,6 +1538,69 @@ pub mod secure_transport {
             .ok_or(TransportError::InvalidCertificate)
     }
 
+    fn read_identity_file(path: &Path) -> Result<Option<Vec<u8>>, TransportError> {
+        use std::io::Read;
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(TransportError::Io),
+        };
+        if !identity_file_is_regular(&metadata) {
+            return Err(TransportError::Io);
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = options.open(path).map_err(|_| TransportError::Io)?;
+        if !identity_file_is_regular(&file.metadata().map_err(|_| TransportError::Io)?) {
+            return Err(TransportError::Io);
+        }
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .map_err(|_| TransportError::Io)?;
+        Ok(Some(contents))
+    }
+
+    fn identity_file_is_regular(metadata: &fs::Metadata) -> bool {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return false;
+            }
+        }
+        metadata.file_type().is_file()
+    }
+
+    // Initial identity writes must never replace a credential, including when a
+    // competing creator wins after the absence check. Partial writes stay put
+    // so the next load fails closed instead of silently rotating the identity.
+    fn create_identity_file(path: &Path, contents: &[u8]) -> Result<(), TransportError> {
+        use std::io::Write;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path).map_err(|_| TransportError::Io)?;
+        #[cfg(windows)]
+        restrict_windows_path(path)?;
+        file.write_all(contents).map_err(|_| TransportError::Io)
+    }
+
     fn write_secret(path: &Path, contents: &[u8]) -> Result<(), TransportError> {
         #[cfg(unix)]
         {
@@ -1064,6 +1668,17 @@ pub mod secure_transport {
         }
     }
 
+    /// Peer certificates identify machines with DNS SANs, not IP SANs.
+    pub fn peer_server_name(id: &str) -> Result<ServerName<'static>, TransportError> {
+        if !valid_machine_id(id) {
+            return Err(TransportError::InvalidCertificate);
+        }
+        match ServerName::try_from(id.to_owned()) {
+            Ok(name @ ServerName::DnsName(_)) => Ok(name),
+            _ => Err(TransportError::InvalidCertificate),
+        }
+    }
+
     fn valid_machine_id(id: &str) -> bool {
         !id.is_empty()
             && id
@@ -1074,6 +1689,45 @@ pub mod secure_transport {
     impl From<io::Error> for TransportError {
         fn from(_: io::Error) -> Self {
             Self::Io
+        }
+    }
+
+    #[cfg(test)]
+    mod identity_creation_tests {
+        use super::*;
+
+        #[test]
+        fn credential_creation_collision_preserves_existing_bytes() {
+            let directory = tempfile::tempdir().unwrap();
+            for name in ["certificate.der", "private-key.der"] {
+                let path = directory.path().join(name);
+                assert!(!path.exists());
+                // A competing creator wins after the caller checked absence.
+                fs::write(&path, b"original credential").unwrap();
+                let result = create_identity_file(&path, b"replacement credential");
+                assert_eq!(result, Err(TransportError::Io));
+                assert_eq!(fs::read(&path).unwrap(), b"original credential");
+            }
+        }
+
+        #[test]
+        fn failed_second_credential_write_does_not_regenerate_first_on_reload() {
+            let directory = tempfile::tempdir().unwrap();
+            let certificate_path = directory.path().join("certificate.der");
+            let key_path = directory.path().join("private-key.der");
+            let generated = rcgen::generate_simple_self_signed(vec!["host".to_owned()]).unwrap();
+            let certificate = generated.cert.der().to_vec();
+            create_identity_file(&certificate_path, &certificate).unwrap();
+            // A nonregular path appearing between the two writes forces failure.
+            fs::create_dir(&key_path).unwrap();
+            assert_eq!(
+                create_identity_file(&key_path, &generated.key_pair.serialize_der()),
+                Err(TransportError::Io)
+            );
+            fs::remove_dir(&key_path).unwrap();
+            assert!(SecureTransport::load_or_create(directory.path(), "host").is_err());
+            assert_eq!(fs::read(&certificate_path).unwrap(), certificate);
+            assert!(!key_path.exists());
         }
     }
 }
@@ -2324,17 +2978,17 @@ pub mod apple_simulator {
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::Terminal(TerminalStatus::Exited(0))))
             {
-                let stderr = events
+                let output = events
                     .iter()
-                    .filter(|event| matches!(event.kind, EventKind::Stderr))
+                    .filter(|event| matches!(event.kind, EventKind::Stdout | EventKind::Stderr))
                     .flat_map(|event| event.payload.iter().copied())
                     .collect::<Vec<_>>();
-                let stderr = String::from_utf8_lossy(&stderr);
-                return Err(if stderr.contains("runtime_missing") {
+                let output = String::from_utf8_lossy(&output);
+                return Err(if output.contains("runtime_missing") {
                     SimulatorError::RuntimeMissing
-                } else if stderr.contains("boot_failed") {
+                } else if output.contains("boot_failed") {
                     SimulatorError::BootFailed
-                } else if stderr.contains("detach") {
+                } else if output.contains("detach") {
                     SimulatorError::Detached
                 } else {
                     SimulatorError::Busy
@@ -3164,7 +3818,7 @@ pub mod network_processes {
         }
     }
 
-    #[derive(Deserialize, Serialize)]
+    #[derive(Clone, Deserialize, Serialize)]
     #[serde(tag = "request", rename_all = "snake_case")]
     pub enum Request {
         Heartbeat {
@@ -3176,6 +3830,10 @@ pub mod network_processes {
             events: Vec<NetworkEvent>,
         },
         List,
+        AuthenticateDashboardAccess {
+            claim: crate::controller_session::MeshAccessClaim,
+            client_signature: Vec<u8>,
+        },
         Run {
             operation: RunRequest,
         },
@@ -6058,4 +6716,10 @@ mod tests {
         assert_eq!(env!("CARGO_PKG_NAME"), "devicelane");
     }
 }
+pub mod connection_config;
+pub mod dashboard;
+pub mod local_ipc;
 pub mod mac_bootstrap;
+pub mod registry_event_store;
+pub mod registry_runtime;
+pub mod state_paths;

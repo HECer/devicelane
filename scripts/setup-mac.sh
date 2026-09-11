@@ -4,6 +4,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 HOME_DIR=${HOME:-}
 MODE=install
+DAEMON_MODE=
 DRY_RUN=false
 PAIR_ADDRESS=
 CONTROLLER_HOST=127.0.0.1
@@ -19,7 +20,12 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=true ;;
         --upgrade) MODE=upgrade ;;
-        --status) MODE=status ;;
+        --install) DAEMON_MODE=install ;;
+        --repair) DAEMON_MODE=repair ;;
+        --autostart-enable) DAEMON_MODE=autostart-enable ;;
+        --autostart-disable) DAEMON_MODE=autostart-disable ;;
+        --logs) DAEMON_MODE=logs ;;
+        --status) DAEMON_MODE=status ;;
         --uninstall) MODE=uninstall ;;
         --pair-address)
             shift
@@ -34,7 +40,7 @@ while [ "$#" -gt 0 ]; do
             HOME_DIR=$1
             ;;
         *)
-            echo "usage: setup-mac.sh [--dry-run] [--upgrade|--status|--uninstall] [--controller HOST] [--pair-address HOST:PORT] [--home DIRECTORY]" >&2
+            echo "usage: setup-mac.sh [--dry-run] [--install|--repair|--status|--autostart-enable|--autostart-disable|--logs|--upgrade|--uninstall] [--controller HOST] [--pair-address HOST:PORT] [--home DIRECTORY]" >&2
             exit 2
             ;;
     esac
@@ -79,7 +85,47 @@ DIAGNOSTIC_BUNDLE="$LOG_DIR/diagnostics"
 PLIST_PATH="$HOME_DIR/Library/LaunchAgents/dev.mesh.agent.plist"
 PLIST_STAGE="$PLIST_PATH.next"
 SERVICE="gui/$(id -u)/dev.mesh.agent"
-PAIR_COMMAND="mesh-registry pair --listen 0.0.0.0:7445 --identity .mesh/registry"
+DAEMON_PROGRAM_DIR="$HOME_DIR/.local/lib/devicelane/bin"
+DAEMON_PROGRAM_PATH="$DAEMON_PROGRAM_DIR/devicelane-service"
+DAEMON_IDENTITY_DIR="$HOME_DIR/Library/Application Support/DeviceLane/identity"
+DAEMON_STATE_DIR="$HOME_DIR/Library/Application Support/DeviceLane/state"
+DAEMON_RUNTIME_DIR="$DAEMON_STATE_DIR/runtime"
+DAEMON_LOG_DIR="$HOME_DIR/Library/Logs/DeviceLane"
+DAEMON_PLIST_PATH="$HOME_DIR/Library/LaunchAgents/dev.devicelane.service.plist"
+DAEMON_SERVICE="gui/$(id -u)/dev.devicelane.service"
+# Only offer an executable handoff for validated private numeric interfaces.
+# Hostnames remain supported for registry transport; resolving them is not a bind policy.
+private_pairing_host() {
+    printf '%s\n' "$1" | awk '
+        function groups(value, parts, count, i) {
+            if (value == "") return 0
+            count = split(value, parts, ":")
+            for (i = 1; i <= count; i++)
+                if (length(parts[i]) < 1 || length(parts[i]) > 4 || parts[i] ~ /[^0-9a-f]/) return 99
+            return count
+        }
+        {
+            host = tolower($0)
+            if (host ~ /^[0-9.]+$/ && split(host, octets, ".") == 4) {
+                for (i = 1; i <= 4; i++)
+                    if (octets[i] == "" || octets[i] > 255 || (length(octets[i]) > 1 && substr(octets[i], 1, 1) == "0")) exit 1
+                exit !(octets[1] == 10 || octets[1] == 127 ||
+                    (octets[1] == 172 && octets[2] >= 16 && octets[2] <= 31) ||
+                    (octets[1] == 192 && octets[2] == 168) ||
+                    (octets[1] == 169 && octets[2] == 254))
+            }
+            if (host !~ /^f[cd][0-9a-f][0-9a-f]:/) exit 1
+            compressed = split(host, halves, "::")
+            if (compressed == 1) exit !(groups(host) == 8)
+            if (compressed == 2) exit !(groups(halves[1]) + groups(halves[2]) < 8)
+            exit 1
+        }'
+}
+if private_pairing_host "$CONTROLLER_HOST"; then
+    PAIR_COMMAND="mesh-registry pair --listen $CONTROLLER_ENDPOINT:7445 --identity .mesh/registry"
+else
+    PAIR_COMMAND="Choose a numeric private controller interface for the temporary pairing listener; rerun --dry-run --controller with that IP."
+fi
 
 redact() {
     sed -E 's/(pairing_code|private_key|signing_secret|token)([=:][^ ,}]*)/\1=[REDACTED]/g'
@@ -89,9 +135,141 @@ xml_escape() {
     sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
+rollback_mac_service() {
+    ROLLBACK_FAILED=false
+    if ! launchctl bootout "$DAEMON_SERVICE" >/dev/null 2>&1; then echo "rollback error: stop replacement" >&2; ROLLBACK_FAILED=true; fi
+    if [ "$HAD_DAEMON_PROGRAM" = true ]; then
+        if ! cp -p "$DAEMON_PROGRAM_BACKUP" "$DAEMON_PROGRAM_PATH"; then echo "rollback error: restore daemon binary" >&2; ROLLBACK_FAILED=true; fi
+    elif ! rm -f "$DAEMON_PROGRAM_PATH"; then echo "rollback error: remove replacement daemon" >&2; ROLLBACK_FAILED=true; fi
+    if [ "$HAD_DAEMON_PLIST" = true ]; then
+        if ! cp -p "$DAEMON_PLIST_BACKUP" "$DAEMON_PLIST_PATH"; then echo "rollback error: restore LaunchAgent" >&2; ROLLBACK_FAILED=true; fi
+    elif ! rm -f "$DAEMON_PLIST_PATH"; then echo "rollback error: remove replacement LaunchAgent" >&2; ROLLBACK_FAILED=true; fi
+    if [ "$WAS_DAEMON_LOADED" = true ]; then
+        if ! launchctl enable "$DAEMON_SERVICE"; then echo "rollback error: enable restored service" >&2; ROLLBACK_FAILED=true; fi
+        if ! launchctl bootstrap "gui/$(id -u)" "$DAEMON_PLIST_PATH"; then echo "rollback error: bootstrap restored service" >&2; ROLLBACK_FAILED=true; fi
+        if ! launchctl kickstart -k "$DAEMON_SERVICE"; then echo "rollback error: restart" >&2; ROLLBACK_FAILED=true; fi
+        if ! launchctl print "$DAEMON_SERVICE" >/dev/null; then echo "rollback error: health verification" >&2; ROLLBACK_FAILED=true; fi
+    fi
+    if [ "$WAS_DAEMON_DISABLED" = true ]; then
+        if ! launchctl disable "$DAEMON_SERVICE"; then echo "rollback error: restore launchd override" >&2; ROLLBACK_FAILED=true; fi
+    elif ! launchctl enable "$DAEMON_SERVICE"; then echo "rollback error: restore launchd override" >&2; ROLLBACK_FAILED=true; fi
+    [ "$ROLLBACK_FAILED" = false ]
+}
+
+activate_mac_service() {
+    HAD_DAEMON_PROGRAM=false; HAD_DAEMON_PLIST=false; WAS_DAEMON_LOADED=false; WAS_DAEMON_DISABLED=false
+    if [ -e "$DAEMON_PROGRAM_BACKUP" ] || [ -e "$DAEMON_PLIST_BACKUP" ]; then
+        echo "refusing to overwrite existing DeviceLane recovery artifacts" >&2
+        return 1
+    fi
+    [ -f "$DAEMON_PROGRAM_PATH" ] && { cp -p "$DAEMON_PROGRAM_PATH" "$DAEMON_PROGRAM_BACKUP"; HAD_DAEMON_PROGRAM=true; }
+    [ -f "$DAEMON_PLIST_PATH" ] && { cp -p "$DAEMON_PLIST_PATH" "$DAEMON_PLIST_BACKUP"; HAD_DAEMON_PLIST=true; }
+    launchctl print "$DAEMON_SERVICE" >/dev/null 2>&1 && WAS_DAEMON_LOADED=true || true
+    launchctl print-disabled "gui/$(id -u)" 2>/dev/null | grep -q '"dev.devicelane.service" => true' && WAS_DAEMON_DISABLED=true || true
+    if ! (
+        { [ "$WAS_DAEMON_LOADED" = false ] || launchctl bootout "$DAEMON_SERVICE"; } &&
+        mv -f "$DAEMON_PROGRAM_STAGE" "$DAEMON_PROGRAM_PATH" &&
+        mv -f "$DAEMON_PLIST_STAGE" "$DAEMON_PLIST_PATH" &&
+        launchctl enable "$DAEMON_SERVICE" &&
+        launchctl bootstrap "gui/$(id -u)" "$DAEMON_PLIST_PATH" &&
+        launchctl kickstart -k "$DAEMON_SERVICE" &&
+        launchctl print "$DAEMON_SERVICE" >/dev/null &&
+        { if [ "$HAD_DAEMON_PLIST" = true ] && [ "$WAS_DAEMON_DISABLED" = true ]; then launchctl disable "$DAEMON_SERVICE"; else launchctl enable "$DAEMON_SERVICE"; fi; }
+    ); then
+        if rollback_mac_service; then
+            rm -f "$DAEMON_PROGRAM_BACKUP" "$DAEMON_PLIST_BACKUP"
+        else
+            echo "DeviceLane rollback could not restore a healthy service; backups were retained" >&2
+        fi
+        rm -f "$DAEMON_PROGRAM_STAGE" "$DAEMON_PLIST_STAGE"
+        return 1
+    fi
+    if ! rm -f "$DAEMON_PROGRAM_BACKUP" "$DAEMON_PLIST_BACKUP"; then
+        echo "cleanup error: recovery artifacts were retained" >&2
+        return 1
+    fi
+}
+
+mac_service_status() {
+    if [ ! -f "$DAEMON_PLIST_PATH" ]; then
+        printf 'Installed=false\nRunning=false\nAutostart=unavailable\nLogs=%s\n' "$DAEMON_LOG_DIR"
+        return 1
+    fi
+    launchctl print "$DAEMON_SERVICE" >/dev/null 2>&1 && RUNNING=true || RUNNING=false
+    if launchctl print-disabled "gui/$(id -u)" | grep -q '"dev.devicelane.service" => true'; then AUTOSTART=disabled; else AUTOSTART=enabled; fi
+    printf 'Installed=true\nRunning=%s\nAutostart=%s\nLogs=%s\n' "$RUNNING" "$AUTOSTART" "$DAEMON_LOG_DIR"
+}
+
+mac_enable_autostart() {
+    [ -f "$DAEMON_PLIST_PATH" ] || { echo "DeviceLane service is not installed" >&2; return 1; }
+    launchctl enable "$DAEMON_SERVICE"
+    if launchctl print "$DAEMON_SERVICE" >/dev/null 2>&1; then
+        : "already loaded"
+    else
+        launchctl bootstrap "gui/$(id -u)" "$DAEMON_PLIST_PATH"
+    fi
+    launchctl kickstart -k "$DAEMON_SERVICE"
+    launchctl print "$DAEMON_SERVICE" >/dev/null
+}
+
+if [ "${DEVICELANE_LIFECYCLE_SOURCE_ONLY:-0}" = 1 ]; then return 0; fi
+
 if [ "$DRY_RUN" = true ]; then
     printf 'NEXT_CONTROLLER_COMMAND=%s\n' "$PAIR_COMMAND"
     printf 'DIAGNOSTIC_BUNDLE=%s\n' "$DIAGNOSTIC_BUNDLE"
+    exit
+fi
+
+if [ -n "$DAEMON_MODE" ]; then
+    case "$DAEMON_MODE" in
+        status)
+            mac_service_status; exit ;;
+        autostart-enable)
+            mac_enable_autostart; exit ;;
+        autostart-disable) launchctl bootout "$DAEMON_SERVICE" >/dev/null 2>&1 || true; launchctl disable "$DAEMON_SERVICE"; exit ;;
+        logs) printf '%s\n' "$DAEMON_LOG_DIR"; exit ;;
+    esac
+    mkdir -p "$DAEMON_PROGRAM_DIR" "$DAEMON_IDENTITY_DIR" "$DAEMON_STATE_DIR" "$DAEMON_RUNTIME_DIR" "$DAEMON_LOG_DIR" "$(dirname "$DAEMON_PLIST_PATH")"
+    chmod 700 "$DAEMON_PROGRAM_DIR" "$DAEMON_IDENTITY_DIR" "$DAEMON_STATE_DIR" "$DAEMON_RUNTIME_DIR" "$DAEMON_LOG_DIR"
+    if [ -n "${DEVICELANE_SERVICE_BINARY:-}" ]; then
+        [ "${DEVICELANE_SERVICE_BINARY#/}" != "$DEVICELANE_SERVICE_BINARY" ] || { echo "bundled service path must be absolute" >&2; exit 1; }
+        [ -f "$DEVICELANE_SERVICE_BINARY" ] && [ ! -L "$DEVICELANE_SERVICE_BINARY" ] || { echo "bundled service is unavailable" >&2; exit 1; }
+        DAEMON_BUILD_PATH=$DEVICELANE_SERVICE_BINARY
+    else
+        cd "$ROOT"
+        cargo build --release --bin devicelane-service >/dev/null
+        DAEMON_BUILD_PATH=target/release/devicelane-service
+    fi
+    DAEMON_PROGRAM_STAGE="$DAEMON_PROGRAM_PATH.next"
+    DAEMON_PROGRAM_BACKUP="$DAEMON_PROGRAM_PATH.previous"
+    DAEMON_PLIST_BACKUP="$DAEMON_PLIST_PATH.previous"
+    install -m 700 "$DAEMON_BUILD_PATH" "$DAEMON_PROGRAM_STAGE"
+    DAEMON_PLIST_STAGE="$DAEMON_PLIST_PATH.next"
+    DAEMON_PLIST_PROGRAM_PATH=$(printf '%s' "$DAEMON_PROGRAM_PATH" | xml_escape)
+    DAEMON_PLIST_IDENTITY_DIR=$(printf '%s' "$DAEMON_IDENTITY_DIR" | xml_escape)
+    DAEMON_PLIST_RUNTIME_DIR=$(printf '%s' "$DAEMON_RUNTIME_DIR" | xml_escape)
+    DAEMON_PLIST_LOG_DIR=$(printf '%s' "$DAEMON_LOG_DIR" | xml_escape)
+    trap 'rm -f "$DAEMON_PROGRAM_STAGE" "$DAEMON_PLIST_STAGE"' EXIT HUP INT TERM
+    cat >"$DAEMON_PLIST_STAGE" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>dev.devicelane.service</string>
+<key>ProgramArguments</key><array>
+<string>$DAEMON_PLIST_PROGRAM_PATH</string><string>--identity</string><string>$DAEMON_PLIST_IDENTITY_DIR</string>
+<string>--runtime-dir</string><string>$DAEMON_PLIST_RUNTIME_DIR</string><string>--log-dir</string><string>$DAEMON_PLIST_LOG_DIR</string>
+<string>--role</string><string>workstation</string><string>--foreground</string>
+</array>
+<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+<key>RunAtLoad</key><true/>
+<key>StandardOutPath</key><string>$DAEMON_PLIST_LOG_DIR/service.log</string>
+<key>StandardErrorPath</key><string>$DAEMON_PLIST_LOG_DIR/service-error.log</string>
+</dict></plist>
+EOF
+    chmod 600 "$DAEMON_PLIST_STAGE"
+    "$PLUTIL" -lint "$DAEMON_PLIST_STAGE" >/dev/null
+    activate_mac_service
+    trap - EXIT HUP INT TERM
     exit
 fi
 
@@ -101,11 +279,14 @@ if [ "$MODE" = status ]; then
 fi
 
 if [ "$MODE" = uninstall ]; then
+    launchctl bootout "$DAEMON_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$DAEMON_PLIST_PATH" "$DAEMON_PROGRAM_PATH"
     launchctl bootout "$SERVICE" >/dev/null 2>&1 || true
     rm -f "$PLIST_PATH"
     rm -f "$PROGRAM_PATH" "$CLI_PATH"
     rm -rf "$HARDWARE_GATE_DIR"
     rmdir "$PROGRAM_DIR/bin" "$PROGRAM_DIR" >/dev/null 2>&1 || true
+    echo "DeviceLane services removed. Identity and logs were preserved."
     exit
 fi
 
@@ -166,7 +347,7 @@ mkdir -p "$PROGRAM_DIR/bin" "$IDENTITY_DIR" "$AUDIT_DIR" "$WORKSPACE_DIR" "$LOG_
 chmod 700 "$PROGRAM_DIR" "$PROGRAM_DIR/bin" "$IDENTITY_DIR" "$AUDIT_DIR" "$WORKSPACE_DIR" "$LOG_DIR" "$DIAGNOSTIC_BUNDLE"
 
 cd "$ROOT"
-cargo build --workspace --release >/dev/null
+cargo build --release --locked --bin mesh-agent --bin mesh-cli >/dev/null
 install -m 700 target/release/mesh-agent "$PROGRAM_PATH"
 install -m 700 target/release/mesh-cli "$CLI_PATH"
 rm -rf "$HARDWARE_GATE_DIR.next"

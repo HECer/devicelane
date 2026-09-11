@@ -2,6 +2,100 @@ use device_development_mesh::mac_bootstrap::validate_production_launch_agent;
 use std::fs;
 use std::process::Command;
 
+fn bootstrap_dry_run(controller: &str) -> String {
+    use std::{
+        io::Read,
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let home = tempfile::tempdir().unwrap();
+    let shell = if cfg!(windows) {
+        "C:/Program Files/Git/bin/sh.exe"
+    } else {
+        "sh"
+    };
+    let home_argument = home.path().to_str().unwrap().replace('\\', "/");
+    let home_argument = if cfg!(windows) {
+        format!(
+            "/{}{}",
+            home_argument[..1].to_lowercase(),
+            &home_argument[2..]
+        )
+    } else {
+        home_argument
+    };
+    let mut child = Command::new(shell)
+        .arg(root.join("scripts/setup-mac.sh"))
+        .args(["--dry-run", "--controller", controller, "--home"])
+        .arg(home_argument)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bootstrap regression requires a POSIX shell (Git for Windows)");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bootstrap dry-run timed out");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "{stderr}");
+    assert!(home.path().read_dir().unwrap().next().is_none());
+    stdout
+}
+
+#[test]
+fn generated_pairing_command_uses_private_numeric_controller_interface() {
+    for (controller, endpoint) in [
+        ("192.168.0.61", "192.168.0.61:7445"),
+        ("fd12:3456::61", "[fd12:3456::61]:7445"),
+        ("fc00:1:2:3:4:5:6:7", "[fc00:1:2:3:4:5:6:7]:7445"),
+    ] {
+        let output = bootstrap_dry_run(controller);
+        assert!(output.contains(&format!(
+            "NEXT_CONTROLLER_COMMAND=mesh-registry pair --listen {endpoint} --identity .mesh/registry"
+        )), "{output}");
+    }
+    for controller in [
+        "controller.local",
+        "8.8.8.8",
+        "0.0.0.0",
+        "192.168.999.1",
+        "fd12:::1",
+        "fd12:1:2:3:4:5:6:7:8",
+        "fd12::1::2",
+        "192.168.001.1",
+    ] {
+        let output = bootstrap_dry_run(controller);
+        assert!(!output.contains("mesh-registry pair --listen"), "{output}");
+        assert!(
+            output.contains("numeric private controller interface"),
+            "{output}"
+        );
+    }
+}
+
 #[test]
 fn mac_bootstrap_defines_the_complete_user_launch_agent_lifecycle() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -9,7 +103,7 @@ fn mac_bootstrap_defines_the_complete_user_launch_agent_lifecycle() {
     let smoke = fs::read_to_string(root.join("scripts/mac-bootstrap-smoke")).unwrap();
 
     for required in [
-        "cargo build --workspace --release",
+        "cargo build --release --locked --bin mesh-agent --bin mesh-cli",
         "\"$CLI_PATH\" doctor",
         "\"$PROGRAM_PATH\" pair",
         "launchctl bootstrap",
@@ -26,6 +120,10 @@ fn mac_bootstrap_defines_the_complete_user_launch_agent_lifecycle() {
             "missing bootstrap step: {required}"
         );
     }
+    assert!(
+        !setup.contains("cargo build --workspace --release"),
+        "the agent bootstrap must not build the Tauri workspace before its sidecar is staged"
+    );
     assert!(smoke.contains("cargo test --test mac_bootstrap"));
     assert!(smoke.contains("setup-mac.sh --dry-run"));
 }
@@ -261,4 +359,70 @@ fn uninstall_preserves_identity_and_audit_by_default() {
     assert!(!setup.contains("rm -rf \"$PROGRAM_DIR\""));
     assert!(!setup.contains("rm -rf \"$IDENTITY_DIR\""));
     assert!(!setup.contains("rm -rf \"$AUDIT_DIR\""));
+}
+
+#[test]
+fn mac_daemon_launch_agent_has_complete_lifecycle() {
+    let setup = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-mac.sh"),
+    )
+    .unwrap();
+
+    for required in [
+        "--repair",
+        "--autostart-enable",
+        "--autostart-disable",
+        "--logs",
+        "devicelane-service",
+        "dev.devicelane.service",
+        "<key>KeepAlive</key>",
+        "<key>RunAtLoad</key>",
+    ] {
+        assert!(
+            setup.contains(required),
+            "missing macOS daemon lifecycle: {required}"
+        );
+    }
+    assert!(setup.contains("Identity and logs were preserved"));
+    assert!(setup.contains(
+        "DAEMON_PLIST_PROGRAM_PATH=$(printf '%s' \"$DAEMON_PROGRAM_PATH\" | xml_escape)"
+    ));
+    assert!(setup.contains("Installed="));
+    assert!(setup.contains("Autostart="));
+    assert!(setup.contains("Logs=%s"));
+    assert!(setup.contains("\"$DAEMON_LOG_DIR\""));
+}
+
+#[test]
+fn mac_repair_is_transactional_and_absent_status_is_explicit() {
+    let setup = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-mac.sh"),
+    )
+    .unwrap();
+    for required in [
+        "activate_mac_service",
+        "DAEMON_PROGRAM_BACKUP",
+        "DAEMON_PLIST_BACKUP",
+        "rollback_mac_service",
+        "launchctl print \"$DAEMON_SERVICE\"",
+        "already loaded",
+        "Installed=false",
+        "Autostart=unavailable",
+        "WAS_DAEMON_DISABLED",
+        "launchctl enable \"$DAEMON_SERVICE\"",
+        "launchctl disable \"$DAEMON_SERVICE\"",
+        "refusing to overwrite existing DeviceLane recovery artifacts",
+        "rollback error: restore daemon binary",
+        "rollback error: restore LaunchAgent",
+        "rollback error: restore launchd override",
+        "rollback error: health verification",
+    ] {
+        assert!(
+            setup.contains(required),
+            "missing transactional macOS repair: {required}"
+        );
+    }
+    assert!(!setup.contains(
+        "launchctl bootstrap \"gui/$(id -u)\" \"$DAEMON_PLIST_PATH\" 2>/dev/null || true"
+    ));
 }

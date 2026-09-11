@@ -1,3 +1,4 @@
+use command_group::{CommandGroup, GroupChild};
 use device_development_mesh::{
     network_processes::{LeaseRequest, ManifestUpload, RunRequest},
     remote_apple_protocol::{AppleOperation, AppleRequest, RemoteProtocolVersion},
@@ -7,10 +8,500 @@ use sha2::{Digest, Sha256};
 use std::{
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
+    process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+fn prepare_service_state_directory(path: &Path) {
+    #[cfg(windows)]
+    device_development_mesh::state_paths::prepare_private_state_directory(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn child_guard_terminates_descendants() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("descendant-pid");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--ignored", "--exact", "child_guard_parent_fixture"])
+        .env("DEVICELANE_TEST_DESCENDANT_PID", &marker);
+    let parent = spawn_command(&mut command);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "descendant did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let descendant: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    drop(parent);
+    // Query and clean up only the PID created by this fixture. Cleanup on RED
+    // prevents the deliberately exposed orphan from surviving the test.
+    let result = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &format!(
+            "if (Get-Process -Id {descendant} -ErrorAction SilentlyContinue) {{ Stop-Process -Id {descendant} -Force; exit 1 }}; exit 0"
+        )])
+        .status()
+        .unwrap();
+    assert!(result.success(), "child guard left its descendant running");
+}
+
+#[test]
+#[ignore = "subprocess fixture for child_guard_terminates_descendants"]
+#[cfg(windows)]
+fn child_guard_parent_fixture() {
+    if std::env::var_os("DEVICELANE_TEST_DESCENDANT_PID").is_none() {
+        return;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "child_guard_leaf_fixture"])
+        .spawn()
+        .unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+#[ignore = "subprocess fixture for child_guard_terminates_descendants"]
+#[cfg(windows)]
+fn child_guard_leaf_fixture() {
+    let Some(marker) = std::env::var_os("DEVICELANE_TEST_DESCENDANT_PID") else {
+        return;
+    };
+    std::fs::write(marker, std::process::id().to_string()).unwrap();
+    thread::sleep(Duration::from_secs(60));
+}
+
+#[test]
+fn dashboard_job_preserves_live_inventory_during_real_mesh_execution() {
+    use device_development_mesh::dashboard::policy::{AccessRequest, RemoteOperationGrant};
+    use device_development_mesh::dashboard::{
+        ActivityId, ActivityState, ApprovalDecision, DashboardScope, DeviceId, Freshness, HostId,
+        OperationId, PrincipalId, ResourceClass,
+    };
+    use device_development_mesh::local_ipc::{
+        LocalProtocolVersion, LocalRequest, LocalResponse, local_endpoint, send_local_request,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let address = free_address();
+    let registry_identity = root.path().join("registry");
+    let agent_identity = root.path().join("agent");
+    let other_identity = root.path().join("inventory-agent");
+    let service_identity = root.path().join("mac-1");
+    let controller_identity = root.path().join("windows-client");
+    for (path, id) in [
+        (&agent_identity, "agent"),
+        (&other_identity, "inventory-agent"),
+        (&service_identity, "mac-1"),
+        (&controller_identity, "windows-client"),
+    ] {
+        pair(&registry_identity, "registry", path, id);
+    }
+    let _registry = spawn(
+        env!("CARGO_BIN_EXE_mesh-registry"),
+        &[
+            "--listen",
+            &address,
+            "--identity",
+            registry_identity.to_str().unwrap(),
+            "--offline-after-ms",
+            "5000",
+            "--agent-peer",
+            "agent",
+            "--agent-peer",
+            "inventory-agent",
+        ],
+    );
+    let workspace = root.path().join("workspaces");
+    std::fs::create_dir_all(workspace.join("mac-1/project/build/App.app")).unwrap();
+    let marker = root.path().join("tools.log");
+    let simctl = fake_tool(root.path(), "simctl", &marker);
+    let xcodebuild = fake_tool(root.path(), "xcodebuild", &marker);
+    let release_install = root.path().join("release-install");
+    let script = std::fs::read_to_string(&simctl).unwrap();
+    #[cfg(windows)]
+    let script = script.replace("echo agent-tool-output", &format!(
+        ":wait_install\r\nif \"%1\"==\"install\" if not exist \"{}\" (\r\n ping -n 2 127.0.0.1 >nul\r\n goto wait_install\r\n)\r\necho agent-tool-output", release_install.display()));
+    #[cfg(unix)]
+    let script = script.replace("echo \"agent-tool-output", &format!(
+        "while [ \"$1\" = install ] && [ ! -f '{}' ]; do sleep 0.05; done\necho \"agent-tool-output", release_install.display()));
+    #[cfg(windows)]
+    let script = script.replace(
+        "echo agent-tool-output simctl %*\r\n",
+        &format!("echo agent-tool-output simctl %*\r\nif \"%1\"==\"install\" echo install-gate-exit>>\"{}\"\r\n", marker.display()),
+    );
+    #[cfg(unix)]
+    let script = format!(
+        "{script}\n[ \"$1\" != install ] || echo install-gate-exit >> '{}'\n",
+        marker.display()
+    );
+    std::fs::write(&simctl, script).unwrap();
+    let _agent = spawn(
+        env!("CARGO_BIN_EXE_mesh-agent"),
+        &[
+            "--registry",
+            &address,
+            "--identity",
+            agent_identity.to_str().unwrap(),
+            "--id",
+            "mac-1",
+            "--os",
+            "macos",
+            "--arch",
+            "aarch64",
+            "--workspace-root",
+            workspace.to_str().unwrap(),
+            "--simctl",
+            simctl.to_str().unwrap(),
+            "--xcodebuild",
+            xcodebuild.to_str().unwrap(),
+            "--capability",
+            "apple.simulator@1",
+            "--device",
+            "sim-1:ios:connected",
+            "--heartbeat-ms",
+            "100",
+        ],
+    );
+    let _other_agent = spawn(
+        env!("CARGO_BIN_EXE_mesh-agent"),
+        &[
+            "--registry",
+            &address,
+            "--identity",
+            other_identity.to_str().unwrap(),
+            "--peer-id",
+            "inventory-agent",
+            "--id",
+            "other-mac",
+            "--os",
+            "macos",
+            "--arch",
+            "aarch64",
+            "--heartbeat-ms",
+            "100",
+        ],
+    );
+    let runtime = root.path().join("runtime");
+    let logs = root.path().join("logs");
+    prepare_service_state_directory(&runtime);
+    prepare_service_state_directory(&logs);
+    #[cfg(windows)]
+    let listen = format!(r"\\.\pipe\devicelane-live-job-{}", std::process::id());
+    #[cfg(unix)]
+    let listen = runtime
+        .canonicalize()
+        .unwrap()
+        .join("job.sock")
+        .display()
+        .to_string();
+    let endpoint = local_endpoint(&runtime, &listen).unwrap();
+    let _service = spawn(
+        env!("CARGO_BIN_EXE_devicelane-service"),
+        &[
+            "--identity",
+            service_identity.to_str().unwrap(),
+            "--runtime-dir",
+            runtime.to_str().unwrap(),
+            "--role",
+            "workstation",
+            "--registry",
+            &address,
+            "--listen",
+            &listen,
+            "--log-dir",
+            logs.to_str().unwrap(),
+        ],
+    );
+    struct ReleaseOnDrop(PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+    let _release_on_drop = ReleaseOnDrop(release_install.clone());
+    let snapshot = || {
+        send_local_request(
+            &endpoint,
+            &LocalRequest::DashboardSnapshot {
+                version: LocalProtocolVersion::CURRENT,
+                scope: DashboardScope::Mesh,
+            },
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(LocalResponse::DashboardSnapshot(snapshot)) = snapshot() {
+            if snapshot
+                .hosts
+                .iter()
+                .any(|host| host.id.as_str() == "other-mac" && host.freshness == Freshness::Live)
+            {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "inventory observer did not become live"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let device = DeviceId::parse("sim-1").unwrap();
+    let activity = ActivityId::parse("live-inventory-install").unwrap();
+    let access = AccessRequest {
+        activity_id: activity.clone(),
+        principal_id: PrincipalId::parse("windows-agent").unwrap(),
+        source_host_id: HostId::parse("windows-client").unwrap(),
+        target_host_id: HostId::parse("mac-1").unwrap(),
+        device_id: Some(device.clone()),
+        operation: OperationId::parse("apple.install_app").unwrap(),
+        resources: vec![
+            ResourceClass::WorkspaceRead,
+            ResourceClass::DeviceLease,
+            ResourceClass::ApplicationInstall,
+        ],
+        remote_operation: Some(
+            RemoteOperationGrant::new(
+                "install-live",
+                "project",
+                Some(device),
+                AppleOperation::InstallApp {
+                    app_path: "build/App.app".into(),
+                },
+            )
+            .unwrap(),
+        ),
+        physical_device: false,
+        user_present: true,
+    };
+    use device_development_mesh::local_ipc::{
+        MeshRpcBoundary, PersistentMeshRpcBoundary, RemoteExecutionConfig,
+    };
+    let controller =
+        SecureTransport::load_or_create(&controller_identity, "windows-client").unwrap();
+    let (claim, client_signature) =
+        device_development_mesh::controller_session::sign_mesh_access_claim(&controller, access)
+            .unwrap();
+    let access = claim.access.clone();
+    let response = PersistentMeshRpcBoundary::default()
+        .call(
+            &RemoteExecutionConfig {
+                registry_address: address.clone(),
+                registry_peer_id: "registry".into(),
+                identity_path: controller_identity,
+                client_id: "windows-client".into(),
+            },
+            &device_development_mesh::network_processes::Request::AuthenticateDashboardAccess {
+                claim,
+                client_signature,
+            },
+        )
+        .unwrap();
+    assert!(
+        response.accepted,
+        "signed mesh access rejected: {:?}",
+        response.error
+    );
+    let assertion = response
+        .events
+        .iter()
+        .find(|event| event.kind == "authenticated_dashboard_access")
+        .map(|event| serde_json::from_str(&event.payload).unwrap())
+        .expect("missing signed assertion");
+    let response = send_local_request(
+        &endpoint,
+        &LocalRequest::RequestAuthenticatedApproval {
+            version: LocalProtocolVersion::CURRENT,
+            assertion,
+            lifetime_ms: 30_000,
+        },
+    )
+    .unwrap();
+    let LocalResponse::ApprovalCreated { nonce, .. } = response else {
+        panic!("approval failed: {response:?}")
+    };
+    let response = send_local_request(
+        &endpoint,
+        &LocalRequest::DecideApproval {
+            version: LocalProtocolVersion::CURRENT,
+            nonce,
+            access,
+            decision: ApprovalDecision::AllowOnce,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, LocalResponse::ApprovalDecided { .. }),
+        "{response:?}"
+    );
+    let response = send_local_request(
+        &endpoint,
+        &LocalRequest::StartRemoteExecution {
+            version: LocalProtocolVersion::CURRENT,
+            activity_id: activity.clone(),
+            workspace_path: "project".into(),
+            request_id: "install-live".into(),
+            app_path: "build/App.app".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(response, LocalResponse::ExecutionStarted { .. }),
+        "{response:?}"
+    );
+    let execution_started = Instant::now();
+    // Keep the assertion beyond the daemon's 30-second remote execution
+    // timeout. Windows CI can spend several seconds starting the synthetic
+    // command environment before the install gate is reached.
+    let deadline = execution_started + Duration::from_secs(35);
+    let mut gate_entered = None;
+    let mut released = false;
+    let mut released_at_ms = None;
+    let event_diagnostics = || {
+        send_local_request(
+            &endpoint,
+            &LocalRequest::ActivityEvents {
+                version: LocalProtocolVersion::CURRENT,
+                scope: DashboardScope::Mesh,
+                cursor: device_development_mesh::dashboard::EventCursor {
+                    epoch: 1,
+                    sequence: 0,
+                },
+                limit: 128,
+            },
+        )
+    };
+    loop {
+        let LocalResponse::DashboardSnapshot(current) = snapshot().unwrap() else {
+            panic!("snapshot missing")
+        };
+        assert_eq!(
+            current
+                .hosts
+                .iter()
+                .find(|host| host.id.as_str() == "other-mac")
+                .unwrap()
+                .freshness,
+            Freshness::Live,
+            "remote job displaced live inventory"
+        );
+        let state = current
+            .activities
+            .iter()
+            .find(|entry| entry.activity_id == activity)
+            .unwrap()
+            .state;
+        if gate_entered.is_none()
+            && std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .contains("simctl install sim-1")
+        {
+            gate_entered = Some((Instant::now(), current.revision));
+        }
+        // Each inventory observation commits three topology revisions. After
+        // tool entry, no controller/lease setup remains to advance this counter.
+        if !released
+            && gate_entered.is_some_and(|(entered, revision)| {
+                entered.elapsed() >= Duration::from_millis(2200)
+                    && current.revision.saturating_sub(revision) >= 6
+            })
+        {
+            std::fs::write(&release_install, b"release").unwrap();
+            released = true;
+            released_at_ms = Some(execution_started.elapsed().as_millis());
+        }
+        if state == ActivityState::Succeeded {
+            assert!(
+                released,
+                "installation completed before its explicit test gate release"
+            );
+            break;
+        }
+        assert!(
+            !matches!(
+                state,
+                ActivityState::Failed | ActivityState::Denied | ActivityState::Cancelled
+            ),
+            "remote job failed: {:?}; events={:?}; tools={}; diagnostics={}",
+            current.activities,
+            event_diagnostics(),
+            std::fs::read_to_string(&marker).unwrap_or_default(),
+            live_job_diagnostics(
+                &registry_identity,
+                &marker,
+                execution_started,
+                gate_entered.map(|(at, _)| at.duration_since(execution_started).as_millis()),
+                released_at_ms
+            )
+        );
+        assert!(
+            Instant::now() < deadline,
+            "remote job did not terminate: activities={:?}; events={:?}; gate={:?}; released={released}; revision={}; tools={}; diagnostics={}",
+            current.activities,
+            event_diagnostics(),
+            gate_entered,
+            current.revision,
+            std::fs::read_to_string(&marker).unwrap_or_default(),
+            live_job_diagnostics(
+                &registry_identity,
+                &marker,
+                execution_started,
+                gate_entered.map(|(at, _)| at.duration_since(execution_started).as_millis()),
+                released_at_ms
+            )
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        std::fs::read_to_string(marker)
+            .unwrap()
+            .contains("simctl install sim-1")
+    );
+}
+
+// Read only this test's synthetic registry state. Omit event payloads, artifact
+// contents, identities and logs; cap input size and output collection lengths.
+fn live_job_diagnostics(
+    registry: &Path,
+    marker: &Path,
+    started: Instant,
+    entered_at_ms: Option<u128>,
+    released_at_ms: Option<u128>,
+) -> serde_json::Value {
+    fn read_fixture_json(path: &Path) -> serde_json::Value {
+        use std::io::Read;
+        let result = std::fs::File::open(path).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(256 * 1024 + 1).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        match result {
+            Ok(bytes) if bytes.len() <= 256 * 1024 => serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({"read_error": "invalid_json"})),
+            Ok(_) => serde_json::json!({"read_error": "size_limit"}),
+            Err(error) => serde_json::json!({"read_error": format!("{:?}", error.kind())}),
+        }
+    }
+    let state = read_fixture_json(&registry.join("vertical-slice.json"));
+    let payload = &state["payload"];
+    let jobs: Vec<_> = payload["jobs"].as_object().into_iter().flatten().take(8).map(|(id, events)| {
+        let events: Vec<_> = events.as_array().into_iter().flatten().take(32).map(|event| {
+            serde_json::json!({"sequence": event["sequence"], "kind": event["kind"], "payload_bytes": event["payload"].as_str().map(str::len)})
+        }).collect();
+        serde_json::json!({"id": id, "events": events, "pending": payload["apple_pending"].get(id).is_some(), "acknowledged": payload["acknowledged"].as_array().is_some_and(|ids| ids.iter().any(|value| value == id))})
+    }).collect();
+    let index = read_fixture_json(&registry.join("artifacts/index.json"));
+    let artifacts: Vec<_> = index["payload"].as_object().into_iter().flatten().take(8).map(|(id, entry)| {
+        serde_json::json!({"id": id, "job_id": entry["metadata"]["job_id"], "name": entry["metadata"]["name"], "total_size": entry["metadata"]["total_size"], "confirmed_offset": entry["confirmed_offset"], "published": entry["published"]})
+    }).collect();
+    let markers = std::fs::read_to_string(marker).unwrap_or_default();
+    serde_json::json!({"elapsed_ms": started.elapsed().as_millis(), "gate_entered_ms": entered_at_ms, "gate_released_ms": released_at_ms, "gate_exit_seen": markers.lines().any(|line| line.trim() == "install-gate-exit"), "registry_read_error": state["read_error"], "registry_generation": state["generation"], "jobs": jobs, "artifact_index_read_error": index["read_error"], "artifact_generation": index["generation"], "artifacts": artifacts})
+}
 
 #[test]
 fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
@@ -104,6 +595,7 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         project.join("MeshApp.xcodeproj/project.pbxproj").is_file()
     });
 
+    let mut tool_output = Vec::new();
     for (index, operation) in vec![
         AppleOperation::DiscoverProject {
             container: "MeshApp.xcodeproj".into(),
@@ -150,7 +642,8 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         let request = apple_request(index, operation.clone(), lease_id.clone());
         let accepted = cli_json(&address, &first_identity, "apple-run", &request);
         let job_id = accepted["job_id"].as_str().unwrap().to_owned();
-        let terminal = wait_for_terminal(&address, &first_identity, &job_id);
+        let context = format!("{operation:?}");
+        let terminal = wait_for_terminal(&address, &first_identity, &job_id, &context, &marker);
         assert_eq!(
             terminal["kind"],
             "completed",
@@ -171,6 +664,7 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
             format!("{:x}", Sha256::digest(&bytes))
         );
         assert!(!bytes.is_empty());
+        tool_output.extend_from_slice(&bytes);
         if let Some(lease_id) = lease_id {
             let released = cli_json(
                 &address,
@@ -198,7 +692,9 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         wait_for_terminal(
             &address,
             &second_identity,
-            observed["job_id"].as_str().unwrap()
+            observed["job_id"].as_str().unwrap(),
+            "observer DiscoverProject",
+            &marker,
         )["kind"]
             == "completed"
     );
@@ -217,17 +713,24 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         ),
     );
     let durable_job = durable["job_id"].as_str().unwrap().to_owned();
-    let before = wait_for_terminal(&address, &first_identity, &durable_job);
+    let before = wait_for_terminal(
+        &address,
+        &first_identity,
+        &durable_job,
+        "durable BuildApp",
+        &marker,
+    );
     registry_process.kill().unwrap();
     registry_process.wait().unwrap();
     registry_process = start_registry(&address, &registry_identity);
     wait_for_host(&address, &first_identity);
-    let after = events(&address, &first_identity, &durable_job, 0);
+    let after = wait_for_event_snapshot(&address, &first_identity, &durable_job, &before);
     assert!(after["events"].as_array().unwrap().contains(&before));
 
     agent.kill().unwrap();
     registry_process.kill().unwrap();
     let markers = std::fs::read_to_string(marker).unwrap();
+    let trace = format!("{markers}\n{}", String::from_utf8_lossy(&tool_output));
     assert!(markers.lines().all(|line| line.contains("agent-tool")));
     for alternatives in [
         &["-project MeshApp.xcodeproj -list"][..],
@@ -244,10 +747,8 @@ fn remote_apple_vertical_slice_survives_reconnect_and_registry_restart() {
         ],
     ] {
         assert!(
-            alternatives
-                .iter()
-                .any(|expected| markers.contains(expected)),
-            "missing one of {alternatives:?}: {markers}"
+            alternatives.iter().any(|expected| trace.contains(expected)),
+            "missing one of {alternatives:?}: {trace}"
         );
     }
 }
@@ -278,7 +779,7 @@ fn start_registry(address: &str, identity: &Path) -> ChildGuard {
             "--identity",
             identity.to_str().unwrap(),
             "--offline-after-ms",
-            "500",
+            "5000",
         ],
     )
 }
@@ -347,7 +848,20 @@ fn cli_json<T: serde::Serialize>(
     command: &str,
     body: &T,
 ) -> serde_json::Value {
-    serde_json::from_slice(&cli(address, identity, command, body).stdout).unwrap()
+    let output = cli(address, identity, command, body);
+    assert!(
+        output.status.success(),
+        "mesh-cli {command} failed with {}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "mesh-cli {command} returned invalid JSON: {error}; status={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }
 
 fn cli_value(
@@ -359,34 +873,67 @@ fn cli_value(
     cli_json(address, identity, command, body)
 }
 
-fn events(address: &str, identity: &Path, job_id: &str, after: u64) -> serde_json::Value {
-    cli_value(
-        address,
-        identity,
-        "events",
-        &serde_json::json!({"job_id": job_id, "after": after}),
-    )
-}
-
-fn wait_for_terminal(address: &str, identity: &Path, job_id: &str) -> serde_json::Value {
-    let mut terminal = None;
-    wait_until("terminal event", || {
-        terminal = events(address, identity, job_id, 0)["events"]
-            .as_array()
-            .and_then(|items| {
+fn wait_for_terminal(
+    address: &str,
+    identity: &Path,
+    job_id: &str,
+    context: &str,
+    marker: &Path,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_snapshot = serde_json::Value::Null;
+    loop {
+        let output = cli(
+            address,
+            identity,
+            "events",
+            &serde_json::json!({"job_id": job_id, "after": 0}),
+        );
+        let last_status = output.status.to_string();
+        let last_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if output.status.success() {
+            last_snapshot = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "mesh-cli events returned invalid JSON for {context}/{job_id}: {error}; status={last_status}; stderr={last_stderr}"
+                )
+            });
+            let pending_without_events = last_snapshot["accepted"] == true
+                && last_snapshot["job_id"] == job_id
+                && last_snapshot.get("events").is_none();
+            assert!(
+                last_snapshot["events"].is_array() || pending_without_events,
+                "mesh-cli events returned an invalid pending state for {context}/{job_id}: snapshot={last_snapshot}; status={last_status}; stderr={last_stderr}"
+            );
+            if let Some(terminal) = last_snapshot["events"].as_array().and_then(|items| {
                 items
                     .iter()
                     .find(|event| matches!(event["kind"].as_str(), Some("completed" | "rejected")))
-                    .cloned()
-            });
-        terminal.is_some()
-    });
-    terminal.unwrap()
+            }) {
+                return terminal.clone();
+            }
+        } else {
+            let error = serde_json::from_slice::<serde_json::Value>(&output.stderr)
+                .ok()
+                .and_then(|value| value["error"].as_str().map(str::to_owned));
+            assert_eq!(
+                error.as_deref(),
+                Some("connection_unavailable"),
+                "mesh-cli events failed non-transiently for {context}/{job_id}; status={last_status}; stderr={last_stderr}"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal event absent for {context}/{job_id}; last_status={last_status}; last_stderr={last_stderr}; last_snapshot={last_snapshot}; markers={}",
+            std::fs::read_to_string(marker).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_for_host(address: &str, identity: &Path) {
-    wait_until("host", || {
-        Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_mesh-cli"))
             .args([
                 "--registry",
                 address,
@@ -396,10 +943,61 @@ fn wait_for_host(address: &str, identity: &Path) {
                 "--json",
             ])
             .output()
-            .is_ok_and(|output| {
-                output.status.success() && String::from_utf8_lossy(&output.stdout).contains("mac-1")
-            })
-    });
+            .unwrap();
+        if output.status.success()
+            && serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .ok()
+                .and_then(|hosts| hosts.as_array().cloned())
+                .is_some_and(|hosts| {
+                    hosts
+                        .iter()
+                        .any(|host| host["id"] == "mac-1" && host["status"] == "online")
+                })
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "registry never exposed mac-1 through a valid CLI response; status={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_event_snapshot(
+    address: &str,
+    identity: &Path,
+    job_id: &str,
+    expected: &serde_json::Value,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = cli(
+            address,
+            identity,
+            "events",
+            &serde_json::json!({"job_id": job_id, "after": 0}),
+        );
+        if output.status.success() {
+            if let Ok(snapshot) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if snapshot["events"]
+                    .as_array()
+                    .is_some_and(|events| events.contains(expected))
+                {
+                    return snapshot;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "registry never restored the durable event snapshot; status={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
@@ -411,6 +1009,15 @@ fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
 }
 
 fn pair(registry: &Path, registry_id: &str, peer: &Path, peer_id: &str) {
+    #[cfg(windows)]
+    {
+        if !registry.exists() {
+            prepare_service_state_directory(registry);
+        }
+        if !peer.exists() {
+            prepare_service_state_directory(peer);
+        }
+    }
     let mut left = SecureTransport::load_or_create(registry, registry_id).unwrap();
     let mut right = SecureTransport::load_or_create(peer, peer_id).unwrap();
     let code = left.issue_pairing_code(Duration::from_secs(10));
@@ -425,25 +1032,26 @@ fn free_address() -> String {
 }
 
 fn spawn(path: &str, args: &[&str]) -> ChildGuard {
-    ChildGuard(
-        Command::new(path)
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    )
+    spawn_command(Command::new(path).args(args))
 }
 
-struct ChildGuard(Child);
+fn spawn_command(command: &mut Command) -> ChildGuard {
+    command.stdout(Stdio::null()).stderr(Stdio::inherit());
+    let mut group = command.group();
+    #[cfg(windows)]
+    group.kill_on_drop(true);
+    ChildGuard(group.spawn().unwrap())
+}
+
+struct ChildGuard(GroupChild);
 impl std::ops::Deref for ChildGuard {
-    type Target = Child;
-    fn deref(&self) -> &Child {
+    type Target = GroupChild;
+    fn deref(&self) -> &GroupChild {
         &self.0
     }
 }
 impl std::ops::DerefMut for ChildGuard {
-    fn deref_mut(&mut self) -> &mut Child {
+    fn deref_mut(&mut self) -> &mut GroupChild {
         &mut self.0
     }
 }

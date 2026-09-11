@@ -50,6 +50,8 @@ function extract(archive, destination) {
 export function validateArchiveEntries(listing, platform) {
   const suffix = platform === 'win32' ? '.exe' : '';
   const allowed = new Set([
+    `devicelane${suffix}`,
+    `devicelane-service${suffix}`,
     `mesh-cli${suffix}`,
     `mesh-agent${suffix}`,
     `mesh-registry${suffix}`,
@@ -161,7 +163,7 @@ async function ensureBinary(binary, version) {
     await verifyChecksum(archive, await readFile(join(scratch, 'SHA256SUMS'), 'utf8'), asset);
     extract(archive, staged);
     const hashes = {};
-    for (const name of ['mesh-cli', 'mesh-agent', 'mesh-registry']) {
+    for (const name of ['devicelane', 'devicelane-service', 'mesh-cli', 'mesh-agent', 'mesh-registry']) {
       const executableNameForPlatform = executableName(name, process.platform);
       hashes[executableNameForPlatform] = await sha256(join(staged, executableNameForPlatform));
     }

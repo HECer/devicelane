@@ -94,9 +94,7 @@ fn separate_processes_pair_heartbeat_and_retain_offline_snapshot() {
     assert!(text.contains("capabilities: apple.build@1"));
     assert!(text.contains("devices: iphone-1 ios connected"));
 
-    let json = eventually_list(&address, &cli_identity, &["--json"]);
-    assert!(json.status.success());
-    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let json = eventually_host_status(&address, &cli_identity, "online");
     assert_eq!(json[0]["id"], "mac-1");
     assert_eq!(json[0]["status"], "online");
     assert_eq!(json[0]["capabilities"][0], "apple.build@1");
@@ -104,9 +102,7 @@ fn separate_processes_pair_heartbeat_and_retain_offline_snapshot() {
 
     agent.kill().unwrap();
     agent.wait().unwrap();
-    thread::sleep(Duration::from_millis(400));
-    let offline = eventually_list(&address, &cli_identity, &["--json"]);
-    let offline: serde_json::Value = serde_json::from_slice(&offline.stdout).unwrap();
+    let offline = eventually_host_status(&address, &cli_identity, "offline");
     assert_eq!(offline[0]["status"], "offline");
     assert_eq!(offline[0]["devices"][0]["id"], "iphone-1");
 
@@ -180,12 +176,41 @@ fn eventually_list(address: &str, identity: &str, extra: &[&str]) -> Output {
     }
 }
 
+fn eventually_host_status(address: &str, identity: &str, expected: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = eventually_list(address, identity, &["--json"]);
+        let hosts: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if hosts[0]["status"] == expected {
+            return hosts;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host did not become {expected} within five seconds; last response: {hosts}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn pair(
     left_path: impl AsRef<std::path::Path>,
     left_id: &str,
     right_path: impl AsRef<std::path::Path>,
     right_id: &str,
 ) {
+    #[cfg(windows)]
+    {
+        let left_path = left_path.as_ref();
+        let right_path = right_path.as_ref();
+        if !left_path.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(left_path)
+                .unwrap();
+        }
+        if !right_path.exists() {
+            device_development_mesh::state_paths::prepare_private_state_directory(right_path)
+                .unwrap();
+        }
+    }
     let mut left = SecureTransport::load_or_create(left_path, left_id).unwrap();
     let mut right = SecureTransport::load_or_create(right_path, right_id).unwrap();
     let code = left.issue_pairing_code(Duration::from_secs(10));

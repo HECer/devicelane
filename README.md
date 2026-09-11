@@ -85,6 +85,64 @@ This provides `devicelane` (the client), `devicelane-agent`, and
 `devicelane-registry`. Native archives and checksums are also available directly
 from [GitHub Releases](https://github.com/HECer/devicelane/releases).
 
+### Desktop installers
+
+The desktop release produces a Windows MSI, a hardened and notarized macOS DMG, and Linux
+AppImage and deb packages. Pull-request artifacts are explicitly named `unsigned-ci-*`; they are
+short-lived test outputs and must not be redistributed as production builds. A production
+candidate is emitted only by the protected manual workflow after native platform signing,
+Apple notarization inputs, SHA-256 manifests, a CycloneDX SBOM, and a signed checksum bundle are
+available.
+
+Install production packages only into the platform installer's administrator-owned location.
+DeviceLane checks the staged sidecar hash during packaging, but a hash check does not eliminate
+time-of-check/time-of-use races in a writable install directory. The signed, non-user-writable
+installation root is the security boundary. The per-user lifecycle tools preserve identity and
+logs during repair and normal uninstall; delete those directories separately only when rotating
+the device identity intentionally.
+
+The native installer contains the desktop executable, `devicelane-service`, and the equal
+`devicelane` CLI client. The lifecycle and smoke tooling resolves both command binaries below the
+verified native installation root, rejects links/reparse points, and never substitutes a raw
+`target/release` binary for an installed artifact.
+
+Release builds pin the hosted runner image (`windows-2025`, `macos-15`, or `ubuntu-24.04`), its
+exact image version, Rust 1.95.0, Node.js 22.20.0, every GitHub Action by commit, the native
+Xcode/SDK or MSVC/WiX toolchain, Linux package versions, `Cargo.lock`, and
+`desktop/package-lock.json`. Production aborts when an observed input differs from the protected
+repository-variable pins. `SOURCE_DATE_EPOCH`, UTC, non-incremental compilation, and two clean
+unsigned builds provide a reproducibility gate for unsigned payloads and configuration; their
+normalized installed-file manifests must match before CI accepts an artifact. Native container
+hashes are recorded where the format is deterministic.
+
+The normalized comparison covers file-system semantics as well as bytes: entry type, executable
+or Unix permission mode, symbolic-link target, macOS extended attributes, and relevant Windows
+file attributes and ACL SDDL. Release files retain their bundle-relative paths during collection;
+an attempted destination collision aborts the workflow.
+
+Each artifact set includes `BUILD-INPUTS.txt` with the observed versions and input hashes. The
+signed envelope is intentionally outside the unsigned payload comparison: signing services add
+external timestamp and notarization evidence, so the signed MSI/DMG container need not be
+bit-for-bit identical to its unsigned envelope. Production acceptance is not weakened: native
+signature verification, the single-DMG notarization and stapling gates, checksums, SBOMs, and
+signed checksum evidence must all succeed.
+
+Each production platform has its own protected job. Credentials are unavailable while dependencies
+and unsigned payloads are built, and are injected only into the individual import, signing, or
+notarization step that needs them. Windows signing additionally pins the certificate subject and
+thumbprint, selects that certificate explicitly, verifies the resulting Publisher, and removes the
+temporary certificate and PFX. Linux package smoke tests exercise the packaged lifecycle script in
+an isolated home/runtime with a process-backed systemd adapter and perform real `dpkg` install and
+uninstall transactions on the hosted runner.
+
+On macOS, the complete Tauri application and all build hooks finish without Apple credentials. The
+validated `.app` is then processed only by native `codesign`, `hdiutil`, `notarytool`, and `stapler`
+commands. Its temporary keychain is removed and the prior keychain search list restored before any
+smoke or SBOM step. Build jobs have no OIDC token permission; a separate protected attestation job
+receives only the already checked artifact digests and holds the minimal short-lived OIDC grant.
+Real deb transactions additionally require the hosted-CI gate and refuse to alter an already
+installed package.
+
 ### Build from source
 
 The examples use port `7443` for normal mutual-TLS traffic and temporary ports `7444`/`7445` for initial pairing. Replace `CONTROLLER_HOST` with a private DNS name or LAN/VPN address reachable from the other host.
@@ -111,17 +169,19 @@ In a second terminal, pair the local CLI:
 
 ### 2. Pair and install a Mac agent
 
-On the controller, temporarily permit inbound TCP `7445` **only from the Mac's private IP**, then run:
+On the controller, temporarily permit inbound TCP `7445` **only from the Mac's private IP**, then run the following, replacing `192.168.0.61` with the controller's numeric private LAN or VPN interface address:
 
 ```powershell
-.\target\debug\mesh-registry.exe pair --listen 0.0.0.0:7445 --identity .mesh\registry
+.\target\debug\mesh-registry.exe pair --listen 192.168.0.61:7445 --identity .mesh\registry
 ```
 
 On the Mac, from the cloned repository:
 
 ```sh
-sh ./scripts/setup-mac.sh --controller CONTROLLER_HOST
+sh ./scripts/setup-mac.sh --controller 192.168.0.61
 ```
+
+Use the same controller address on the Mac. IPv6 ULA addresses use brackets in the listener command, for example `--listen [fd12:3456::61]:7445`, and no brackets in `--controller fd12:3456::61`. Pairing rejects wildcard, hostname, and public listener addresses. The setup dry run prints a pairing command for private IPv4 and ULA addresses; other forms receive guidance to choose a numeric private interface. Hostnames remain supported for registry transport. A private bind limits exposure; the legacy pairing exchange still sends its code in-band.
 
 The setup script builds release binaries, pairs the agent, installs a per-user LaunchAgent, validates the Apple toolchain, starts the service, and prints the exact registry command required for that agent. Close firewall port `7445` immediately after pairing.
 
@@ -134,6 +194,31 @@ Run the `NEXT_CONTROLLER_COMMAND` printed by the Mac installer. It has this form
 ```
 
 Allow TCP `7443` only from trusted clients and agents on your LAN or private VPN.
+
+For a persistent per-user Windows controller, install or repair a Scheduled Task with the
+explicit agent peer ID printed by the Mac installer:
+
+```powershell
+.\scripts\setup-windows.ps1 --controller-install `
+  --agent-peer MAC_AGENT_ID `
+  --controller-listen 0.0.0.0:7443 `
+  --controller-identity "$env:LOCALAPPDATA\DeviceLane\registry\identity" `
+  --controller-log-dir "$env:LOCALAPPDATA\DeviceLane\registry\logs"
+.\scripts\setup-windows.ps1 --controller-status
+.\scripts\setup-windows.ps1 --controller-uninstall
+```
+
+Installation and repair require explicit `--agent-peer`, `--controller-listen`,
+`--controller-identity`, and `--controller-log-dir` values. The Scheduled Task launches a
+PowerShell logging wrapper whose command contains only the deployed registry path and public
+runtime arguments; private keys and pairing secrets remain in the identity directory. A repair
+builds and stages a new per-user binary before briefly stopping and replacing the running
+controller. Re-running `--controller-install` repairs the current user's task idempotently.
+Uninstall removes only that user's task and preserves the deployed binary, identity, and logs.
+
+Do not expose the registry to the public Internet. Permit inbound TCP `7443` in Windows
+Firewall only from trusted private LAN subnets or VPN peers; keep the firewall rule disabled
+until pairing is complete and remove temporary pairing-port rules immediately afterward.
 
 ### 4. Verify the mesh
 
@@ -157,6 +242,33 @@ sh ./scripts/setup-mac.sh --controller CONTROLLER_HOST --status    # inspect ser
 sh ./scripts/setup-mac.sh --controller CONTROLLER_HOST --upgrade   # rebuild and upgrade
 sh ./scripts/setup-mac.sh --controller CONTROLLER_HOST --uninstall # remove installed binaries/service
 ```
+
+The unified `devicelane` client exposes the dashboard over authenticated local IPC. Commands include
+`mesh status|watch`, `activities list|watch|cancel`, `approvals list|request|decide`,
+`policy list|put|delete`, and `audit list|export`. Every daemon request requires `--local`;
+`--json` returns stable JSON and activity watch returns NDJSON. Events are acknowledged only after
+stdout accepts and flushes them. Administrative changes use typed approval and access flags; raw
+shell commands and raw IPC JSON are not accepted.
+
+The per-user DeviceLane daemon has an independent lifecycle and keeps its identity and logs when
+uninstalled:
+
+```sh
+sh ./scripts/setup-mac.sh --install
+sh ./scripts/setup-mac.sh --status
+sh ./scripts/setup-mac.sh --autostart-disable
+sh ./scripts/setup-mac.sh --autostart-enable
+sh ./scripts/setup-mac.sh --logs
+sh ./scripts/setup-mac.sh --uninstall
+```
+
+On Linux the equivalent commands use `scripts/setup-linux.sh`. The adapter installs a hardened
+`systemd --user` unit. Where a user systemd session is unavailable, the script prints the exact
+`devicelane-service --foreground` command for a session supervisor or terminal.
+
+On Windows use `setup-windows.ps1` with `--service-install`, `--service-repair`,
+`--service-status`, `--service-autostart-enable`, `--service-autostart-disable`, `--service-logs`,
+or `--service-uninstall`. All three adapters use per-user state and log directories.
 
 Diagnostics are written below `~/Library/Logs/DeviceDevelopmentMesh/diagnostics`. Identity and trust material remain below `~/Library/Application Support/DeviceDevelopmentMesh` and must never be shared.
 
@@ -197,6 +309,75 @@ sh ./scripts/mac-bootstrap-smoke
 ```
 
 Physical-device results are deliberately separate from mock, simulator, and fixture tests. **Mocks gelten nicht als Nachweis** for either hardware gate. A hardware gate is only green after installation, launch, logs, and artifact return succeed on a real authorized device.
+
+### DeviceLane dashboard release gate
+
+The dashboard execution worker exposes typed terminal reasons instead of free-form remote errors.
+Failures preserve the approved activity ID across live events and audit records. If durable audit
+storage fails, DeviceLane terminates the visible activity with `audit_unavailable`, marks audit
+health unavailable, and rejects subsequent auditable mutations until the service has recovered the
+store. Registry event resync remains distinct from transport reconnect, and daemon restart recovery
+terminates interrupted work without inventing a replacement activity.
+
+Windows-origin approval requests use the separately paired Windows identity and the registry mTLS
+path. Invoke `devicelane approvals request --local --json` with `--mesh-registry` and
+`--mesh-identity`, and omit `--principal-id` and `--source-host-id`. DeviceLane derives the Windows
+SID with the native OS token API and the source host from the certificate identity, signs the exact
+access request, and accepts the target approval only after the registry and target verify the full
+signature chain. Free or mismatched remote principal/source values fail with
+`mesh_identity_mismatch` before an approval is created.
+
+The normal CI matrix runs the locked Rust workspace, the Tauri bridge, the React dashboard tests,
+type checking, production frontend build, and lifecycle contract/smoke checks on Windows, macOS,
+and Linux. That deterministic fixture coverage does not prove a physical Mac pass. A production
+release additionally requires a real paired Windows-to-Mac run against the target Apple Silicon
+Mac supplied as `<MAC_HOST>` at execution time; private LAN addresses do not belong in committed
+release evidence.
+
+Start the gate on the Mac before submitting the matching operation from Windows. The expected
+operation must request both `workspace_read` and `device_lease`, be approved on the Mac, survive a
+disconnect/reconnect plus an explicit cursor resynchronization, and reach a terminal state. The
+script requires Darwin arm64, an authenticated trusted controller session, and the exact binary,
+SHA-256, and version from the approved build manifest. It refuses fixture mode and writes exactly
+one generated allow-listed JSON file containing only redacted metadata. Identifiers and the controller address are SHA-256
+pseudonyms; raw logs, xcresults, screenshots, audit databases, identities, and secrets are never
+copied or archived by the mesh gate.
+
+Create a fresh challenge on the Mac (`SESSION_CHALLENGE=$(openssl rand -hex 32)`). On the paired
+Windows controller, issue a short-lived assertion with the approved binary and its existing paired
+identity; DeviceLane derives the principal from the Windows SID and the source host from the
+certificate identity, so neither value is accepted as operator input:
+
+```powershell
+devicelane controller-session issue --json `
+  --identity C:\ProgramData\DeviceLane\identity `
+  --mesh-controller "<WINDOWS_CONTROLLER_HOST>:7443" `
+  --challenge "<SESSION_CHALLENGE>" > controller-session.json
+```
+
+Copy only `controller-session.json` to the Mac over the already authorized channel, then run:
+
+```sh
+DEVICELANE_REAL_MESH_GATE=1 sh ./scripts/mac-hardware-gate.sh \
+  --mesh-controller "<WINDOWS_CONTROLLER_HOST>:7443" \
+  --controller-peer-id windows-controller \
+  --mesh-endpoint "$TMPDIR/devicelane/devicelane.sock" \
+  --mesh-identity "$HOME/Library/Application Support/DeviceLane/identity" \
+  --controller-session-assertion "$HOME/controller-session.json" \
+  --controller-session-challenge "$SESSION_CHALLENGE" \
+  --mesh-activity-id release-gate-20260902 \
+  --devicelane-binary /absolute/path/to/devicelane \
+  --devicelane-sha256 "<APPROVED_LOWERCASE_SHA256>" \
+  --devicelane-version "devicelane 0.1.0"
+```
+
+The mesh gate is green only when it observes the Windows principal/source in a target-local
+approval, live activity through the CLI stream, explicit nonzero-or-unavailable metrics,
+both a real `reconnecting` transition and `resync_required` recovery through a fresh snapshot and
+replacement epoch/cursor, a terminal result, and exact canonical audit equality. Evidence contains
+only the canonical audit digest and redacted allow-listed metadata. If the authenticated DeviceLane
+session is unavailable, report the physical gate as blocked; never replace it with TCP reachability
+or a fixture pass.
 
 For Yoke-managed work, `passes: true` is valid only when the mapped **story-spezifische Akzeptanzprüfung** also passes. The global quality gate additionally runs the complete workspace tests, Clippy with warnings denied, and the formatting check.
 
@@ -244,6 +425,7 @@ release_status: experimental
 hardware_gates:
   physical_iphone: pending
   physical_android: pending
+  windows_to_mac_dashboard: pending
 ```
 
 ## License and acknowledgements
