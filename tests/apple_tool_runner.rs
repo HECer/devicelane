@@ -101,6 +101,30 @@ fn runner_enforces_timeout_and_cancellation() {
 }
 
 #[test]
+fn runner_allows_explicit_reproducible_tool_path() {
+    let root = tempdir().unwrap();
+    let helper = env::current_exe().unwrap();
+    let runner = AppleToolRunner::new(root.path(), [(AppleTool::Xcodebuild, helper)]).unwrap();
+    let events = runner
+        .execute(
+            AppleTool::Xcodebuild,
+            vec![
+                "--exact".into(),
+                "apple_runner_path_helper".into(),
+                "--nocapture".into(),
+            ],
+            ".",
+            HashMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.payload.windows(b"/usr/bin:/bin".len()).any(|window| window == b"/usr/bin:/bin")
+    }));
+}
+
+#[test]
 fn apple_runner_helper() {
     if env::var("DEVELOPER_DIR").as_deref() == Ok("clean") && env::var("PATH").is_err() {
         println!("clean");
@@ -113,6 +137,13 @@ fn apple_runner_helper() {
 fn apple_runner_slow_helper() {
     if env::var("DEVELOPER_DIR").as_deref() == Ok("slow") {
         std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+#[test]
+fn apple_runner_path_helper() {
+    if env::var("PATH").as_deref() == Ok("/usr/bin:/bin") {
+        println!("/usr/bin:/bin");
     }
 }
 

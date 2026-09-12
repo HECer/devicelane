@@ -5,7 +5,7 @@ use device_development_mesh::{
     process_execution::{
         CancellationToken, EventKind, ProcessError, ProcessExecutor, ProcessRequest,
     },
-    remote_apple_protocol::AppleAgent,
+    remote_apple_protocol::{AppleAgent, AppleOperation},
     secure_transport::SecureTransport,
 };
 use sha2::{Digest, Sha256};
@@ -589,8 +589,8 @@ fn start_apple_job(
                         selected_tool,
                         arguments,
                         &operation.workspace_path,
-                        HashMap::new(),
-                        Duration::from_secs(60),
+                        HashMap::from([("PATH".into(), APPLE_TOOL_PATH.into())]),
+                        apple_operation_timeout(&operation.operation),
                         cancellation.clone(),
                     )
                 };
@@ -954,6 +954,17 @@ fn process_error_code(error: ProcessError) -> &'static str {
     }
 }
 
+fn apple_operation_timeout(operation: &AppleOperation) -> Duration {
+    match operation {
+        AppleOperation::BuildApp { .. } | AppleOperation::RunXcTest { .. } => {
+            Duration::from_secs(30 * 60)
+        }
+        _ => Duration::from_secs(60),
+    }
+}
+
+const APPLE_TOOL_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin";
+
 fn send_apple_progress(
     registry: &str,
     transport: &SecureTransport,
@@ -1101,6 +1112,28 @@ fn metadata(a: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apple_build_operations_use_long_running_tool_deadline() {
+        let build = device_development_mesh::remote_apple_protocol::AppleOperation::BuildApp {
+            container: "App.xcodeproj".into(),
+            scheme: "App".into(),
+            destination: "generic/platform=iOS Simulator".into(),
+        };
+        let test = device_development_mesh::remote_apple_protocol::AppleOperation::RunXcTest {
+            container: "App.xcodeproj".into(),
+            scheme: "App".into(),
+            destination: "generic/platform=iOS Simulator".into(),
+        };
+        assert_eq!(apple_operation_timeout(&build), Duration::from_secs(30 * 60));
+        assert_eq!(apple_operation_timeout(&test), Duration::from_secs(30 * 60));
+        assert_eq!(
+            apple_operation_timeout(
+                &device_development_mesh::remote_apple_protocol::AppleOperation::Diagnostics
+            ),
+            Duration::from_secs(60)
+        );
+    }
 
     #[test]
     fn artifact_upload_replays_identical_requests_after_lost_responses() {

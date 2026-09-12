@@ -4163,7 +4163,7 @@ pub mod preflight {
             let executor = ProcessExecutor::new(
                 workspace,
                 programs.values().cloned(),
-                ["DEVELOPER_DIR", "SDKROOT", "TMPDIR"],
+                ["DEVELOPER_DIR", "SDKROOT", "TMPDIR", "PATH"],
             )?;
             Ok(Self { executor, programs })
         }
