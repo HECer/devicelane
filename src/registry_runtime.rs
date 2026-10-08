@@ -31,6 +31,10 @@ struct Entry {
     heartbeat: Instant,
 }
 
+fn apple_host_is_current(entry: &Entry, now: Instant, offline: Duration) -> bool {
+    now.duration_since(entry.heartbeat) < offline
+}
+
 #[derive(Default, serde::Deserialize, serde::Serialize)]
 struct DurableState {
     requests: HashMap<String, String>,
@@ -687,7 +691,8 @@ fn handle(
                             .unwrap()
                             .values()
                             .find(|entry| {
-                                entry.host.capabilities.contains(&operation.capability)
+                                apple_host_is_current(entry, Instant::now(), offline)
+                                    && entry.host.capabilities.contains(&operation.capability)
                                     && operation.device_id.as_ref().is_none_or(|device_id| {
                                         entry.host.devices.iter().any(|device| {
                                             &device.id == device_id && device.state == "connected"
@@ -2056,5 +2061,28 @@ mod tests {
         assert!(!read_only_during_recovery(&Request::Lease {
             operation: LeaseRequest::Disconnect,
         }));
+    }
+
+    #[test]
+    fn stale_apple_host_is_not_eligible_for_new_jobs() {
+        let now = Instant::now();
+        let stale = Entry {
+            host: HostSnapshot {
+                id: "stale-agent".into(),
+                operating_system: "macos".into(),
+                architecture: "arm64".into(),
+                status: "online".into(),
+                capabilities: vec!["apple.build@1".into()],
+                devices: Vec::new(),
+            },
+            heartbeat: now - Duration::from_secs(61),
+        };
+        let fresh = Entry {
+            heartbeat: now - Duration::from_secs(1),
+            ..stale
+        };
+
+        assert!(!apple_host_is_current(&stale, now, Duration::from_secs(60)));
+        assert!(apple_host_is_current(&fresh, now, Duration::from_secs(60)));
     }
 }

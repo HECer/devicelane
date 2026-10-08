@@ -1,4 +1,3 @@
-# Yoke runtime artifacts (managed by yoke retrofit)
 /target/
 /desktop/node_modules/
 /desktop/dist/
@@ -9,27 +8,3 @@
 /graphify-out/cache/
 /.mesh/
 .worktrees/
-.yoke/worktrees/
-.yoke/backup/
-.yoke/loop-status.json
-.yoke/loop.log
-.yoke/batch-*.log
-.yoke/loop.lock
-.yoke/loop.lock.takeover
-.yoke/loop.lock.takeover.recovery
-.yoke/loop.lock.*.tmp
-.yoke/loop.pause
-.yoke/runner.pid
-.yoke/ambiguity.md
-.yoke/decision-request.yaml
-.yoke/pending-decision.yaml
-.yoke/decision-answering.yaml
-.yoke/decision-resume*.yaml
-.yoke/decision-*.yaml.*.tmp
-.yoke/story-durations.json
-.yoke/proof/
-.yoke/checks/
-.yoke/artifacts/
-.yoke/history/
-.yoke/events/
-.yoke/context/DECISIONS.md

@@ -379,7 +379,7 @@ only the canonical audit digest and redacted allow-listed metadata. If the authe
 session is unavailable, report the physical gate as blocked; never replace it with TCP reachability
 or a fixture pass.
 
-For Yoke-managed work, `passes: true` is valid only when the mapped **story-spezifische Akzeptanzprüfung** also passes. The global quality gate additionally runs the complete workspace tests, Clippy with warnings denied, and the formatting check.
+The CI workflow runs the complete workspace tests, Clippy with warnings denied, and the formatting check.
 
 ## Repository map
 
@@ -392,8 +392,7 @@ For Yoke-managed work, `passes: true` is valid only when the mapped **story-spez
 | `scripts/` | Windows/macOS bootstrap and hardware gates |
 | `hardware/DeviceMeshGate/` | Minimal signed iOS hardware-gate application |
 | `tests/` | Contract, security, integration, and platform tests |
-| `.yoke/` | Yoke planning and acceptance-test metadata |
-| `.agents/skills/` | Yoke/gstack-derived development-agent workflow skills |
+| `.agents/skills/` | Project-local development-agent skills |
 
 ## Machine-readable project facts
 
@@ -430,4 +429,4 @@ hardware_gates:
 
 ## License and acknowledgements
 
-DeviceLane is available under the [MIT License](LICENSE). Development workflow material derived from [gstack](https://github.com/garrytan/gstack) and [Yoke](https://github.com/HECer/yoke) remains MIT-licensed; see [NOTICE](NOTICE).
+DeviceLane is available under the [MIT License](LICENSE). Development workflow material derived from [gstack](https://github.com/garrytan/gstack) remains MIT-licensed; see [NOTICE](NOTICE).

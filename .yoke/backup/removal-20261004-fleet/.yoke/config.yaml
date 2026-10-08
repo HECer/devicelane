@@ -1,0 +1,55 @@
+canonVersion: 1.22.0
+agents:
+  - codex
+loop:
+  enabled: false
+  timeoutMinutes: 90
+  maxCallMinutes: 180
+  progressTimeoutMinutes: 90
+  decisionPolicy: auto
+runner:
+  agent: codex
+routing:
+  enabled: true
+  strategy: capability
+  maxCandidates: 3
+  workers:
+    - id: codex-light
+      agent: codex
+      model: gpt-5.6-luna
+      reasoningEffort: low
+      costTier: low
+      capabilities:
+        - mechanical
+        - tests
+      tier: light
+    - id: codex-standard
+      agent: codex
+      model: gpt-5.6-terra
+      reasoningEffort: medium
+      costTier: low
+      capabilities:
+        - implementation
+      tier: standard
+    - id: codex-strong
+      agent: codex
+      model: gpt-5.6-sol
+      reasoningEffort: high
+      costTier: medium
+      capabilities:
+        - debugging
+      tier: strong
+    - id: codex-frontier
+      agent: codex
+      model: gpt-6-astra
+      reasoningEffort: high
+      costTier: high
+      capabilities:
+        - architecture
+      tier: frontier
+verify:
+  command: cargo test --workspace && cargo clippy --workspace --all-targets -- -D
+    warnings && cargo fmt --all -- --check
+codeGraph: graphify
+codeIntelligence:
+  mode: off

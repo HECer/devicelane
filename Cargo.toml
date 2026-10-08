@@ -23,7 +23,7 @@ readme = "README.md"
 keywords = ["ios", "android", "remote-development", "device", "debugging"]
 categories = ["development-tools"]
 publish = false
-exclude = [".agents/**", ".codex/**", ".yoke/**", "AGENTS.md", "RTK.md"]
+exclude = [".agents/**", ".codex/**", "AGENTS.md", "RTK.md"]
 
 [lib]
 name = "device_development_mesh"
