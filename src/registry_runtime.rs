@@ -2077,12 +2077,13 @@ mod tests {
             },
             heartbeat: now - Duration::from_secs(61),
         };
+        assert!(!apple_host_is_current(&stale, now, Duration::from_secs(60)));
+
         let fresh = Entry {
             heartbeat: now - Duration::from_secs(1),
             ..stale
         };
 
-        assert!(!apple_host_is_current(&stale, now, Duration::from_secs(60)));
         assert!(apple_host_is_current(&fresh, now, Duration::from_secs(60)));
     }
 }

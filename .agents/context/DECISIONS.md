@@ -18,3 +18,7 @@ This file records durable product and architecture choices, not task-runner stat
 ## 2026-09-06 — Hardware support claims
 
 - Treat hardware support as available only after verification on the relevant real device and host; fixture results alone do not establish installed-host support.
+
+## 2026-10-08 — Pairing session authority boundary
+
+- Validate the shared approval tuple against controller-owned invitation fields before opening a session. The in-memory session core only reports readiness after both peers confirm the exact tuple; TLS provenance, bearer-token replay protection, daemon-wide admission and restart fencing, local IPC authorization, audit, revocation revalidation, and trust mutation remain daemon responsibilities.

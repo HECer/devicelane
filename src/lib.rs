@@ -1,4 +1,5 @@
 pub mod local_runtime;
+pub mod pairing_session;
 
 pub mod controller_session {
     use crate::dashboard::model::{HostId, PrincipalId};
